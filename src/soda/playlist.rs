@@ -83,6 +83,11 @@ pub fn build_playlist_from_user_item(
             item.stats.count_collected.to_string(),
         );
     }
+    // 隐私标记只有 `is_private = true` 时才写入，避免给所有歌单都塞一个 `false`
+    // （与 `review_status` 等可选字段保持一致的「有才写」语义）。
+    if item.is_private {
+        extra.insert("is_private".to_string(), "true".to_string());
+    }
 
     Playlist {
         source: SOURCE_SODA.to_string(),
@@ -475,6 +480,36 @@ pub fn get_recommended_playlists(_soda: &Soda) -> Result<Vec<Playlist>> {
     ))
 }
 
+/// 「为你推荐歌单」的 PC 路径（客户端 `GetRecommendPlaylist`）。
+pub const RECOMMEND_PLAYLIST_PATH: &str = "/luna/me/playlist/recommend";
+
+/// 推荐歌单（客户端 `GetRecommendPlaylist`，`GET /luna/me/playlist/recommend`）。
+///
+/// `GET /luna/me/playlist/recommend` 没有查询参数，回包是 `{status_code, playlists:[…]}`。
+pub fn get_recommend_playlists(soda: &Soda) -> Result<Vec<Playlist>> {
+    let value = super::pc_get_json(soda, RECOMMEND_PLAYLIST_PATH, &[])?;
+    Ok(parse_recommend_playlists(&value))
+}
+
+/// 解析推荐歌单回包（缺字段一律当空列表，不报错）。
+pub fn parse_recommend_playlists(value: &serde_json::Value) -> Vec<Playlist> {
+    let Some(list) = value.get("playlists").and_then(|list| list.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Playlist> = Vec::new();
+    for item in list {
+        let Ok(parsed) = serde_json::from_value::<UserPlaylistItem>(item.clone()) else {
+            continue;
+        };
+        let playlist = build_playlist_from_user_item(&parsed, "", "");
+        if playlist.id.is_empty() {
+            continue;
+        }
+        out.push(playlist);
+    }
+    out
+}
+
 /// 等价 `GetPlaylistCategories`。
 pub fn get_playlist_categories(_soda: &Soda) -> Result<Vec<PlaylistCategory>> {
     Err(SodaError::unsupported("playlist categories not supported"))
@@ -499,6 +534,11 @@ fn non_empty(value: String) -> Option<String> {
 }
 
 impl Soda {
+    /// 推荐歌单（客户端 `GetRecommendPlaylist`）。
+    pub fn get_recommend_playlists(&self) -> Result<Vec<Playlist>> {
+        get_recommend_playlists(self)
+    }
+
     /// 等价 `(*Soda).SearchPlaylist`。
     pub fn search_playlist(&self, keyword: &str) -> Result<Vec<Playlist>> {
         search_playlist(self, keyword)

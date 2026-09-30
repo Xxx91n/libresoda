@@ -20,8 +20,10 @@
 //! - 推荐流 / 听歌模式：`Soda::feed_mode`、`Soda::discover_mix`、`Soda::fetch_discover`
 //! - 我喜欢的音乐与收藏：`Soda::collect_media` / `collect_playlists` / `collect_albums`
 //!   / `collect_artists`、`Soda::collected_items`、`Soda::collected_artists`
-//! - 歌单管理：`Soda::create_playlist`、`append_playlist_media`、`sort_playlist_media`、
-//!   `update_playlist_info`、`delete_playlists`、`playlist_name_has_sensitive_word`
+//! - 歌单管理：`Soda::create_playlist` / `create_playlist_with_media`、`append_playlist_media`、
+//!   `sort_playlist_media`、`update_playlist_info`、`delete_playlists`、
+//!   `append_playlist_tracks`、`import_playlist`、`playlist_name_has_sensitive_word`
+//! - 歌单列表：`Soda::get_my_playlists`（我创建的）、`Soda::get_recommend_playlists`
 //! - 音质档位：`Soda::set_quality_preference`（`best` / `lossless` / `highest` / `medium`…）
 //! - 播放记录：`Soda::append_recently_played_media`、`Soda::recently_played_media`、
 //!   `Soda::media_stats`

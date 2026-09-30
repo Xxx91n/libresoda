@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 /// 但对 `collection` / `playlist media` 这类接口，单曲固定是 `track`。
 pub const MEDIA_TYPE_TRACK: &str = "track";
 
+/// 媒体类型：UGC 短片（官方 `MediaTypeUgcClip`）。歌单/收藏接口里也会出现这种条目
+///（客户端 `AddToPlaylistMenu` 对 `media_type === 'ugc_clip'` 有单独分支）。
+pub const MEDIA_TYPE_UGC_CLIP: &str = "ugc_clip";
+
 /// 一条媒体引用（`{id, type}`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {

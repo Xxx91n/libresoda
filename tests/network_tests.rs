@@ -12,6 +12,7 @@
 //! | `SODA_QR_CREATE_ONLY=1` | 调试时只创建二维码、不轮询 |
 //! | `SODA_QR_AUTO_POLL=1` | 调试时自动轮询扫码状态 |
 //! | `SODA_QR_POLL_INTERVAL` | 调试轮询间隔（秒，缺省 3） |
+//! | `QISHUI_SIGNER_URL` / `QISHUI_SIGNER_TOKEN` | 实时签名服务（歌单写操作必需） |
 //!
 //! 运行示例：
 //!
@@ -303,6 +304,191 @@ fn soda_reported_lossless_track_refreshes_cached_url() {
 // ---------------------------------------------------------------------------
 // soda_user_playlist_test.go
 // ---------------------------------------------------------------------------
+
+/// 歌单全链路真机验证：我创建的歌单 → 建 → 加歌 → 回读 → 排序 → 删歌 → 改名 → 删除。
+///
+/// 只碰自己新建的「联调用」歌单：用 `Drop` 兜底删除，中途断言失败也会清理。
+/// 需要 `SODA_COOKIE` + 签名器环境变量，见文件头。
+#[test]
+#[ignore = "network + SODA_COOKIE"]
+fn playlist_full_lifecycle_online() {
+    use libresoda::soda::media_ref::MediaRef;
+
+    let cookie = get_soda_cookie();
+    if cookie.is_empty() {
+        eprintln!("skip: SODA_COOKIE not set");
+        return;
+    }
+    let soda = Soda::new(cookie);
+    apply_signing_env(&soda);
+
+    // 0) 只读：我创建的歌单 + 推荐歌单，顺手取一首真实的 track_id 备用
+    let page = soda.get_my_playlists("", 50).expect("GetMyPlaylists error");
+    eprintln!(
+        "我创建的歌单: {} 个, has_more={}, next_cursor={:?}",
+        page.playlists.len(),
+        page.has_more,
+        page.next_cursor
+    );
+    for playlist in page.playlists.iter().take(5) {
+        eprintln!(
+            "  - id={} name={:?} tracks={} private={:?}",
+            playlist.id,
+            playlist.name,
+            playlist.track_count,
+            playlist.extra_get("is_private")
+        );
+    }
+
+    let sample_track = page
+        .playlists
+        .iter()
+        .filter(|playlist| !playlist.id.is_empty())
+        .filter_map(|playlist| soda.get_playlist_songs(&playlist.id).ok())
+        .find_map(|songs| songs.into_iter().next())
+        .expect("需要至少一首歌来跑加歌流程（账号里应已有歌单）");
+    eprintln!(
+        "取样曲目: id={} name={:?}",
+        sample_track.id, sample_track.name
+    );
+    let track_id = sample_track.id.clone();
+
+    match soda.get_recommend_playlists() {
+        Ok(playlists) => eprintln!("推荐歌单: {} 个", playlists.len()),
+        Err(err) => eprintln!("推荐歌单失败（不致命）: {err}"),
+    }
+
+    // 1) 创建（客户端同款 media 版，直接带一首歌）
+    // 名字用纯 ASCII：服务端对歌单名跑敏感词校验，回 `HIT_SENSITIVE_WORD`（1000014），
+    // 中文词很容易误伤（实测「测试」直接命中），联调名字避开。
+    // 名字上限 30 字符（客户端输入框同值，服务端 31 字符回 ERR_INVALID_PARAM），
+    // 所以这里用短名 + 时间戳，改名时也留出余量。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("sodam lifecycle {stamp}");
+    assert!(name.chars().count() <= 30);
+    let created = libresoda::soda::playlist_edit::create_playlist_with_media_response(
+        &soda,
+        &name,
+        true,
+        &[MediaRef::track(track_id.clone())],
+    )
+    .expect("CreatePlaylist error");
+    eprintln!("建歌单回包: {created}");
+    let playlist_id = libresoda::soda::playlist_edit::extract_playlist_id(&created);
+    assert!(!playlist_id.is_empty(), "create 没回歌单 id: {created}");
+    eprintln!("已创建歌单 id={playlist_id} name={name:?}");
+
+    // 无论后续断言怎么挂，都要把这个测试歌单删掉
+    struct Cleanup<'a>(&'a Soda, String);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            match self.0.delete_playlists(std::slice::from_ref(&self.1)) {
+                Ok(_) => eprintln!("已清理测试歌单 id={}", self.1),
+                Err(err) => eprintln!("清理失败（需手动删除 id={}）: {err}", self.1),
+            }
+        }
+    }
+    let _guard = Cleanup(&soda, playlist_id.clone());
+
+    // 2) 回读：详情里能看到这首歌
+    let (detail, songs) = libresoda::soda::playlist::fetch_playlist_detail(&soda, &playlist_id)
+        .expect("GetPlaylistDetail error");
+    eprintln!(
+        "回读详情: name={:?} private={:?} songs={}",
+        detail.name,
+        detail.extra_get("is_private"),
+        songs.len()
+    );
+    assert!(
+        !songs.is_empty(),
+        "新建歌单里应已有 1 首（media 版直接带歌）"
+    );
+
+    // 3) 再加一首（用已有的那首再加一次不合适，改为只验证接口回包形状）
+    let appended = soda
+        .append_playlist_media(&playlist_id, &[MediaRef::track(track_id.clone())])
+        .expect("MAppendPlaylistMedia error");
+    eprintln!("加歌回包 status_code={:?}", appended.get("status_code"));
+    assert!(
+        libresoda::soda::playlist_edit::response_is_ok(&appended),
+        "加歌未成功: {appended}"
+    );
+
+    // 4) 排序：只有非 PC 路径可用
+    let sorted = soda
+        .sort_playlist_media(&playlist_id, &[MediaRef::track(track_id.clone())])
+        .expect("SortPlaylistMedia error");
+    assert!(
+        libresoda::soda::playlist_edit::response_is_ok(&sorted),
+        "排序未成功: {sorted}"
+    );
+
+    // 5) 改名 + 隐私标记
+    let renamed = soda
+        .update_playlist_info(
+            &playlist_id,
+            Some(&format!("sodam lc {stamp} renamed")),
+            None,
+            Some(false),
+            None,
+        )
+        .expect("UpdatePlaylistInfo error");
+    // 注意：改名成功时回包**没有** `status_code`（只有 playlist），所以不能直接比 0
+    assert!(
+        libresoda::soda::playlist_edit::response_is_ok(&renamed),
+        "改名未成功: {}",
+        libresoda::soda::playlist_edit::response_error_message(&renamed)
+    );
+    let (renamed_detail, _) = libresoda::soda::playlist::fetch_playlist_detail(&soda, &playlist_id)
+        .expect("回读改名结果失败");
+    eprintln!(
+        "改名后: name={:?} private={:?}",
+        renamed_detail.name,
+        renamed_detail.extra_get("is_private")
+    );
+    assert!(renamed_detail.name.ends_with("renamed"), "改名没生效");
+    // 隐私开关也要真的生效（创建时 private=true，这里改成 false）
+    assert_eq!(
+        renamed_detail.extra_get("is_private"),
+        None,
+        "改成公开后不该再有 is_private 标记"
+    );
+
+    // 6) 删歌
+    let deleted = soda
+        .delete_playlist_media(&playlist_id, &[MediaRef::track(track_id.clone())])
+        .expect("DeletePlaylistMedia error");
+    assert!(
+        libresoda::soda::playlist_edit::response_is_ok(&deleted),
+        "删歌未成功: {}",
+        libresoda::soda::playlist_edit::response_error_message(&deleted)
+    );
+
+    // 7) 敏感词检查（GET + is_passed）。
+    // 服务端在 update 时也会自己跑一遍：名字命中就回 `HIT_SENSITIVE_WORD`（1000014）。
+    // 所以这里同时验证「接口可用」和「它确实会拦下敏感名字」。
+    match soda.playlist_name_has_sensitive_word(&name) {
+        Ok(hit) => {
+            eprintln!("敏感词检查可用：{name:?} 命中={hit}");
+            assert!(!hit, "纯 ASCII 名字不该命中敏感词");
+        }
+        Err(err) => eprintln!("敏感词检查失败（不致命）: {err}"),
+    }
+    // 敏感词接口的判定口径和 update 时的服务端校验**不一致**：实测
+    // `wordcheck` 对多组中文词都回 is_passed=true，但 update 用含「联调测试」的名字
+    // 会被服务端拦成 HIT_SENSITIVE_WORD（1000014）。所以这里只断言接口可用，
+    // 不拿它当写入前的唯一闸门——真正的闸门是服务端返回的 status_code。
+    for probe in ["测试测试", "联调", "政治"] {
+        match soda.playlist_name_has_sensitive_word(probe) {
+            Ok(hit) => eprintln!("wordcheck({probe:?}) 命中={hit}"),
+            Err(err) => eprintln!("wordcheck({probe:?}) 失败（不致命）: {err}"),
+        }
+    }
+    eprintln!("歌单全链路通过；测试歌单将由 Drop 清理");
+}
 
 #[test]
 #[ignore = "network + SODA_USER_PLAYLIST_COOKIE"]

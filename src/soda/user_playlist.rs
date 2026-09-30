@@ -1,11 +1,83 @@
-//! 「我的歌单」（对应上游 `soda/user_playlist.go`）。
+//! 「我的歌单」（对应上游 `soda/user_playlist.go`），以及客户端侧边栏用的
+//! 「我创建的歌单」列表（`GetMyPlaylists`，上游没有）。
 
 use super::playlist::build_playlist_from_user_item;
-use super::types::{PCMeResponse, UserPlaylistResponse};
+use super::types::{PCMeResponse, UserPlaylistItem, UserPlaylistResponse};
 use super::Soda;
 use crate::error::{Result, SodaError};
 use crate::http;
 use crate::model::Playlist;
+
+/// 客户端 `GetMyPlaylists` 的 PC 路径（侧边栏「创建的歌单」）。
+pub const MY_PLAYLISTS_PATH: &str = "/luna/pc/me/playlist";
+
+/// 「我创建的歌单」一页（客户端 `useSidebarPlaylistsQuery` 的翻页语义）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MyPlaylistsPage {
+    pub playlists: Vec<Playlist>,
+    pub has_more: bool,
+    pub next_cursor: String,
+}
+
+/// 拉取「我创建的歌单」（客户端 `GetMyPlaylists`，`GET /luna/pc/me/playlist`）。
+///
+/// 客户端传的查询参数只有 `cursor` + `count`（默认 50）；IDL 里还有一个 `ab_param`，
+/// 但它只出现在 body 里，GET 时不会发出去。
+pub fn get_my_playlists(soda: &Soda, cursor: &str, count: i64) -> Result<MyPlaylistsPage> {
+    if !soda.has_cookie() {
+        return Err(SodaError::invalid_input("soda my playlists require cookie"));
+    }
+    let count = if count <= 0 { 50 } else { count.min(100) };
+    let value = super::pc_get_json(
+        soda,
+        MY_PLAYLISTS_PATH,
+        &[
+            ("cursor", cursor.trim().to_string()),
+            ("count", count.to_string()),
+        ],
+    )?;
+    Ok(parse_my_playlists(&value))
+}
+
+/// 解析「我创建的歌单」回包。
+///
+/// 列表字段缺失（无歌单时服务端只回 `status_info`）当作空列表，不报错。
+pub fn parse_my_playlists(value: &serde_json::Value) -> MyPlaylistsPage {
+    let items = parse_my_playlist_items(value);
+    MyPlaylistsPage {
+        playlists: items,
+        has_more: value
+            .get("has_more")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false),
+        next_cursor: value
+            .get("next_cursor")
+            .and_then(|cursor| cursor.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+fn parse_my_playlist_items(value: &serde_json::Value) -> Vec<Playlist> {
+    let raw = match value.get("playlists").and_then(|list| list.as_array()) {
+        Some(list) => list,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<Playlist> = Vec::new();
+    for item in raw {
+        // 歌单实体与 /luna/pc/playlist/detail 的 playlist 同构，直接复用解析。
+        let Ok(parsed) = serde_json::from_value::<UserPlaylistItem>(item.clone()) else {
+            continue;
+        };
+        let playlist = build_playlist_from_user_item(&parsed, "", "");
+        if playlist.id.is_empty() {
+            continue;
+        }
+        out.push(playlist);
+    }
+    out
+}
 
 /// 等价 `GetUserPlaylists`：先取用户 id，再分页拉取歌单并做切片。
 pub fn get_user_playlists(soda: &Soda, page: i64, limit: i64) -> Result<Vec<Playlist>> {
@@ -119,6 +191,11 @@ pub fn fetch_user_playlist_page(
 }
 
 impl Soda {
+    /// 我创建的歌单（客户端侧边栏用；`cursor` 传空串取第一页）。
+    pub fn get_my_playlists(&self, cursor: &str, count: i64) -> Result<MyPlaylistsPage> {
+        get_my_playlists(self, cursor, count)
+    }
+
     /// 等价 `(*Soda).GetUserPlaylists`。
     pub fn get_user_playlists(&self, page: i64, limit: i64) -> Result<Vec<Playlist>> {
         get_user_playlists(self, page, limit)

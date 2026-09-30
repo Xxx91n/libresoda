@@ -214,6 +214,8 @@ pub struct UserPlaylistItem {
     pub play_count: i64,
     pub owner: UserPlaylistOwner,
     pub review_status: String,
+    /// 隐私歌单标记（客户端 `PlaylistMoreAction` 的「设为隐私/公开」读的就是它）。
+    pub is_private: bool,
     #[serde(rename = "type")]
     pub playlist_type: i64,
     pub resource_cnt: ResourceCount,

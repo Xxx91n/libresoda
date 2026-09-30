@@ -426,6 +426,214 @@ fn extract_json_block_handles_nested_braces_and_strings() {
 }
 
 // ---------------------------------------------------------------------------
+// 歌单写操作（客户端 IDL 形状）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_playlist_media_body_matches_client() {
+    use libresoda::soda::media_ref::MediaRef;
+    use libresoda::soda::playlist_edit::create_playlist_media_body;
+
+    // 官方 CreatePlaylistDialog.vue：{ name, is_private, media:[{id,type}] }
+    let body = create_playlist_media_body(
+        "  夜跑  ",
+        true,
+        &[
+            MediaRef::track("7501674235158431760"),
+            MediaRef::new("7412", "ugc_clip"),
+        ],
+    );
+    assert_eq!(body["name"], "夜跑");
+    assert_eq!(body["is_private"], true);
+    assert_eq!(
+        body["media"],
+        serde_json::json!([
+            {"id": "7501674235158431760", "type": "track"},
+            {"id": "7412", "type": "ugc_clip"},
+        ])
+    );
+}
+
+#[test]
+fn track_ids_bodies_use_official_field_names() {
+    use libresoda::soda::playlist_edit::{
+        append_playlist_tracks_body, delete_playlist_tracks_body, sort_playlist_tracks_body,
+    };
+
+    let ids = vec![" 1 ".to_string(), String::new(), "2".to_string()];
+    assert_eq!(
+        append_playlist_tracks_body("p1", &ids).expect("body"),
+        serde_json::json!({"playlist_id": "p1", "track_ids": ["1", "2"]})
+    );
+    // 删歌官方字段名是 delete_track_ids，不是 track_ids
+    assert_eq!(
+        delete_playlist_tracks_body("p1", &ids).expect("body"),
+        serde_json::json!({"playlist_id": "p1", "delete_track_ids": ["1", "2"]})
+    );
+    assert_eq!(
+        sort_playlist_tracks_body("p1", &ids).expect("body"),
+        serde_json::json!({"playlist_id": "p1", "track_ids": ["1", "2"]})
+    );
+
+    // 缺 id / 全空白都要显式报错，而不是发一个空请求
+    assert!(append_playlist_tracks_body("", &ids).is_err());
+    assert!(append_playlist_tracks_body("p1", &[String::new()]).is_err());
+    assert!(delete_playlist_tracks_body("  ", &ids).is_err());
+}
+
+#[test]
+fn import_playlist_body_trims_url() {
+    use libresoda::soda::playlist_edit::import_playlist_body;
+    assert_eq!(
+        import_playlist_body("  https://music.163.com/playlist?id=1  "),
+        serde_json::json!({"url": "https://music.163.com/playlist?id=1"})
+    );
+}
+
+#[test]
+fn created_playlist_id_extracted_from_response_variants() {
+    use libresoda::soda::playlist_edit::extract_playlist_id;
+    // 官方 CreatePlaylist 回包
+    assert_eq!(
+        extract_playlist_id(&serde_json::json!({
+            "status_code": 0,
+            "playlist": {"id": "7501674235158431760"}
+        })),
+        "7501674235158431760"
+    );
+    // ImportPlaylist 回包
+    assert_eq!(
+        extract_playlist_id(&serde_json::json!({"playlist_id": "p2"})),
+        "p2"
+    );
+    // 数字型 id 也要兜住（服务端偶尔回 number）
+    assert_eq!(
+        extract_playlist_id(&serde_json::json!({"playlist": {"id": 42}})),
+        "42"
+    );
+    // 没有 id 时返回空串（调用方据此判断）
+    assert_eq!(
+        extract_playlist_id(&serde_json::json!({"status_code": 0})),
+        ""
+    );
+}
+
+#[test]
+fn playlist_name_length_limit_matches_client() {
+    use libresoda::soda::media_ref::MediaRef;
+    use libresoda::soda::playlist_edit::{
+        create_playlist_body, create_playlist_media_body, PLAYLIST_NAME_MAX_CHARS,
+    };
+
+    // 客户端 CreatePlaylistDialog.vue / EditPlaylist.vue 的输入框都是 max-length=30；
+    // 服务端硬线也是 30（31 字符回 ERR_INVALID_PARAM）。
+    assert_eq!(PLAYLIST_NAME_MAX_CHARS, 30);
+    let ok = "a".repeat(PLAYLIST_NAME_MAX_CHARS);
+    assert_eq!(create_playlist_body(&ok, true, &[])["name"], ok.as_str());
+
+    // 这些是构造器，不做长度校验（校验在 create_/update_ 里，因为它们要发请求）
+    let _ = create_playlist_media_body(&ok, true, &[MediaRef::track("1")]);
+}
+
+#[test]
+fn response_is_ok_treats_missing_status_code_as_success() {
+    use libresoda::soda::playlist_edit::{response_error_message, response_is_ok};
+
+    // 实测：建歌单/改名的成功回包没有 status_code（只有 playlist + status_info）
+    assert!(response_is_ok(
+        &serde_json::json!({"playlist": {"id": "1"}})
+    ));
+    assert!(response_is_ok(&serde_json::json!({"status_code": 0})));
+    assert!(!response_is_ok(&serde_json::json!({
+        "status_code": 1000004,
+        "status_info": {"status_msg": "ERR_INVALID_PARAM"}
+    })));
+    assert!(!response_is_ok(&serde_json::json!({
+        "status_code": 1000014,
+        "status_info": {"status_msg": "HIT_SENSITIVE_WORD"}
+    })));
+
+    assert_eq!(
+        response_error_message(&serde_json::json!({
+            "status_info": {"status_msg": "HIT_SENSITIVE_WORD"}
+        })),
+        "HIT_SENSITIVE_WORD"
+    );
+    assert_eq!(response_error_message(&serde_json::json!({})), "");
+}
+
+// ---------------------------------------------------------------------------
+// 歌单读取（我创建的歌单 / 推荐歌单）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_my_playlists_reads_page_fields() {
+    use libresoda::soda::user_playlist::parse_my_playlists;
+
+    let value = serde_json::json!({
+        "status_code": 0,
+        "next_cursor": " cb2 ",
+        "has_more": true,
+        "playlists": [{
+            "id": "7501674235158431760",
+            "title": "夜跑",
+            "desc": "十点以后",
+            "url_cover": {"uri": "cover-uri", "urls": ["https://img/1.jpg"]},
+            "count_tracks": 12,
+            "play_count": 34,
+            "is_private": true,
+            "owner": {"id": "9", "nickname": "zephyr"}
+        }]
+    });
+    let page = parse_my_playlists(&value);
+    assert!(page.has_more);
+    assert_eq!(page.next_cursor, "cb2");
+    assert_eq!(page.playlists.len(), 1);
+    let playlist = &page.playlists[0];
+    assert_eq!(playlist.id, "7501674235158431760");
+    assert_eq!(playlist.name, "夜跑");
+    // build_image_url 会把 uri 拼在 url 后面并补上尺寸后缀（上游同款行为）
+    assert!(
+        playlist.cover.contains("https://img/1.jpg"),
+        "{}",
+        playlist.cover
+    );
+    assert_eq!(playlist.track_count, 12);
+    assert_eq!(playlist.creator, "zephyr");
+    // 隐私标记透传到 extra，客户端「设为公开/隐私」要用
+    assert_eq!(playlist.extra_get("is_private"), Some("true"));
+}
+
+#[test]
+fn parse_my_playlists_treats_empty_envelope_as_empty_list() {
+    use libresoda::soda::user_playlist::parse_my_playlists;
+    // 没有歌单时服务端只回 status_info（不报错，也不伪造 has_more）
+    let page = parse_my_playlists(&serde_json::json!({"status_code": 0}));
+    assert!(page.playlists.is_empty());
+    assert!(!page.has_more);
+    assert_eq!(page.next_cursor, "");
+}
+
+#[test]
+fn parse_recommend_playlists_handles_list_and_missing_field() {
+    use libresoda::soda::playlist::parse_recommend_playlists;
+
+    let value = serde_json::json!({
+        "status_code": 0,
+        "playlists": [
+            {"id": "p1", "title": "A", "count_tracks": 3},
+            {"title": "没有 id，应被丢掉"}
+        ]
+    });
+    let playlists = parse_recommend_playlists(&value);
+    assert_eq!(playlists.len(), 1);
+    assert_eq!(playlists[0].id, "p1");
+    assert_eq!(playlists[0].name, "A");
+
+    assert!(parse_recommend_playlists(&serde_json::json!({"status_code": 0})).is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
 
