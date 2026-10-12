@@ -214,6 +214,42 @@ soda.media_stats(&[("media_id", "<track_id>".into()), ("media_type", "track".int
 * 实测：整曲无损 46.3MB/236.6s 下载并解密（ffmpeg 可解码）；最近播放 写→读→删均通过
 * 播放上报 `media_stats` 带 `media_id` 返回 `stats`，不带参数只有 status
 
+### 5.1 播放进度 / 时长上报
+
+官方客户端把「进度 / 时长」交给 applog 埋点（`POST https://mcs.zijieapi.com/v1/json`），
+把「播放计数」交给业务接口（`POST /luna/pc/action`，`action_type=play`）。两条通道都已封装：
+
+```rust
+use libresoda::{ApplogIdentity, PlayAction, PlayEndReason};
+
+let identity = ApplogIdentity {
+    device_id: "7123456789012345".into(), // 空则用进程内回退 did
+    user_id: "999".into(),                // 登录用户 id（可选）
+    ..Default::default()
+};
+let media = MediaRef::track("<track_id>");
+
+// 开播：applog audio_play + 业务 play 计数
+soda.report_play_start(&identity, &media)?;
+soda.report_play_action(&PlayAction::track("<track_id>"))?;
+
+// 首次拿到进度（官方只发一次）
+soda.report_play_progress(&identity, &media, 12.5, 240.0, true)?;
+
+// 暂停 / 播完 / 切歌：时长（播了多少毫秒）
+soda.report_play_duration(&identity, &media, 30_000, 240.0, PlayEndReason::Finished, 30_000, 0, true)?;
+
+// 播放前校验（可选，业务接口，返回 status / risk_result）
+let check = soda.check_media("<track_id>", "track", 240, None, "player", "feed")?;
+```
+
+* 进度事件：`player_metrics.type=progressed`，`extra_data`=进度**秒**、`duration`=总时长**秒**
+* 时长事件：`audio_finish` / `audio_over`，`duration`=播放**毫秒**、`duration_pct`、`foreground_dur`/`background_dur`
+* 埋点不是签名接口（官方同样只用 `Content-Type` + `X-SS-STUB` 直发 MCS）；播放计数 / mcheck 走签名接口
+* 没配设备指纹时，`ApplogIdentity` 用官方 `getFallbackDid` 同款的进程内回退 did
+
+实测（2026-10-12，sodam dev，音量 0）：开播 / 进度 / 时长 / 播放计数四个请求均返回成功。
+
 ## 6. 元数据（歌词 / 封面 / 标题 / 作者 / 歌单）
 
 ```rust

@@ -27,6 +27,8 @@
 //! - 音质档位：`Soda::set_quality_preference`（`best` / `lossless` / `highest` / `medium`…）
 //! - 播放记录：`Soda::append_recently_played_media`、`Soda::recently_played_media`、
 //!   `Soda::media_stats`
+//! - 播放上报：`Soda::report_play_start` / `report_play_progress` / `report_play_duration`
+//!   （官方 applog 埋点，进度与时长）、`Soda::report_play_action` / `check_media`（业务接口）
 //! - 搜索联想：`Soda::suggest`、`Soda::suggest_words`
 //! - 专辑 / 艺人：`Soda::fetch_pc_album_detail`、`Soda::fetch_artist_detail`、
 //!   `Soda::list_artist_tracks`、`Soda::list_artist_albums`
@@ -54,6 +56,7 @@ pub mod util;
 
 pub use error::{Result, SodaError};
 pub use model::{Playlist, PlaylistCategory, Song};
+pub use soda::report::{ApplogIdentity, PlayAction, PlayEndReason};
 pub use soda::signature::AppCredentials;
 pub use soda::stream::StreamAccessReport;
 pub use soda::{soda, Soda};

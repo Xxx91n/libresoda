@@ -34,6 +34,7 @@ pub mod playlist;
 pub mod playlist_edit;
 pub mod qr_login;
 pub mod quality;
+pub mod report;
 pub mod search;
 pub mod signature;
 pub mod song;
