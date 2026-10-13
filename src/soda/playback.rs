@@ -18,6 +18,8 @@ pub const RECENTLY_PLAYED_PATH: &str = "/luna/pc/me/recently-played-media";
 pub const RECENTLY_PLAYED_DELETE_PATH: &str = "/luna/pc/me/recently-played-media/delete";
 /// 播放统计 / 上报（参数随版本变动，透传查询参数）。
 pub const MEDIA_STATS_PATH: &str = "/luna/pc/media-stats";
+/// 「音乐墙」：返回 `listen_duration`（总/周听歌时长）。
+pub const MUSIC_WALL_PATH: &str = "/luna/me/music_wall";
 
 /// 默认媒体类型（客户端单曲固定 `track`）。
 pub const MEDIA_TYPE_TRACK: &str = "track";
@@ -95,6 +97,33 @@ pub fn media_stats(soda: &Soda, params: &[(&str, String)]) -> Result<serde_json:
     super::pc_get_json(soda, MEDIA_STATS_PATH, params)
 }
 
+/// 「音乐墙」：返回 `listen_duration`（`total_duration` / `week_duration`，单位由服务端定）。
+pub fn my_music_wall(
+    soda: &Soda,
+    ab_param: &str,
+    recent_rankings_version: &str,
+) -> Result<serde_json::Value> {
+    require_login(soda, "soda music wall")?;
+    let body = serde_json::json!({
+        "ab_param": ab_param.trim(),
+        "recent_rankings_version": recent_rankings_version.trim(),
+        "schema_extra": "",
+    });
+    super::pc_post_json(soda, MUSIC_WALL_PATH, &body)
+}
+
+/// 指定用户的「音乐墙」：返回 `user_listen_duration`（`total_duration` / `week_duration`）。
+pub fn user_music_wall(soda: &Soda, user_id: &str, ab_param: &str) -> Result<serde_json::Value> {
+    require_login(soda, "soda user music wall")?;
+    if user_id.trim().is_empty() {
+        return Err(SodaError::invalid_input(
+            "soda user music wall requires user_id",
+        ));
+    }
+    let path = format!("/luna/users/{}/music_wall", user_id.trim());
+    super::pc_get_json(soda, &path, &[("ab_param", ab_param.trim().to_string())])
+}
+
 impl Soda {
     /// 读最近播放。
     pub fn recently_played_media(
@@ -120,6 +149,20 @@ impl Soda {
     /// 播放统计 / 上报（参数透传）。
     pub fn media_stats(&self, params: &[(&str, String)]) -> Result<serde_json::Value> {
         media_stats(self, params)
+    }
+
+    /// 「音乐墙」：读总/周听歌时长。
+    pub fn my_music_wall(
+        &self,
+        ab_param: &str,
+        recent_rankings_version: &str,
+    ) -> Result<serde_json::Value> {
+        my_music_wall(self, ab_param, recent_rankings_version)
+    }
+
+    /// 指定用户的「音乐墙」：读他的总/周听歌时长。
+    pub fn user_music_wall(&self, user_id: &str, ab_param: &str) -> Result<serde_json::Value> {
+        user_music_wall(self, user_id, ab_param)
     }
 }
 

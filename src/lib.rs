@@ -56,6 +56,7 @@ pub mod util;
 
 pub use error::{Result, SodaError};
 pub use model::{Playlist, PlaylistCategory, Song};
+pub use soda::media_ref::{media_played_array, MediaPlayed, MediaRef};
 pub use soda::report::{ApplogIdentity, PlayAction, PlayEndReason};
 pub use soda::signature::AppCredentials;
 pub use soda::stream::StreamAccessReport;

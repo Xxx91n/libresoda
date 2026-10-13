@@ -57,6 +57,69 @@ pub(crate) fn media_array(media: &[MediaRef]) -> serde_json::Value {
     )
 }
 
+/// 一条「已播 / 待播」媒体记录（官方 IDL `MediaPlayed`）。
+///
+/// **听歌时长就是靠它上报的**：推荐流 / 电台 / 相关推荐请求会把最近播过的曲目
+/// 连实际播放毫秒（`played_mills`）一起回传，服务端据此累计总听歌时长。
+/// `played_ms = -1` 表示「队列里但还没播」（官方 `getMediaPlayed` 的待播项）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaPlayed {
+    pub media_id: String,
+    pub media_type: String,
+    pub duration_seconds: i64,
+    pub played_ms: i64,
+}
+
+impl MediaPlayed {
+    pub fn new(
+        media_id: impl Into<String>,
+        media_type: impl Into<String>,
+        duration_seconds: i64,
+        played_ms: i64,
+    ) -> Self {
+        Self {
+            media_id: media_id.into(),
+            media_type: media_type.into(),
+            duration_seconds,
+            played_ms,
+        }
+    }
+
+    /// 待播项（`played_mills = -1`）。
+    pub fn upcoming(media_id: impl Into<String>, duration_seconds: i64) -> Self {
+        Self::new(media_id, MEDIA_TYPE_TRACK, duration_seconds, -1)
+    }
+
+    /// 已播项（`played_mills` 为实际播放毫秒）。
+    pub fn played(
+        media_id: impl Into<String>,
+        media_type: impl Into<String>,
+        duration_seconds: i64,
+        played_ms: i64,
+    ) -> Self {
+        Self::new(media_id, media_type, duration_seconds, played_ms.max(0))
+    }
+}
+
+/// 把 [`MediaPlayed`] 列表转成请求体里的 `played_media` 数组。
+pub fn media_played_array(items: &[MediaPlayed]) -> serde_json::Value {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .filter(|item| !item.media_id.trim().is_empty())
+            .map(|item| {
+                let media_type = item.media_type.trim();
+                serde_json::json!({
+                    "media_id": item.media_id.trim(),
+                    "type": if media_type.is_empty() { MEDIA_TYPE_TRACK } else { media_type },
+                    "duration": item.duration_seconds.max(0),
+                    "played_mills": item.played_ms,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +143,21 @@ mod tests {
             serde_json::json!([
                 {"id": "1", "type": "track"},
                 {"id": "2", "type": "track"},
+            ])
+        );
+    }
+
+    #[test]
+    fn media_played_array_keeps_played_mills() {
+        let value = media_played_array(&[
+            MediaPlayed::upcoming("9", 200),
+            MediaPlayed::played("1", "track", 240, 30_000),
+        ]);
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"media_id": "9", "type": "track", "duration": 200, "played_mills": -1},
+                {"media_id": "1", "type": "track", "duration": 240, "played_mills": 30000},
             ])
         );
     }
