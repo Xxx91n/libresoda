@@ -260,6 +260,21 @@ pub fn duration_event(
     }
 }
 
+/// 播放器指标事件（`player_metrics.type = finish`），`cost` 为实际播放毫秒。
+///
+/// 官方在切歌 / 换队列时除了 `audio_over` / `audio_finish`，还会补发这一条
+/// （`setupAudioFinishReporter`）。
+pub fn finish_metric_event(media: &MediaRef, played_ms: i64, duration_seconds: f64) -> Value {
+    let mut params = media_params(media);
+    let obj = params.as_object_mut().expect("object");
+    obj.insert("type".into(), json!("finish"));
+    obj.insert("engine_version".into(), json!("v4"));
+    obj.insert("cost".into(), json!(played_ms.max(0)));
+    obj.insert("duration".into(), json!(duration_seconds.max(0.0)));
+    obj.insert("extra_data".into(), json!(""));
+    applog_event("player_metrics", params)
+}
+
 /// 组装 MCS 批量上报 body。
 pub fn applog_body(identity: &ApplogIdentity, is_playing: bool, events: &[Value]) -> Value {
     let device_id = identity.resolved_device_id();
@@ -344,7 +359,7 @@ pub fn report_play_duration(
     background_ms: i64,
     finished: bool,
 ) -> Result<Value> {
-    let events = vec![duration_event(
+    let mut events = vec![duration_event(
         media,
         played_ms,
         duration_seconds,
@@ -353,6 +368,19 @@ pub fn report_play_duration(
         background_ms,
         finished,
     )];
+    // 暂停只报 `audio_over`；切歌 / 播完 / 换队列补 `audio_finish` 与 finish 指标。
+    if reason != PlayEndReason::Pause {
+        events.push(duration_event(
+            media,
+            played_ms,
+            duration_seconds,
+            reason,
+            foreground_ms,
+            background_ms,
+            true,
+        ));
+        events.push(finish_metric_event(media, played_ms, duration_seconds));
+    }
     send_applog(soda, identity, &applog_body(identity, false, &events))
 }
 
@@ -616,6 +644,17 @@ mod tests {
         assert_eq!(body["user"]["user_id"], "999");
         assert_eq!(body["user"]["user_is_login"], true);
         assert_eq!(body["events"][0]["event"], "audio_play");
+    }
+
+    #[test]
+    fn finish_metric_carries_played_ms_in_cost() {
+        let event = finish_metric_event(&track("9"), 45_000, 120.0);
+        assert_eq!(event["event"], "player_metrics");
+        let params: Value =
+            serde_json::from_str(event["params"].as_str().unwrap()).expect("params json");
+        assert_eq!(params["type"], "finish");
+        assert_eq!(params["cost"], 45_000);
+        assert_eq!(params["group_id"], "9");
     }
 
     #[test]

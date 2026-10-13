@@ -244,7 +244,8 @@ let check = soda.check_media("<track_id>", "track", 240, None, "player", "feed")
 ```
 
 * 进度事件：`player_metrics.type=progressed`，`extra_data`=进度**秒**、`duration`=总时长**秒**
-* 时长事件：`audio_finish` / `audio_over`，`duration`=播放**毫秒**、`duration_pct`、`foreground_dur`/`background_dur`
+* 时长事件：`audio_finish` / `audio_over`，`duration`=播放**毫秒**、`duration_pct`、`foreground_dur`/`background_dur`；
+  切歌 / 换队列时还会补发 `player_metrics.type=finish`（`cost`=播放毫秒），与官方三连发一致
 * 埋点不是签名接口（官方同样只用 `Content-Type` + `X-SS-STUB` 直发 MCS）；播放计数 / mcheck 走签名接口
 * 没配设备指纹时，`ApplogIdentity` 用官方 `getFallbackDid` 同款的进程内回退 did
 
