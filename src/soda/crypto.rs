@@ -20,6 +20,13 @@ const AES_BLOCK_SIZE: usize = 16;
 /// 正常音频（48kHz、每帧约 1024 采样）即使数小时也只有几万条，4M 足够宽裕。
 const MAX_SAMPLE_ENTRIES: usize = 4 * 1024 * 1024;
 
+/// 流式解密允许缓存在内存里的「mdat 之前」字节上限。
+///
+/// 正常文件的 `ftyp` + `moov` 只有几十 KB；这里设 8MB 是为了防止损坏或被
+/// 伪造的 box size 让 `vec![0; size]` 直接申请几个 GB（整块路径有同样的风险，
+/// 但那条路本来就是「整个文件进内存」，流式路径不能退化成那样）。
+const MAX_PREFIX_BYTES: usize = 8 * 1024 * 1024;
+
 /// MP4 box 视图（相对 `data` 的偏移/长度 + 内容切片）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mp4Box<'a> {
@@ -184,11 +191,18 @@ pub fn decrypt_stream<R: Read, W: Write>(
             break;
         }
 
+        if size > MAX_PREFIX_BYTES.saturating_sub(prefix.len()) {
+            return Err(SodaError::crypto("declared box size is unreasonably large"));
+        }
         let mut payload = vec![0u8; size - header_len];
         input
             .read_exact(&mut payload)
             .map_err(|err| SodaError::crypto(format!("read box payload failed: {err}")))?;
-        prefix.extend_from_slice(&head[..header_len]);
+        // 注意：64 位 size 时头部共 16 字节（head 8 + ext 8），不能只拼 head
+        prefix.extend_from_slice(&head);
+        if let Some(ext) = ext {
+            prefix.extend_from_slice(&ext);
+        }
         prefix.extend_from_slice(&payload);
     }
 
@@ -283,6 +297,9 @@ pub fn decrypt_stream<R: Read, W: Write>(
     if remaining > 0 {
         return Err(SodaError::crypto("decrypted size mismatch"));
     }
+
+    // mdat 之后可能还有其它 box（如 udta / free），原样透传，保证输出与整块解密一致
+    std::io::copy(input, out).map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
     Ok(())
 }
 

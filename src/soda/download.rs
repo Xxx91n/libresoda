@@ -275,34 +275,24 @@ pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Resul
     let written = if info.play_auth.trim().is_empty() {
         // SEO url_player_info 对免费歌曲返回明文 m4a（无 play_auth），直接落盘
         std::io::copy(&mut reader, &mut writer)
-            .map(|bytes| bytes as usize)
+            .map(|_| ())
             .map_err(|err| SodaError::http(err.to_string()))
     } else {
         super::crypto::decrypt_stream_with_auth(&mut reader, &info.play_auth, &mut writer)
-            .map(|()| 0)
-    };
-
-    let flush = writer
-        .flush()
-        .map_err(|err| SodaError::http(err.to_string()));
+    }
+    .and_then(|()| {
+        writer
+            .flush()
+            .map_err(|err| SodaError::http(err.to_string()))
+    });
     drop(writer);
 
-    match (written, flush) {
-        (Err(err), _) => {
-            let _ = std::fs::remove_file(output_path);
-            Err(err)
-        }
-        (Ok(_), Err(err)) => {
-            let _ = std::fs::remove_file(output_path);
-            Err(err)
-        }
-        (Ok(bytes), Ok(())) => {
-            // 写出的字节数应当是解密后的实际大小；info.size 是服务端声明的原始长度，
-            // 只用于调用方的截断校验，这里不覆盖。
-            let _ = bytes;
-            Ok(info)
-        }
+    if let Err(err) = written {
+        // 半截文件不能留在缓存里冒充有效音频
+        let _ = std::fs::remove_file(output_path);
+        return Err(err);
     }
+    Ok(info)
 }
 
 impl Soda {

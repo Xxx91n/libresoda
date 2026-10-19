@@ -340,6 +340,63 @@ fn decrypt_stream_falls_back_when_moov_follows_mdat() {
 }
 
 #[test]
+fn decrypt_stream_preserves_boxes_after_mdat() {
+    // mdat 之后追加一个 udta box：整块解密会原样保留，流式也必须保留
+    let file = encrypted_fixture();
+    let mut with_tail = file.clone();
+    with_tail.extend_from_slice(&mp4_box(b"udta", b"tail-data"));
+
+    let expected = decrypt_audio_with_key(&with_tail, &KEY).expect("batch decrypt");
+    let mut input = Dribble {
+        data: &with_tail,
+        pos: 0,
+        step: 11,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("stream decrypt");
+    assert_eq!(out, expected);
+    assert!(out.ends_with(b"tail-data"));
+}
+
+#[test]
+fn decrypt_stream_rejects_absurd_box_size_without_allocating() {
+    // ftyp + 一个声明 200MB 的 free box：必须在分配之前就拒绝
+    let mut file = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+    file.extend_from_slice(&(200u32 * 1024 * 1024).to_be_bytes());
+    file.extend_from_slice(b"free");
+    file.extend_from_slice(&[0u8; 16]);
+
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 8,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("应拒绝超大的 box");
+    assert!(err.to_string().contains("unreasonably large"), "{err}");
+}
+
+#[test]
+fn decrypt_stream_handles_64bit_box_size_header() {
+    // 64 位 size 的 free box（size 字段为 1，后跟 u64 实际长度）：不能 panic
+    let mut file = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+    let payload = [0u8; 8];
+    file.extend_from_slice(&1u32.to_be_bytes());
+    file.extend_from_slice(b"free");
+    file.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
+    file.extend_from_slice(&payload);
+
+    // 后面没有 moov：走「moov 不在 mdat 之前」的兜底，最终报错而不是 panic
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 3,
+    };
+    let mut out = Vec::new();
+    assert!(decrypt_stream(&mut input, &KEY, &mut out).is_err());
+}
+
+#[test]
 fn decrypt_stream_rejects_truncated_mdat() {
     let file = encrypted_fixture();
     // 砍掉最后一个样本的一半，样本表仍然声明完整大小
