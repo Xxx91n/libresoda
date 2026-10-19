@@ -138,6 +138,33 @@ pub fn get(url: &str, options: &[RequestOption]) -> Result<Vec<u8>> {
     Ok(get_full(url, options)?.body)
 }
 
+/// GET 请求，返回**流式读取器**，不把响应体读进内存。
+///
+/// 用于整曲下载：调用方可以边收边解密边写盘，峰值内存与单曲大小无关
+/// （无损整曲 40~80MB，整块读入会同时占住 body + 解密副本）。
+pub fn get_reader(url: &str, options: &[RequestOption]) -> Result<Box<dyn Read>> {
+    let merged = merge_options(options);
+    let mut request = ureq::get(url)
+        .timeout(merged.timeout_value())
+        .set("User-Agent", DEFAULT_USER_AGENT);
+    for (key, value) in merged.headers() {
+        request = request.set(key, value);
+    }
+
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let final_url = response.get_url().to_string();
+            return Err(SodaError::http(format!(
+                "http request failed: status {status} ({final_url})"
+            )));
+        }
+        Err(err) => return Err(SodaError::http(err.to_string())),
+    };
+
+    Ok(Box::new(response.into_reader()))
+}
+
 /// POST 请求，返回响应体（对应上游 `utils.Post`）。
 pub fn post_json(url: &str, body: &[u8], options: &[RequestOption]) -> Result<Vec<u8>> {
     Ok(post_bytes(url, body, options)?.body)

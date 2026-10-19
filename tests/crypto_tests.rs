@@ -5,10 +5,11 @@
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use libresoda::soda::crypto::{
-    box_child_start, decode_base36, decrypt_audio_with_key, decrypt_senc_sample,
+    box_child_start, decode_base36, decrypt_audio_with_key, decrypt_senc_sample, decrypt_stream,
     encrypted_sample_original_format, extract_key, find_box, find_box_deep, parse_senc, parse_stsz,
     SencSample,
 };
+use std::io::Read;
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -232,6 +233,124 @@ fn decrypt_audio_with_key_restores_plaintext_samples() {
     let stsd = find_box_deep(&decrypted, b"stsd", 0, decrypted.len()).expect("stsd");
     assert!(!stsd.data.windows(4).any(|window| window == b"enca"));
     assert!(stsd.data.windows(4).any(|window| window == b"mp4a"));
+}
+
+// ---------------------------------------------------------------------------
+// 流式解密：输出必须与整块解密逐字节一致
+// ---------------------------------------------------------------------------
+
+/// 每次只吐几个字节的读取器：验证流式解密不依赖一次性读取。
+struct Dribble<'a> {
+    data: &'a [u8],
+    pos: usize,
+    step: usize,
+}
+
+impl Read for Dribble<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(self.step).min(self.data.len() - self.pos);
+        buf[..len].copy_from_slice(&self.data[self.pos..self.pos + len]);
+        self.pos += len;
+        Ok(len)
+    }
+}
+
+/// 三个样本，其中一个带 subsample（明文段 + 密文段），覆盖两条解密分支。
+fn encrypted_fixture() -> Vec<u8> {
+    let ivs: [[u8; 8]; 3] = [[4; 8], [5; 8], [6; 8]];
+    let clear = vec![0x11u8; 16];
+    let secret: Vec<u8> = (0..48u8).map(|value| value.wrapping_mul(7)).collect();
+    let mut plain_samples: Vec<Vec<u8>> = Vec::new();
+    plain_samples.push((0..128u8).collect());
+    plain_samples.push({
+        let mut sample = clear.clone();
+        sample.extend_from_slice(&secret);
+        sample
+    });
+    plain_samples.push((0..96u8).map(|value| value.wrapping_add(3)).collect());
+
+    let mut encrypted_mdat: Vec<u8> = Vec::new();
+    let mut senc_payload = vec![0u8; 8];
+    senc_payload[4..8].copy_from_slice(&(ivs.len() as u32).to_be_bytes());
+    for (index, sample) in plain_samples.iter().enumerate() {
+        let iv = ivs[index];
+        if index == 1 {
+            // subsample：前 16 字节明文，后 48 字节密文
+            encrypted_mdat.extend_from_slice(&clear);
+            encrypted_mdat.extend_from_slice(&ctr_apply(&secret, &iv));
+            // senc: iv(8) + 子样本数(2) + (clear(u16), encrypted(u32))
+            senc_payload.extend_from_slice(&iv);
+            senc_payload.extend_from_slice(&1u16.to_be_bytes());
+            senc_payload.extend_from_slice(&(16u16).to_be_bytes());
+            senc_payload.extend_from_slice(&(48u32).to_be_bytes());
+        } else {
+            encrypted_mdat.extend_from_slice(&ctr_apply(sample, &iv));
+            senc_payload.extend_from_slice(&iv);
+        }
+    }
+    let sample_sizes: Vec<u32> = plain_samples.iter().map(|s| s.len() as u32).collect();
+    build_mp4(&sample_sizes, &senc_payload, &encrypted_mdat, 8)
+}
+
+#[test]
+fn decrypt_stream_matches_batch_output() {
+    let file = encrypted_fixture();
+    let expected = decrypt_audio_with_key(&file, &KEY).expect("batch decrypt");
+
+    // 1 字节、3 字节、跨 box 边界的 7 字节、以及一次性读完
+    for step in [1usize, 3, 7, 4096] {
+        let mut input = Dribble {
+            data: &file,
+            pos: 0,
+            step,
+        };
+        let mut out = Vec::new();
+        decrypt_stream(&mut input, &KEY, &mut out).expect("stream decrypt");
+        assert_eq!(out, expected, "step={step} 时流式输出与整块解密不一致");
+    }
+}
+
+#[test]
+fn decrypt_stream_falls_back_when_moov_follows_mdat() {
+    // 少见但合法的排布：ftyp + mdat + moov。流式路径应退回整块解密。
+    let file = encrypted_fixture();
+    let moov = find_box(&file, b"moov", 0, file.len()).expect("moov");
+    let mdat = find_box(&file, b"mdat", 0, file.len()).expect("mdat");
+    let ftyp = find_box(&file, b"ftyp", 0, file.len()).expect("ftyp");
+    let ftyp_bytes = file[ftyp.offset..ftyp.offset + ftyp.size].to_vec();
+    let mdat_bytes = file[mdat.offset..mdat.offset + mdat.size].to_vec();
+    let moov_bytes = file[moov.offset..moov.offset + moov.size].to_vec();
+
+    let mut reordered = ftyp_bytes;
+    reordered.extend_from_slice(&mdat_bytes);
+    reordered.extend_from_slice(&moov_bytes);
+
+    let expected = decrypt_audio_with_key(&reordered, &KEY).expect("batch decrypt");
+    let mut input = Dribble {
+        data: &reordered,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("stream decrypt");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn decrypt_stream_rejects_truncated_mdat() {
+    let file = encrypted_fixture();
+    // 砍掉最后一个样本的一半，样本表仍然声明完整大小
+    let truncated = &file[..file.len() - 48];
+    let mut input = Dribble {
+        data: truncated,
+        pos: 0,
+        step: 9,
+    };
+    let mut out = Vec::new();
+    assert!(decrypt_stream(&mut input, &KEY, &mut out).is_err());
 }
 
 // ---------------------------------------------------------------------------

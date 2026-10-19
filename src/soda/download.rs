@@ -11,6 +11,7 @@ use super::types::DownloadInfo;
 use super::Soda;
 use crate::error::{Result, SodaError};
 use crate::model::{Song, SOURCE_SODA};
+use std::io::Write;
 use std::path::Path;
 
 /// 等价 `GetDownloadInfo`。
@@ -257,27 +258,51 @@ pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Resul
         return Err(SodaError::invalid_input("invalid download url"));
     }
 
-    let body = crate::http::get(
-        url,
-        &[crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)],
-    )?;
-
-    // SEO url_player_info 对免费歌曲返回明文 m4a（无 play_auth），无需解密；
-    // Android 签名/加密流才有 play_auth，此时必须解密。
-    let data = if info.play_auth.trim().is_empty() {
-        body
-    } else {
-        super::crypto::decrypt_audio(&body, &info.play_auth)
-            .map_err(|err| SodaError::crypto(format!("decrypt failed: {err}")))?
-    };
-
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(output_path, data)?;
-    Ok(info)
+
+    // 边下边解密边写盘：整曲不再进内存。无损单曲 40~80MB，之前「body + 解密副本」
+    // 会让峰值内存翻倍；配合多首预取并发，实测能占到几百 MB。
+    let options =
+        [crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)];
+    let mut reader = crate::http::get_reader(url, &options)?;
+    let file = std::fs::File::create(output_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+
+    let written = if info.play_auth.trim().is_empty() {
+        // SEO url_player_info 对免费歌曲返回明文 m4a（无 play_auth），直接落盘
+        std::io::copy(&mut reader, &mut writer)
+            .map(|bytes| bytes as usize)
+            .map_err(|err| SodaError::http(err.to_string()))
+    } else {
+        super::crypto::decrypt_stream_with_auth(&mut reader, &info.play_auth, &mut writer)
+            .map(|()| 0)
+    };
+
+    let flush = writer
+        .flush()
+        .map_err(|err| SodaError::http(err.to_string()));
+    drop(writer);
+
+    match (written, flush) {
+        (Err(err), _) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(err)
+        }
+        (Ok(_), Err(err)) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(err)
+        }
+        (Ok(bytes), Ok(())) => {
+            // 写出的字节数应当是解密后的实际大小；info.size 是服务端声明的原始长度，
+            // 只用于调用方的截断校验，这里不覆盖。
+            let _ = bytes;
+            Ok(info)
+        }
+    }
 }
 
 impl Soda {

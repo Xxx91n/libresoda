@@ -7,6 +7,7 @@ use crate::util::bitcount;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use std::io::{Read, Write};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -130,6 +131,170 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
     }
 
     Ok(decrypted_data)
+}
+
+/// 流式解密：边读边解边写，峰值内存只与「单个样本」和「mdat 之前的 box」有关。
+///
+/// 与 [`decrypt_audio_with_key`] 的输出**逐字节一致**，区别只是不再把整首
+/// （无损 40~80MB）连同解密副本一起放进内存：
+///
+/// * `mdat` 之前的所有顶层 box（`ftyp` / `moov` / `free` …，通常几十 KB）读进内存，
+///   因为样本表 `stsz`、初始化向量 `senc`、`stsd` 编码改写都在 `moov` 里；
+/// * `mdat` 载荷按样本大小逐块读出、解密、写出，缓冲只占一个样本（几 KB）；
+/// * 少数 `moov` 排在 `mdat` 之后的文件无法流式处理，退回整块解密，保证兼容性。
+pub fn decrypt_stream<R: Read, W: Write>(
+    input: &mut R,
+    key_bytes: &[u8],
+    out: &mut W,
+) -> Result<()> {
+    if key_bytes.len() != 16 {
+        return Err(SodaError::crypto("invalid aes key length"));
+    }
+
+    // 1) 读到 mdat 为止的前导 box（含 64 位 size 的加长头）
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut mdat_header: Vec<u8> = Vec::new();
+    let mdat_payload_len: usize;
+    loop {
+        let mut head = [0u8; 8];
+        input
+            .read_exact(&mut head)
+            .map_err(|err| SodaError::crypto(format!("read box header failed: {err}")))?;
+        let size32 = u32::from_be_bytes(head[0..4].try_into().unwrap_or_default());
+        let kind = &head[4..8];
+        let (size, header_len, ext) = if size32 == 1 {
+            let mut ext = [0u8; 8];
+            input
+                .read_exact(&mut ext)
+                .map_err(|err| SodaError::crypto(format!("read box header failed: {err}")))?;
+            (u64::from_be_bytes(ext) as usize, 16usize, Some(ext))
+        } else {
+            (size32 as usize, 8usize, None)
+        };
+        if size < header_len {
+            return Err(SodaError::crypto("invalid box size"));
+        }
+
+        if kind == b"mdat" {
+            mdat_header.extend_from_slice(&head);
+            if let Some(ext) = ext {
+                mdat_header.extend_from_slice(&ext);
+            }
+            mdat_payload_len = size - header_len;
+            break;
+        }
+
+        let mut payload = vec![0u8; size - header_len];
+        input
+            .read_exact(&mut payload)
+            .map_err(|err| SodaError::crypto(format!("read box payload failed: {err}")))?;
+        prefix.extend_from_slice(&head[..header_len]);
+        prefix.extend_from_slice(&payload);
+    }
+
+    // 2) moov 在 mdat 之后：这种文件没法边下边解，退回整块解密
+    if find_box(&prefix, b"moov", 0, prefix.len()).is_none() {
+        let mut rest = Vec::new();
+        input
+            .read_to_end(&mut rest)
+            .map_err(|err| SodaError::crypto(format!("read file failed: {err}")))?;
+        let mut full = prefix;
+        full.extend_from_slice(&mdat_header);
+        full.extend_from_slice(&rest);
+        let plain = decrypt_audio_with_key(&full, key_bytes)?;
+        out.write_all(&plain)
+            .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+        return Ok(());
+    }
+
+    // 3) 从前导 box 里解出样本表 / 初始化向量 / 编码改写
+    let moov = find_box(&prefix, b"moov", 0, prefix.len())
+        .ok_or_else(|| SodaError::crypto("moov box not found"))?;
+    let mut stbl = find_box(&prefix, b"stbl", moov.offset, moov.offset + moov.size);
+    if stbl.is_none() {
+        if let Some(trak) = find_box(&prefix, b"trak", moov.offset + 8, moov.offset + moov.size) {
+            if let Some(mdia) = find_box(&prefix, b"mdia", trak.offset + 8, trak.offset + trak.size)
+            {
+                if let Some(minf) =
+                    find_box(&prefix, b"minf", mdia.offset + 8, mdia.offset + mdia.size)
+                {
+                    stbl = find_box(&prefix, b"stbl", minf.offset + 8, minf.offset + minf.size);
+                }
+            }
+        }
+    }
+    let stbl = stbl.ok_or_else(|| SodaError::crypto("stbl box not found"))?;
+
+    let stsz = find_box(&prefix, b"stsz", stbl.offset + 8, stbl.offset + stbl.size)
+        .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
+    let sample_sizes = parse_stsz(stsz.data);
+
+    let senc = find_box(&prefix, b"senc", moov.offset + 8, moov.offset + moov.size)
+        .or_else(|| find_box(&prefix, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
+        .ok_or_else(|| SodaError::crypto("senc box not found"))?;
+    let per_sample_iv_size =
+        default_per_sample_iv_size(&prefix, stbl.offset, stbl.offset + stbl.size);
+    let senc_samples = parse_senc(senc.data, per_sample_iv_size);
+
+    // stsd 里的 `enca` 还原成 `frma` 指向的原始编码格式（与整块解密一致）
+    if let Some(stsd) = find_box(&prefix, b"stsd", stbl.offset + 8, stbl.offset + stbl.size) {
+        let start = stsd.offset;
+        let end = stsd.offset + stsd.size;
+        if let Some(index) = find_subslice(&prefix[start..end], b"enca") {
+            let original = encrypted_sample_original_format(&prefix[start..end]);
+            let target = start + index;
+            if target + 4 <= prefix.len() {
+                prefix[target..target + 4].copy_from_slice(&original);
+            }
+        }
+    }
+
+    out.write_all(&prefix)
+        .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+    out.write_all(&mdat_header)
+        .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+
+    // 4) 逐样本解密 mdat
+    let mut remaining = mdat_payload_len;
+    for (index, size) in sample_sizes.iter().enumerate() {
+        let size = *size as usize;
+        if size > remaining {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+        let mut chunk = vec![0u8; size];
+        input
+            .read_exact(&mut chunk)
+            .map_err(|err| SodaError::crypto(format!("read mdat failed: {err}")))?;
+        remaining -= size;
+
+        match senc_samples.get(index) {
+            Some(sample) => {
+                let plain = decrypt_senc_sample(key_bytes, &chunk, sample);
+                out.write_all(&plain)
+                    .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+            }
+            None => out
+                .write_all(&chunk)
+                .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?,
+        }
+    }
+
+    // 样本没覆盖满 mdat：与整块解密一样视为错误，避免写出半截文件
+    if remaining > 0 {
+        return Err(SodaError::crypto("decrypted size mismatch"));
+    }
+    Ok(())
+}
+
+/// [`decrypt_stream`] 的便捷版本：直接从 `play_auth` 还原密钥。
+pub fn decrypt_stream_with_auth<R: Read, W: Write>(
+    input: &mut R,
+    play_auth: &str,
+    out: &mut W,
+) -> Result<()> {
+    let hex_key = extract_key(play_auth)?;
+    let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
+    decrypt_stream(input, &key_bytes, out)
 }
 
 /// 等价 `encryptedSampleOriginalFormat`：从 `frma` box 里读原始格式，失败则退回 `mp4a`。
