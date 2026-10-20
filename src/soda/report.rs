@@ -348,6 +348,9 @@ pub fn report_play_progress(
 }
 
 /// 上报一次「时长」：暂停 / 播完 / 切歌 / 换队列时调用。
+///
+/// 参数与官方 applog 事件的字段一一对应，拆成结构体会让调用侧更难对照。
+#[allow(clippy::too_many_arguments)]
 pub fn report_play_duration(
     soda: &Soda,
     identity: &ApplogIdentity,
