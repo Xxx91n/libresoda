@@ -9,6 +9,11 @@ use std::time::Duration;
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
 
+/// 整曲音频流的建连超时。
+const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 整曲音频流的单次读取空闲超时，不是整首下载的总时限。
+const AUDIO_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// 请求选项；对应 Go 的 `utils.RequestOption` 组合（`WithHeader` / Cookie）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestOption {
@@ -143,12 +148,39 @@ pub fn get(url: &str, options: &[RequestOption]) -> Result<Vec<u8>> {
 /// 用于整曲下载：调用方可以边收边解密边写盘，峰值内存与单曲大小无关
 /// （无损整曲 40~80MB，整块读入会同时占住 body + 解密副本）。
 pub fn get_reader(url: &str, options: &[RequestOption]) -> Result<Box<dyn Read>> {
+    let agent = audio_agent();
+    get_reader_with_agent(url, options, &agent)
+}
+
+/// 音频流专用 Agent：只限制建连和单次读取，不设整首下载的总时限。
+///
+/// `ureq::Request::timeout` 包含读取响应体，慢 CDN 上 25~54MB 的无损整曲
+/// 很容易超过 30 秒。这里用 `timeout_read` 表达“空闲多久算断流”，只要
+/// CDN 还在持续吐数据，下载就可以继续。
+fn audio_agent() -> ureq::Agent {
+    audio_agent_with_timeouts(AUDIO_CONNECT_TIMEOUT, AUDIO_READ_TIMEOUT)
+}
+
+fn audio_agent_with_timeouts(connect: Duration, read: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read)
+        .build()
+}
+
+fn get_reader_with_agent(
+    url: &str,
+    options: &[RequestOption],
+    agent: &ureq::Agent,
+) -> Result<Box<dyn Read>> {
     let merged = merge_options(options);
-    let mut request = ureq::get(url)
-        .timeout(merged.timeout_value())
-        .set("User-Agent", DEFAULT_USER_AGENT);
+    let mut request = agent.get(url).set("User-Agent", DEFAULT_USER_AGENT);
     for (key, value) in merged.headers() {
         request = request.set(key, value);
+    }
+    // 默认不再套 30 秒整体超时；但调用方显式设置的 timeout 仍然生效。
+    if let Some(timeout) = merged.timeout {
+        request = request.timeout(timeout);
     }
 
     let response = match request.call() {
@@ -226,4 +258,87 @@ fn parse_set_cookie(raw: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name.to_string(), value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// 本地慢速 HTTP 服务：先回响应头，再按固定间隔逐字节发送 body。
+    fn slow_server(chunks: &'static [u8], delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                chunks.len()
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in chunks {
+                thread::sleep(delay);
+                if stream.write_all(&[*chunk]).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/audio"), handle)
+    }
+
+    #[test]
+    fn slow_audio_stream_uses_idle_timeout_instead_of_overall_timeout() {
+        let chunks = b"abcd";
+
+        // 旧行为：整体超时会截断总时长超过它的慢速流。
+        let (url, server) = slow_server(chunks, Duration::from_millis(300));
+        let old_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(100))
+            .build();
+        let old_ok = match get_reader_with_agent(&url, &[], &old_agent) {
+            Ok(mut reader) => {
+                let mut body = Vec::new();
+                reader.read_to_end(&mut body).is_ok()
+            }
+            Err(_) => false,
+        };
+        assert!(!old_ok, "整体超时应截断慢速流");
+        server.join().expect("server");
+
+        // 新行为：没有整体时限，只要每次读取之间的间隔小于空闲超时就能完成。
+        let (url, server) = slow_server(chunks, Duration::from_millis(300));
+        let new_agent =
+            audio_agent_with_timeouts(Duration::from_millis(200), Duration::from_secs(2));
+        let mut reader = get_reader_with_agent(&url, &[], &new_agent).expect("headers");
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .expect("slow stream should finish");
+        assert_eq!(body, chunks);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn explicit_request_timeout_is_still_applied_to_reader() {
+        let chunks = b"abcd";
+        let (url, server) = slow_server(chunks, Duration::from_millis(300));
+        let agent = audio_agent_with_timeouts(Duration::from_millis(200), Duration::from_secs(2));
+        let options = [RequestOption::new().timeout(Duration::from_millis(100))];
+        let timed_out = match get_reader_with_agent(&url, &options, &agent) {
+            Ok(mut reader) => {
+                let mut body = Vec::new();
+                reader.read_to_end(&mut body).is_err()
+            }
+            Err(_) => true,
+        };
+        assert!(timed_out, "调用方显式 timeout 不能被忽略");
+        server.join().expect("server");
+    }
 }
