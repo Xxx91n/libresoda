@@ -83,6 +83,9 @@
   峰值内存 = 明文 + 密文两份整曲；Rust 侧 `download_with_info` 改用
   `http::get_reader` + `crypto::decrypt_stream`，边下边解边写盘，峰值只与单个
   样本有关。输出文件与整块路径逐字节一致（`tests/crypto_tests.rs` 有回归）。
+  音频流专用 Agent 使用建连 10s + 单次读取空闲 20s，不设整首下载总时限，
+  避免慢 CDN 上的大体积无损文件被 30s 整体超时截断
+  （见 [`sodahub-org/sodam#12`](https://github.com/sodahub-org/sodam/issues/12)）。
 
 ## 未移植项
 
