@@ -9,8 +9,9 @@
 //! | 进度 | applog 埋点 | `POST https://mcs.zijieapi.com/v1/json` | `tryReportMetricsProgressed` |
 //! | 时长 | applog 埋点 | 同上 | `reportMediaFinish` / `reportMediaOverBySuspend` |
 //!
-//! 埋点不是签名接口：官方客户端也只用 `fetch` + `Content-Type` + `X-SS-STUB`
-//! 直发 MCS，不带 `x-helios` / `x-medusa`。业务接口照其它写操作走 [`super::pc_post_json`]。
+//! 埋点不是签名接口：官方客户端用 Slardar SDK 的 batch sender
+//! (`{"ev_type":"batch","list":[...]}`) 直发 MCS，不带 `x-helios` / `x-medusa`。
+//! 业务接口照其它写操作走 [`super::pc_post_json`]。
 
 use std::hash::{BuildHasher, Hasher};
 use std::sync::OnceLock;
@@ -275,8 +276,20 @@ pub fn finish_metric_event(media: &MediaRef, played_ms: i64, duration_seconds: f
     applog_event("player_metrics", params)
 }
 
-/// 组装 MCS 批量上报 body。
-pub fn applog_body(identity: &ApplogIdentity, is_playing: bool, events: &[Value]) -> Value {
+/// 组装 Slardar SDK 的批量上报 envelope。
+///
+/// 官方 `@slardar/web` 的 `createBatchSender` 最终发送的是
+/// `{"ev_type":"batch","list":[...events...]}`；不能把单条自定义
+/// `{caller,user,header,events}` 直接当成 MCS 的 applog 请求。
+pub fn applog_body(_identity: &ApplogIdentity, _is_playing: bool, events: &[Value]) -> Value {
+    json!({
+        "ev_type": "batch",
+        "list": events,
+    })
+}
+
+/// 保留 applog 的单条事件 identity envelope；供未来显式调试 / 兼容旧服务。
+pub fn legacy_applog_body(identity: &ApplogIdentity, is_playing: bool, events: &[Value]) -> Value {
     let device_id = identity.resolved_device_id();
     let device_id = device_id.trim();
     let user_id = identity.user_id.trim();
@@ -640,13 +653,8 @@ mod tests {
             ..Default::default()
         };
         let body = applog_body(&identity, true, &[play_event(&track("1"))]);
-        assert_eq!(body["caller"], CALLER);
-        assert_eq!(body["header"]["app_id"], APP_ID);
-        assert_eq!(body["header"]["app_version"], "3.8.0");
-        assert_eq!(body["user"]["user_unique_id"], "7123456789012345");
-        assert_eq!(body["user"]["user_id"], "999");
-        assert_eq!(body["user"]["user_is_login"], true);
-        assert_eq!(body["events"][0]["event"], "audio_play");
+        assert_eq!(body["ev_type"], "batch");
+        assert_eq!(body["list"][0]["event"], "audio_play");
     }
 
     #[test]
@@ -662,7 +670,7 @@ mod tests {
 
     #[test]
     fn empty_identity_falls_back_to_fake_did() {
-        let body = applog_body(&ApplogIdentity::default(), false, &[]);
+        let body = legacy_applog_body(&ApplogIdentity::default(), false, &[]);
         let did = body["user"]["user_unique_id"].as_str().unwrap();
         assert!(did.starts_with("100000"), "fallback did shape: {did}");
         assert_eq!(did.len(), 19);
