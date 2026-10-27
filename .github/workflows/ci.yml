@@ -1,3 +1,5 @@
+# 本文件只属于 fork（Xxx91n/libresoda）的 ci/verify 分支：它是本次工作的验证手段，
+# 不是仓库产物。合入上游前必须删掉它——上游 PR 里不含任何 CI 配置文件（见 issue #4）。
 name: CI
 
 on:
