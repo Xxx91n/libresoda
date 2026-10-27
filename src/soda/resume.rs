@@ -3,21 +3,32 @@
 //! 只回答一个问题：「本地这段没下完的字节，这次还能不能接着用」。
 //! 输入全部是已经拿在手上的事实（本地字节数、记录里的总长与密钥指纹、这次响应的
 //! 状态码与 `Content-Range`），所以这里不碰网络也不碰磁盘，每个协议分支都能单测。
+//!
+//! 消费方是取数层与记录文件（issue #6/#7），所以整模块 `pub(crate)`：判断规则一旦公开
+//! 就成了对下游的承诺。
+
+// 消费方（issue #6/#7）尚未落地，先允许 dead_code，否则 clippy -D warnings 会红。
+#![allow(dead_code)]
 
 /// `Content-Range` 的解析结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ContentRange {
+pub(crate) struct ContentRange {
     /// 区间首字节（含）；`bytes */N` 形态不带区间，为 `None`。
-    pub(super) first: Option<u64>,
+    pub(crate) first: Option<u64>,
     /// 区间末字节（含）；同上。
-    pub(super) last: Option<u64>,
+    pub(crate) last: Option<u64>,
     /// 服务端认定的文件总长。
-    pub(super) total: u64,
+    pub(crate) total: u64,
 }
 
-/// 解析 `Content-Range`，只认 `bytes` 单位；其它形态（含无效区间）返回 `None`。
-pub(super) fn parse_content_range(value: &str) -> Option<ContentRange> {
-    let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+/// 解析 `Content-Range`；单位不是 `bytes`、或区间形态不合法的返回空。
+pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
+    // 单位是大小写不敏感的 token（各家 CDN 改写过头部大小写），分隔符按 OWS 收空格与制表符。
+    let (unit, rest) = value.trim().split_once(char::is_whitespace)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim().split_once('/')?;
     let total = total.trim().parse().ok()?;
     // `bytes */N`：`416` 只承认总长，不给区间。
     if range.trim() == "*" {
@@ -43,55 +54,51 @@ pub(super) fn parse_content_range(value: &str) -> Option<ContentRange> {
 
 /// 续传判断的动作。
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum ResumeAction {
+pub(crate) enum ResumeAction {
     /// 旧数据是同一文件的前缀：从 `offset` 起继续追加本次响应。
     Append { offset: u64 },
     /// 服务器忽略了范围请求：本次响应本身就是整份文件，作废旧数据后整份重写。
     FullResponse,
-    /// 旧数据不可信：丢掉它和本次响应，从 0 重新发一次整份请求。
+    /// 这次响应不能用来续传：本地这段接不上，只能从 0 重新发一次整份请求。
+    /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
     /// 服务器说文件就到本地长度为止：旧数据其实已经完整。
     Complete,
 }
 
 /// 判断所需的全部事实：本地有什么、记录里写了什么、这次服务器回了什么。
-pub(super) struct ResumeProbe<'a> {
+pub(crate) struct ResumeProbe<'a> {
     /// 本地 `.part` 的实际字节数。
-    pub(super) local_len: u64,
+    pub(crate) local_len: u64,
     /// 记录文件里的文件总长。
-    pub(super) recorded_total: u64,
+    pub(crate) recorded_total: u64,
     /// 记录文件里的解密密钥指纹。
-    pub(super) recorded_fingerprint: &'a [u8],
+    pub(crate) recorded_fingerprint: &'a [u8],
     /// 这次取流解出的解密密钥指纹。
-    pub(super) current_fingerprint: &'a [u8],
+    pub(crate) current_fingerprint: &'a [u8],
     /// 这次响应的状态码。
-    pub(super) status: u16,
+    pub(crate) status: u16,
     /// 这次响应的 `Content-Range`，没带则为空。
-    pub(super) range: Option<&'a ContentRange>,
+    pub(crate) range: Option<&'a ContentRange>,
 }
 
 /// 由这次响应自己证明本地那段字节还能不能接上。
-pub(super) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
+///
+/// 这里只回答「能不能接」。错误响应该不该留旧数据是调用方的判断，不要把处置表搬进来。
+pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
     match (probe.status, probe.range) {
+        // 整份响应并不复用旧数据，所以密钥换了也照样能用它。
         (200, _) => ResumeAction::FullResponse,
-        // 除 200 之外的分支都要复用旧数据；密钥换了，这段字节的身份就没人能证明。
+        // 另两个「能接上」的结论都靠旧数据：密钥换了，那段字节的身份就没人能证明。
         _ if probe.current_fingerprint != probe.recorded_fingerprint => {
             ResumeAction::RestartFromZero
         }
-        (416, Some(range)) => {
-            if range.total == probe.local_len {
-                ResumeAction::Complete
-            } else {
-                ResumeAction::RestartFromZero
-            }
-        }
-        (206, Some(range)) => {
-            if range.first == Some(probe.local_len) && range.total == probe.recorded_total {
-                ResumeAction::Append {
-                    offset: probe.local_len,
-                }
-            } else {
-                ResumeAction::RestartFromZero
+        (416, Some(range)) if range.total == probe.local_len => ResumeAction::Complete,
+        (206, Some(range))
+            if range.first == Some(probe.local_len) && range.total == probe.recorded_total =>
+        {
+            ResumeAction::Append {
+                offset: probe.local_len,
             }
         }
         _ => ResumeAction::RestartFromZero,
@@ -202,10 +209,36 @@ mod resume_tests {
                 probe(400, 1000, KEY, KEY, 503, None),
                 ResumeAction::RestartFromZero,
             ),
+            (
+                "200 且密钥指纹不符",
+                probe(400, 1000, KEY, OTHER_KEY, 200, None),
+                ResumeAction::FullResponse,
+            ),
+            (
+                "416 且记录总长与本地不等",
+                probe(1000, 1200, KEY, KEY, 416, Some(&only_total)),
+                ResumeAction::Complete,
+            ),
+            (
+                "416 且密钥指纹不符",
+                probe(1000, 1000, KEY, OTHER_KEY, 416, Some(&only_total)),
+                ResumeAction::RestartFromZero,
+            ),
         ];
         for (name, input, expected) in cases {
             assert_eq!(decide_resume_action(&input), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn unparsable_header_cannot_resume() {
+        // 解析与判断的接缝：坏头解析成空，判断按「缺范围头」处理。
+        let broken = parse_content_range("bytes 500-499/1000");
+        assert_eq!(broken, None);
+        assert_eq!(
+            decide_resume_action(&probe(400, 1000, KEY, KEY, 206, broken.as_ref())),
+            ResumeAction::RestartFromZero
+        );
     }
 
     #[test]
@@ -240,5 +273,27 @@ mod resume_tests {
         // 总长不大于末字节
         assert_eq!(parse_content_range("bytes 0-999/999"), None);
         assert_eq!(parse_content_range("bytes 0-1000/1000"), None);
+    }
+
+    #[test]
+    fn parses_unit_token_case_insensitively() {
+        // 头部大小写各家 CDN 会改写（与 ETag 忽略大小写同一类问题）
+        assert_eq!(
+            parse_content_range("Bytes 0-499/1000"),
+            Some(ContentRange {
+                first: Some(0),
+                last: Some(499),
+                total: 1000
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_forms_that_are_not_a_byte_segment() {
+        assert_eq!(parse_content_range("items 0-499/1000"), None);
+        assert_eq!(parse_content_range("bytes 0-499/*"), None);
+        assert_eq!(parse_content_range("bytes */*"), None);
+        assert_eq!(parse_content_range("bytes 400/1000"), None);
+        assert_eq!(parse_content_range(""), None);
     }
 }
