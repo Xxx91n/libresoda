@@ -3,10 +3,12 @@
 //! 只读取证：**不下载音频、不解码、不改动任何产品代码**。结论写回上级 issue #2
 //! 的「待定」一节，输入就是本程序末尾那张汇总表。
 //!
-//! 凭据与曲目 id 一律只从环境变量读，绝不落盘。输出侧全部脱敏：密钥与 `play_auth`
-//! 只给指纹，track id 默认只给**指纹 + 长度**——只留前 4 后 4 是不够的：同一次运行
-//! 还会印出搜索词、时长与体积，公共搜索结果里一拼就能定位到具体曲目，而这份输出
-//! 要粘进公开 issue（AGENTS.md「测试规范」禁止把 track id 写进测试输出）。
+//! 凭据与曲目 id 一律只从环境变量读，绝不落盘。密钥与 `play_auth` 只给指纹；
+//! track id 默认给**指纹 + 长度**（只留前 4 后 4 不够：同一次运行还印了时长与体积）。
+//! 但这层掩码只是防随手复制，不是硬脱敏——FNV 是确定性函数，拿到搜索词的人可以对
+//! 公开结果重算一遍。所以**写回 issue 只粘末尾那张计数表**；逐次明细行（含精确时长、
+//! 体积、CDN 主机名）属于操作者自己的终端，不要整段贴出去
+//! （AGENTS.md「测试规范」禁止把 track id 写进测试输出）。
 //!
 //! ```text
 //! SODA_COOKIE            必需；登录态（sessionid / sessionid_ss / sid_tt 任一）
@@ -43,8 +45,9 @@ use std::sync::Arc;
 const MAX_ALLOC_BYTES: usize = 512 * 1024 * 1024;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
-/// 中止流程里禁止再分配：`eprintln!` 自身要分配，重入本函数会一路递归到栈溢出，
-/// 所以触发护栏时直接 abort、不试图打印（退出信号就是护栏触发的信号）。
+/// 中止路径上仍可能再分配（`abort` 的实现不保证不分配，打印更是肯定要），而重入本
+/// 函数会再判一次超限、再 abort，形成递归直到栈溢出。所以触发护栏后一律拒绝分配、
+/// 也不试图打印：退出信号本身就是护栏触发的信号。
 static BREACH: AtomicBool = AtomicBool::new(false);
 
 struct Capped;
@@ -129,6 +132,8 @@ struct TrackRow {
     usable: usize,
     hosts: usize,
     keys: usize,
+    /// #2「换发 play_auth 而密钥不变」这条假设在本曲目上的状态。
+    auth: String,
     verdict: String,
 }
 
@@ -407,6 +412,7 @@ fn main() {
                 usable: 0,
                 hosts: 0,
                 keys: 0,
+                auth: "无样本".to_string(),
                 verdict: "无密钥可判".to_string(),
             });
             continue;
@@ -465,6 +471,7 @@ fn main() {
         // 否则「换了 n 份 auth 而密钥不变」会被试听流样本背书。
         let distinct_auths = count_distinct(lossless_good.iter().map(|o| o.auth_fp.as_str()));
         let equal = keys_all_equal(&lossless_good);
+        let distinct_keys = count_distinct(lossless_good.iter().filter_map(|o| o.key));
         let verdict = match equal {
             None => {
                 thin += 1;
@@ -485,38 +492,47 @@ fn main() {
             }
             Some(false) => {
                 unstable += 1;
-                let distinct_keys = count_distinct(lossless_good.iter().filter_map(|o| o.key));
                 format!("密钥轮换：无损样本解出 {distinct_keys} 把不同密钥")
             }
         };
         println!("  → {verdict}");
 
         // #2 的设计假设：「同一个文件可能换发不同的 play_auth 而密钥不变」。
+        // (0, _) 只可能是「一个无损样本都没有」：lossless_good 是 good 的子集，而 good
+        // 要求解得出密钥、也就必然发过 play_auth，不存在「有样本却数出 0 份 auth」。
         let auth_note = match (distinct_auths, equal) {
-            (0, _) => "未被触发（无损样本全程没发 play_auth）".to_string(),
-            (1, _) => "未被触发（play_auth 每次都一样，短窗口内平台没换发；这条假设仍未被验证）"
+            (0, _) => "没有无损整曲样本，这条没有输入".to_string(),
+            (1, _) => "未被触发（play_auth 每次都一样；本窗口内平台没换发，这条假设仍未被验证）"
                 .to_string(),
             (n, Some(true)) => format!("成立（无损样本里 play_auth 换了 {n} 份，密钥仍是同一把）"),
             (n, Some(false)) => format!("不成立（play_auth 换了 {n} 份，密钥也跟着变）"),
             (n, None) => format!("无法判定（play_auth 换了 {n} 份，但无损样本不足 2 次）"),
         };
         println!("  → 「换发 play_auth 而密钥不变」：{auth_note}");
+        let auth_short = match (distinct_auths, equal) {
+            (0, _) => "无样本",
+            (1, _) => "未触发",
+            (_, Some(true)) => "成立",
+            (_, Some(false)) => "不成立",
+            (_, None) => "样本不足",
+        };
 
         rows.push(TrackRow {
             id_fp: show_id(track_id),
             usable: lossless_good.len(),
             hosts: lossless_hosts,
-            keys: count_distinct(lossless_good.iter().filter_map(|o| o.key)),
+            keys: distinct_keys,
+            auth: auth_short.to_string(),
             verdict,
         });
     }
 
     println!("\n=== 票 #3 汇总表（写回 #2「待定」一节就用这张表）===");
-    println!("track(idFp)          无损样本  主机数  密钥数  结论");
+    println!("track(idFp)          无损样本  主机数  密钥数  auth轮换  结论");
     for row in &rows {
         println!(
-            "  {:<22} {:>6}  {:>6}  {:>6}  {}",
-            row.id_fp, row.usable, row.hosts, row.keys, row.verdict
+            "  {:<22} {:>6}  {:>6}  {:>6}  {:<9}  {}",
+            row.id_fp, row.usable, row.hosts, row.keys, row.auth, row.verdict
         );
     }
     println!(
@@ -524,6 +540,18 @@ fn main() {
         ids.len()
     );
     println!("其中「换过 CDN 主机仍是同一把密钥」：{host_verified} 首 ← 票面第 2 条的直接证据");
+    println!("证据窗口：所有取流都在**同一次会话内**完成；跨会话/跨天会不会换密钥，本表没有证据。");
+    println!(
+        "「换发 play_auth 而密钥不变」（#2 要记密钥哈希而不是 play_auth 串的依据）：{} ← 写回 #2 时必须带上这句",
+        if rows
+            .iter()
+            .all(|row| row.auth == "未触发" || row.auth == "无样本")
+        {
+            "本窗口内一次都没被触发，仍是未验证的假设，不等于被证伪"
+        } else {
+            "见上表 auth轮换 列"
+        }
+    );
     if odd_len > 0 {
         println!("⚠ 有 {odd_len} 次解出的密钥长度不是 16 字节（与「没发 play_auth」分开记）");
     }
@@ -542,7 +570,7 @@ fn main() {
         println!("总判定：密钥稳定，但所有无损取流都落在同一个 CDN 主机，「换主机之后呢」没被测到，结论不完整。");
         5
     } else {
-        println!("总判定：同一曲目重复取流密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据有收益，可按现设计推进。");
+        println!("总判定：本窗口内同一曲目重复取流密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据有收益，可按现设计推进（跨会话未测；#2 的 play_auth 换发假设仍未验证）。");
         0
     };
     println!("提示：写回 #2 时只写结论与本表；track id 已是指纹形式，不要另附全值、密钥或签名。");
