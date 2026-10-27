@@ -498,24 +498,39 @@ fn main() {
         println!("  → {verdict}");
 
         // #2 的设计假设：「同一个文件可能换发不同的 play_auth 而密钥不变」。
-        // (0, _) 只可能是「一个无损样本都没有」：lossless_good 是 good 的子集，而 good
-        // 要求解得出密钥、也就必然发过 play_auth，不存在「有样本却数出 0 份 auth」。
-        let auth_note = match (distinct_auths, equal) {
-            (0, _) => "没有无损整曲样本，这条没有输入".to_string(),
-            (1, _) => "未被触发（play_auth 每次都一样；本窗口内平台没换发，这条假设仍未被验证）"
-                .to_string(),
-            (n, Some(true)) => format!("成立（无损样本里 play_auth 换了 {n} 份，密钥仍是同一把）"),
-            (n, Some(false)) => format!("不成立（play_auth 换了 {n} 份，密钥也跟着变）"),
-            (n, None) => format!("无法判定（play_auth 换了 {n} 份，但无损样本不足 2 次）"),
+        // 先卡样本数：只有 1 次无损样本时「play_auth 每次都一样」是同义反复，
+        // 不能印成「未触发」这种像是测过的说法。有样本时 distinct_auths 必然 ≥ 1
+        // （good 要求解得出密钥，也就必然发过 play_auth），所以不存在 0 份的情况。
+        let (auth_short, auth_note) = if lossless_good.len() < 2 {
+            (
+                "样本不足",
+                format!(
+                    "无法判定（无损样本只有 {} 次，不足 2 次）",
+                    lossless_good.len()
+                ),
+            )
+        } else {
+            match (distinct_auths, equal) {
+                (1, _) => (
+                    "未触发",
+                    "未被触发（play_auth 每次都一样；本窗口内平台没换发，这条假设仍未被验证）"
+                        .to_string(),
+                ),
+                (n, Some(true)) => (
+                    "成立",
+                    format!("成立（无损样本里 play_auth 换了 {n} 份，密钥仍是同一把）"),
+                ),
+                (n, Some(false)) => (
+                    "不成立",
+                    format!("不成立（play_auth 换了 {n} 份，密钥也跟着变）"),
+                ),
+                (n, None) => (
+                    "样本不足",
+                    format!("无法判定（play_auth 换了 {n} 份，但密钥样本不足 2 次）"),
+                ),
+            }
         };
         println!("  → 「换发 play_auth 而密钥不变」：{auth_note}");
-        let auth_short = match (distinct_auths, equal) {
-            (0, _) => "无样本",
-            (1, _) => "未触发",
-            (_, Some(true)) => "成立",
-            (_, Some(false)) => "不成立",
-            (_, None) => "样本不足",
-        };
 
         rows.push(TrackRow {
             id_fp: show_id(track_id),
@@ -540,7 +555,7 @@ fn main() {
         ids.len()
     );
     println!(
-        "其中「换过 CDN 主机但 play_auth 未换发（密钥因而仍是同一把）」：{host_verified} 首 ← 票面第 2 条真正实测到的是这一条，不是「密钥跨主机稳定」"
+        "其中「无损样本落在 ≥2 个 CDN 主机且密钥同一把」：{host_verified} 首 ← 票面第 2 条测到的就是这个；\n   这个计数不含 play_auth 判断，auth 是否随主机换发只看上表 auth轮换 列。"
     );
     println!("主机由平台自行分配，本程序没有改写 URL host：换主机是**观察到**的，不是构造出来的。");
     println!("证据窗口：所有取流都在**同一次会话内**完成；跨会话/跨天会不会换密钥，本表没有证据。");
