@@ -29,7 +29,7 @@ jobs:
       - name: Verify pinned toolchain
         run: |
           rustc -V && cargo -V && cargo clippy --version
-          rustup show active-toolchain | grep -F "${RUST}-"
+          test "$(rustc -V | awk '{print $2}')" = "$RUST"
 
       - name: Format check
         run: cargo fmt --all -- --check
