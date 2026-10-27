@@ -1,13 +1,12 @@
-//! 续传决策（上游无对应；见 `docs/PORTING.md` 与 issue #2/#5）。
+//! 续传决策（上游无对应；[`sodahub-org/libresoda#5`](https://github.com/sodahub-org/libresoda/issues/5)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
 //!
 //! 只回答一个问题：「本地这段没下完的字节，这次还能不能接着用」。
 //! 输入全部是已经拿在手上的事实（本地字节数、记录里的总长与密钥指纹、这次响应的
 //! 状态码与 `Content-Range`），所以这里不碰网络也不碰磁盘，每个协议分支都能单测。
 //!
-//! 消费方是取数层与记录文件（issue #6/#7），所以整模块 `pub(crate)`：判断规则一旦公开
-//! 就成了对下游的承诺。
+//! 消费方是取数层与记录文件（#6/#7），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
-// 消费方（issue #6/#7）尚未落地，先允许 dead_code，否则 clippy -D warnings 会红。
+// 消费方（#6/#7）尚未落地，先允许 dead_code；它们接上后删除本行。
 #![allow(dead_code)]
 
 /// `Content-Range` 的解析结果。
@@ -67,6 +66,9 @@ pub(crate) enum ResumeAction {
 }
 
 /// 判断所需的全部事实：本地有什么、记录里写了什么、这次服务器回了什么。
+///
+/// ETag 不在其中：#2 的判据只看这次响应自己（起点、总长、密钥指纹），ETag 只写进记录
+/// 文件、供 `If-Range` 这个优化使用，不参与「能不能接上」的判断。
 pub(crate) struct ResumeProbe<'a> {
     /// 本地 `.part` 的实际字节数。
     pub(crate) local_len: u64,
@@ -217,9 +219,8 @@ mod resume_tests {
 
     #[test]
     fn unparsable_header_cannot_resume() {
-        // 解析与判断的接缝：坏头解析成空，判断按「缺范围头」处理。
+        // 解析与判断的接缝：坏头解析成空，判断按「缺范围头」处理（坏头本身另有断言）。
         let broken = parse_content_range("bytes 500-499/1000");
-        assert_eq!(broken, None);
         assert_eq!(
             decide_resume_action(&probe(400, 1000, KEY, KEY, 206, broken.as_ref())),
             ResumeAction::RestartFromZero

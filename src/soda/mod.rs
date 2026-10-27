@@ -35,7 +35,7 @@ pub mod playlist_edit;
 pub mod qr_login;
 pub mod quality;
 pub mod report;
-// 续传决策只在 crate 内可见：公开它等于对判断规则做出承诺。
+// 续传判断故意不对外（理由记在 docs/PORTING.md 的铁律 2 例外）。
 pub(crate) mod resume;
 pub mod search;
 pub mod signature;
