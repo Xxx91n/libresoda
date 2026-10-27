@@ -1,11 +1,12 @@
 //! 票 #3 实测：同一首曲目连续取流，解出的 AES 密钥是不是同一把；换 CDN 主机之后呢。
 //!
-//! 只读取证：**不下载音频、不解码、不改动任何产品代码**。结论要写回上级 issue #2
-//! 的「待定」一节。
+//! 只读取证：**不下载音频、不解码、不改动任何产品代码**。结论写回上级 issue #2
+//! 的「待定」一节，输入就是本程序末尾那张汇总表。
 //!
-//! 凭据与曲目 id 一律只从环境变量读，绝不落盘；输出侧全部脱敏：密钥只给指纹，
-//! `play_auth` 只给指纹，track id 默认只给掩码形式（AGENTS.md「测试规范」禁止把
-//! Cookie、track id 写进测试输出）。
+//! 凭据与曲目 id 一律只从环境变量读，绝不落盘。输出侧全部脱敏：密钥与 `play_auth`
+//! 只给指纹，track id 默认只给**指纹 + 长度**——只留前 4 后 4 是不够的：同一次运行
+//! 还会印出搜索词、时长与体积，公共搜索结果里一拼就能定位到具体曲目，而这份输出
+//! 要粘进公开 issue（AGENTS.md「测试规范」禁止把 track id 写进测试输出）。
 //!
 //! ```text
 //! SODA_COOKIE            必需；登录态（sessionid / sessionid_ss / sid_tt 任一）
@@ -15,7 +16,7 @@
 //! SODA_IID / SODA_FP     可选
 //! SODA_TRACK_IDS         可选；逗号分隔的曲目 id（验收要求至少两首）
 //! SODA_KEYWORD           可选；发现阶段用的搜索词，缺省「周杰伦」
-//! SODA_ATTEMPTS          可选；每首选流次数，缺省 3（至少 2 才能比对）
+//! SODA_ATTEMPTS          可选；每首选流次数，缺省 3（至少 2 才能比对；判据 2 建议 5）
 //! SODA_REVEAL_IDS=1      可选；把 track id 印成全值，只在你自己的终端用，
 //!                        不要粘进仓库、文档或 issue
 //! ```
@@ -88,38 +89,63 @@ struct Observation {
     duration: f64,
     /// `play_auth` 的指纹；空串表示这次没发 `play_auth`（明文流）。
     auth_fp: String,
-    /// 真正解出的 16 字节 AES 密钥；`None` 表示解不出（明文流或解码失败）。
+    /// 票 #3 要「比对 16 字节密钥」，判定一律用这里的字节，不用十六进制字符串：
+    /// 后者的大小写或补零差异会被误判成「换了一把」。
     key: Option<[u8; 16]>,
+    /// 解出来的字节长度（`None` = 没发 play_auth 或还原失败）。长度不是 16 本身就是
+    /// 证据，不能和「根本没密钥」混成一格。
+    decoded_len: Option<usize>,
 }
 
 impl Observation {
-    /// 展示用指纹：对**密钥字节**而不是十六进制字符串取，免得大小写或补零差异
-    /// 被误判成「换了一把」；也与 #7 记录文件对 `&[u8]` 取指纹的口径一致。
+    /// 取流失败用的构造：其余字段一律留空，打印时也不会冒充「0 体积的整曲」。
+    fn failed(detail: String) -> Self {
+        Observation {
+            ok: false,
+            detail,
+            host: String::new(),
+            quality: String::new(),
+            format: String::new(),
+            is_preview: false,
+            lossless: false,
+            size: 0,
+            duration: 0.0,
+            auth_fp: String::new(),
+            key: None,
+            decoded_len: None,
+        }
+    }
+
+    /// 展示与分组都走这里，但**判定用字节**：FNV-1a 64 不是抗碰撞哈希，
+    /// 万一撞了，表格不能自相矛盾，所以按 `[u8; 16]` 分组、只在打印时取指纹。
     fn key_fp(&self) -> String {
         self.key.map(fingerprint).unwrap_or_default()
     }
+}
+
+/// 每首曲目一行，最后汇成写回 #2 的表。
+struct TrackRow {
+    id_fp: String,
+    usable: usize,
+    hosts: usize,
+    keys: usize,
+    verdict: String,
 }
 
 fn env_value(key: &str) -> String {
     std::env::var(key).unwrap_or_default().trim().to_string()
 }
 
-fn reveal_ids() -> bool {
-    env_value("SODA_REVEAL_IDS") == "1"
-}
-
-/// track id 默认掩码：票 #3 的结论要写进 issue，而 AGENTS.md 禁止把 track id 写进输出。
+/// track id 默认只出指纹 + 长度；理由见文件头。
 fn show_id(track_id: &str) -> String {
-    if reveal_ids() {
+    if env_value("SODA_REVEAL_IDS") == "1" {
         return track_id.to_string();
     }
-    let chars: Vec<char> = track_id.chars().collect();
-    if chars.len() <= 8 {
-        return format!("{track_id}…");
-    }
-    let head: String = chars[..4].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{head}…{tail}(len={})", chars.len())
+    format!(
+        "idFp={} len={}",
+        fingerprint(track_id.as_bytes()),
+        track_id.len()
+    )
 }
 
 /// 展示侧脱敏：错误文本或 note 里可能带完整 URL（含 `#auth=`、百分号编码的 `=`）。
@@ -143,7 +169,7 @@ fn host_of(url: &str) -> String {
     rest.split('/').next().unwrap_or("").to_string()
 }
 
-/// 稳定指纹：FNV-1a 64。只用于「两次是不是同一把」的**展示与分组**，
+/// 展示用指纹：FNV-1a 64。只用于「两次是不是同一把」的显示与分组辅助，
 /// 判定本身比对原始字节；不可当成安全强度写进 #2 的记录。
 fn fingerprint(bytes: impl AsRef<[u8]>) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -154,42 +180,30 @@ fn fingerprint(bytes: impl AsRef<[u8]>) -> String {
     format!("{hash:016x}")
 }
 
-/// 从 `play_auth` 还原 AES 密钥。票 #3 要「比对 16 字节密钥」，所以长度必须正好 16：
+/// 从 `play_auth` 还原 AES 密钥，并如实报告解出的长度。
 /// 上游 `extract_key` 内部走 `from_utf8_lossy`，尾部残缺时可能返回空串而不是报错，
-/// 空串会被 `hex_decode` 解成长度 0 的 Vec —— 那种情况判为「解不出」，
-/// 不能当成一把有效密钥去参与「稳定」统计。
-fn decode_key(info: &DownloadInfo) -> Option<[u8; 16]> {
+/// 空串会被 `hex_decode` 解成长度 0 的 Vec —— 那种情况既不算有效密钥，
+/// 也要跟「根本没发 play_auth」区分开。
+fn decode_key(info: &DownloadInfo) -> (Option<[u8; 16]>, Option<usize>) {
     let play_auth = info.play_auth.trim();
     if play_auth.is_empty() {
-        return None;
+        return (None, None);
     }
-    let hex_key = extract_key(play_auth).ok()?;
-    let bytes = hex_decode(&hex_key)?;
-    if bytes.len() != 16 {
-        return None;
-    }
-    bytes.as_slice().try_into().ok()
+    let Ok(hex_key) = extract_key(play_auth) else {
+        return (None, None);
+    };
+    let Some(bytes) = hex_decode(&hex_key) else {
+        return (None, None);
+    };
+    let len = bytes.len();
+    (bytes.as_slice().try_into().ok(), Some(len))
 }
 
 /// 一次只读取流。全程只碰 JSON 元数据，不取音频字节。
 fn observe(soda: &Soda, track_id: &str) -> Observation {
     let info = match resolve_download_info(soda, track_id, None) {
         Ok(info) => info,
-        Err(err) => {
-            return Observation {
-                ok: false,
-                detail: mask(&err.to_string()),
-                host: String::new(),
-                quality: String::new(),
-                format: String::new(),
-                is_preview: true,
-                lossless: false,
-                size: 0,
-                duration: 0.0,
-                auth_fp: String::new(),
-                key: None,
-            };
-        }
+        Err(err) => return Observation::failed(mask(&err.to_string())),
     };
 
     let play_auth = info.play_auth.trim().to_string();
@@ -198,6 +212,7 @@ fn observe(soda: &Soda, track_id: &str) -> Observation {
     } else {
         fingerprint(play_auth.as_bytes())
     };
+    let (key, decoded_len) = decode_key(&info);
 
     Observation {
         ok: true,
@@ -214,11 +229,16 @@ fn observe(soda: &Soda, track_id: &str) -> Observation {
         size: info.size,
         duration: info.duration,
         auth_fp,
-        key: decode_key(&info),
+        key,
+        decoded_len,
     }
 }
 
 fn line(item: &Observation, label: &str) {
+    if !item.ok {
+        println!("  {label} 取流失败：{}", item.detail);
+        return;
+    }
     let key_fp = item.key_fp();
     println!(
         "  {label} host={} 音质={} 格式={} 整曲={} 无损={} 体积={}B 时长={:.1}s keyLen={} keyFp={} authFp={} {}",
@@ -229,14 +249,14 @@ fn line(item: &Observation, label: &str) {
         item.lossless,
         item.size,
         item.duration,
-        item.key.map_or(0, |_| 16),
+        item.decoded_len.map_or("none".to_string(), |len| len.to_string()),
         if key_fp.is_empty() { "-" } else { &key_fp },
         if item.auth_fp.is_empty() { "-" } else { &item.auth_fp },
         item.detail,
     );
 }
 
-/// 发现阶段：只读筛出「无损 + 整曲 + 解得出密钥」的候选，并直接用于比对。
+/// 发现阶段：只读筛出「无损 + 整曲 + 解得出 16 字节密钥」的候选，并直接用于比对。
 fn discover(soda: &Soda) -> Vec<String> {
     let keyword = {
         let given = env_value("SODA_KEYWORD");
@@ -255,20 +275,16 @@ fn discover(soda: &Soda) -> Vec<String> {
     };
 
     let mut picked = Vec::new();
-    println!(
-        "\n=== 发现阶段（只读）：keyword={keyword} 候选 {} 条 ===",
-        songs.len()
-    );
+    println!("\n=== 发现阶段（只读）：候选 {} 条 ===", songs.len());
     for song in songs.iter().take(12) {
         // 用下载路径真正会用的 resolve_download_info 判定，而不是 check_stream_access：
         // 两者择优不同，后者只报 highest，前者却能给到 lossless 整曲。
         let item = observe(soda, &song.id);
-        let id = show_id(&song.id);
         if !item.ok {
-            println!("  track={id} 取流失败：{}", item.detail);
+            println!("  {} 取流失败：{}", show_id(&song.id), item.detail);
             continue;
         }
-        line(&item, &format!("track={id}"));
+        line(&item, &show_id(&song.id));
         let usable = !item.is_preview && item.lossless && item.key.is_some();
         if usable && picked.len() < 2 {
             picked.push(song.id.clone());
@@ -295,10 +311,6 @@ fn keys_all_equal(items: &[&Observation]) -> Option<bool> {
     }
     let first = items[0].key?;
     Some(items.iter().all(|item| item.key == Some(first)))
-}
-
-fn distinct_hosts(items: &[&Observation]) -> usize {
-    count_distinct(items.iter().map(|item| item.host.as_str()))
 }
 
 fn count_distinct<T: Eq + Ord>(items: impl Iterator<Item = T>) -> usize {
@@ -341,7 +353,7 @@ fn main() {
         discover(&soda)
     } else {
         println!(
-            "指定曲目 {} 首（track id 默认掩码，需要全值请自行加 SODA_REVEAL_IDS=1）",
+            "指定曲目 {} 首（track id 默认只出指纹，需要全值自己加 SODA_REVEAL_IDS=1）",
             given.len()
         );
         given
@@ -370,6 +382,8 @@ fn main() {
     let mut nokey = 0usize;
     let mut thin = 0usize;
     let mut host_verified = 0usize;
+    let mut odd_len = 0usize;
+    let mut rows = Vec::new();
 
     for track_id in &ids {
         println!(
@@ -380,16 +394,21 @@ fn main() {
         for attempt in 1..=attempts {
             let item = observe(&soda, track_id);
             line(&item, &format!("#{attempt}"));
+            odd_len += usize::from(item.decoded_len.is_some_and(|len| len != 16));
             obs.push(item);
         }
 
         let good: Vec<&Observation> = obs.iter().filter(|o| o.ok && o.key.is_some()).collect();
         if good.is_empty() {
-            println!(
-                "  → 没有任何一次解出 16 字节密钥（全是明文流或全部失败）：\
-                 记为「无密钥可判」，不参与稳定性结论"
-            );
+            println!("  → 没有任何一次解出 16 字节密钥：记为「无密钥可判」，不参与稳定性结论");
             nokey += 1;
+            rows.push(TrackRow {
+                id_fp: show_id(track_id),
+                usable: 0,
+                hosts: 0,
+                keys: 0,
+                verdict: "无密钥可判".to_string(),
+            });
             continue;
         }
 
@@ -408,6 +427,8 @@ fn main() {
             );
         }
 
+        // 主机分组按**全部可判样本**列（含音质剔除的那些，用于说明 CDN 轮换确实发生了），
+        // 但结论只数无损样本，两件事在打印里分开写清。
         let hosts: Vec<&str> = good
             .iter()
             .map(|o| o.host.as_str())
@@ -415,98 +436,115 @@ fn main() {
             .into_iter()
             .collect();
         println!(
-            "  → 解出密钥 {} 次，覆盖 {} 个 CDN 主机：{}",
+            "  → 解出密钥 {} 次，全部可判样本覆盖 {} 个 CDN 主机：{}",
             good.len(),
             hosts.len(),
             hosts.join(", ")
         );
-        let mut by_host: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut by_host: BTreeMap<&str, BTreeMap<[u8; 16], usize>> = BTreeMap::new();
         for o in &good {
-            *by_host
-                .entry(o.host.as_str())
-                .or_default()
-                .entry(o.key_fp())
-                .or_default() += 1;
+            if let Some(key) = o.key {
+                *by_host
+                    .entry(o.host.as_str())
+                    .or_default()
+                    .entry(key)
+                    .or_default() += 1;
+            }
         }
         for (host, keys) in &by_host {
             let list = keys
                 .iter()
-                .map(|(fp, n)| format!("{fp}×{n}"))
+                .map(|(key, n)| format!("{}×{n}", fingerprint(key)))
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("     host={host} 不同密钥={}  {list}", keys.len());
         }
 
-        let distinct_auths = count_distinct(good.iter().map(|o| o.auth_fp.as_str()));
+        let lossless_hosts = count_distinct(lossless_good.iter().map(|o| o.host.as_str()));
+        // 与无损结论同域：play_auth 的变化也只数无损整曲样本，
+        // 否则「换了 n 份 auth 而密钥不变」会被试听流样本背书。
+        let distinct_auths = count_distinct(lossless_good.iter().map(|o| o.auth_fp.as_str()));
         let equal = keys_all_equal(&lossless_good);
-        match equal {
+        let verdict = match equal {
             None => {
                 thin += 1;
-                println!(
-                    "  → 无损整曲样本只有 {} 次（不足 2 次），本曲目给不出「无损密钥是否稳定」的结论",
+                format!(
+                    "无损样本仅 {} 次（不足 2 次），给不出结论",
                     lossless_good.len()
-                );
+                )
             }
             Some(true) => {
                 stable += 1;
-                let lossless_hosts = distinct_hosts(&lossless_good);
                 if lossless_hosts >= 2 {
                     host_verified += 1;
                 }
-                println!(
-                    "  → 结论：{} 次无损整曲取流的 16 字节密钥**同一把**（覆盖 {lossless_hosts} 个 CDN 主机）",
+                format!(
+                    "密钥稳定：{} 次无损整曲取流的 16 字节密钥同一把（覆盖 {lossless_hosts} 个 CDN 主机）",
                     lossless_good.len()
-                );
+                )
             }
             Some(false) => {
                 unstable += 1;
                 let distinct_keys = count_distinct(lossless_good.iter().filter_map(|o| o.key));
-                println!("  → 结论：无损整曲跨次取流解出 {distinct_keys} 把不同密钥 → 密钥会轮换");
+                format!("密钥轮换：无损样本解出 {distinct_keys} 把不同密钥")
             }
-        }
+        };
+        println!("  → {verdict}");
 
         // #2 的设计假设：「同一个文件可能换发不同的 play_auth 而密钥不变」。
         let auth_note = match (distinct_auths, equal) {
-            (0, _) => "未被触发（本曲目全程没发 play_auth）".to_string(),
+            (0, _) => "未被触发（无损样本全程没发 play_auth）".to_string(),
             (1, _) => "未被触发（play_auth 每次都一样，短窗口内平台没换发；这条假设仍未被验证）"
                 .to_string(),
-            (n, Some(true)) => format!("成立（play_auth 换了 {n} 份，密钥仍是同一把）"),
+            (n, Some(true)) => format!("成立（无损样本里 play_auth 换了 {n} 份，密钥仍是同一把）"),
             (n, Some(false)) => format!("不成立（play_auth 换了 {n} 份，密钥也跟着变）"),
             (n, None) => format!("无法判定（play_auth 换了 {n} 份，但无损样本不足 2 次）"),
         };
         println!("  → 「换发 play_auth 而密钥不变」：{auth_note}");
+
+        rows.push(TrackRow {
+            id_fp: show_id(track_id),
+            usable: lossless_good.len(),
+            hosts: lossless_hosts,
+            keys: count_distinct(lossless_good.iter().filter_map(|o| o.key)),
+            verdict,
+        });
     }
 
-    println!("\n=== 票 #3 汇总 ===");
+    println!("\n=== 票 #3 汇总表（写回 #2「待定」一节就用这张表）===");
+    println!("track(idFp)          无损样本  主机数  密钥数  结论");
+    for row in &rows {
+        println!(
+            "  {:<22} {:>6}  {:>6}  {:>6}  {}",
+            row.id_fp, row.usable, row.hosts, row.keys, row.verdict
+        );
+    }
     println!(
-        "曲目分桶：无损整曲且密钥稳定 {stable} / 密钥轮换 {unstable} / 无损样本不足 {thin} / 无密钥可判 {nokey}（共 {} 首）",
+        "\n分桶：无损整曲且密钥稳定 {stable} / 密钥轮换 {unstable} / 无损样本不足 {thin} / 无密钥可判 {nokey}（共 {} 首）",
         ids.len()
     );
     println!("其中「换过 CDN 主机仍是同一把密钥」：{host_verified} 首 ← 票面第 2 条的直接证据");
+    if odd_len > 0 {
+        println!("⚠ 有 {odd_len} 次解出的密钥长度不是 16 字节（与「没发 play_auth」分开记）");
+    }
     println!(
         "护栏：当前占用 {} 字节（上限 {MAX_ALLOC_BYTES}；触发时以 SIGABRT 退出，不打印）",
         LIVE.load(Ordering::SeqCst)
     );
 
-    let verdict = if unstable > 0 {
-        println!(
-            "总判定：测出密钥轮换 → 用密钥指纹做续传判据会让续传退化成每次从 0 重下，spec #2 的收益要重估。"
-        );
+    let exit_code = if unstable > 0 {
+        println!("总判定：测出密钥轮换 → 用密钥指纹做续传判据会让续传退化成每次从 0 重下，spec #2 的收益要重估。");
         6
     } else if stable < 2 {
         println!("总判定：没测出轮换，但「无损整曲 + 可比对」的曲目不足 2 首，票面验收未满足。");
         4
     } else if host_verified == 0 {
-        println!(
-            "总判定：密钥稳定，但所有无损取流都落在同一个 CDN 主机，「换主机之后呢」没被测到，结论不完整。"
-        );
+        println!("总判定：密钥稳定，但所有无损取流都落在同一个 CDN 主机，「换主机之后呢」没被测到，结论不完整。");
         5
     } else {
-        println!(
-            "总判定：同一曲目重复取流密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据有收益，可按现设计推进。"
-        );
+        println!("总判定：同一曲目重复取流密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据有收益，可按现设计推进。");
         0
     };
-    println!("提示：写回 #2「待定」一节时只写结论与本表，不要写 track id 全值、密钥或签名。");
-    std::process::exit(verdict);
+    println!("提示：写回 #2 时只写结论与本表；track id 已是指纹形式，不要另附全值、密钥或签名。");
+    std::process::exit(exit_code);
 }
