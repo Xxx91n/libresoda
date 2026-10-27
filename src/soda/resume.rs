@@ -86,13 +86,12 @@ pub(crate) struct ResumeProbe<'a> {
 ///
 /// 这里只回答「能不能接」。错误响应该不该留旧数据是调用方的判断，不要把处置表搬进来。
 pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
+    let key_changed = probe.current_fingerprint != probe.recorded_fingerprint;
     match (probe.status, probe.range) {
         // 整份响应并不复用旧数据，所以密钥换了也照样能用它。
         (200, _) => ResumeAction::FullResponse,
         // 另两个「能接上」的结论都靠旧数据：密钥换了，那段字节的身份就没人能证明。
-        _ if probe.current_fingerprint != probe.recorded_fingerprint => {
-            ResumeAction::RestartFromZero
-        }
+        _ if key_changed => ResumeAction::RestartFromZero,
         (416, Some(range)) if range.total == probe.local_len => ResumeAction::Complete,
         (206, Some(range))
             if range.first == Some(probe.local_len) && range.total == probe.recorded_total =>
@@ -132,31 +131,12 @@ mod resume_tests {
 
     #[test]
     fn decides_resume_action() {
-        let tail = ContentRange {
-            first: Some(400),
-            last: Some(999),
-            total: 1000,
-        };
-        let only_total = ContentRange {
-            first: None,
-            last: None,
-            total: 1000,
-        };
-        let file_grew = ContentRange {
-            first: Some(400),
-            last: Some(1499),
-            total: 1500,
-        };
-        let shifted_start = ContentRange {
-            first: Some(300),
-            last: Some(999),
-            total: 1000,
-        };
-        let shorter_total = ContentRange {
-            first: None,
-            last: None,
-            total: 900,
-        };
+        // 范围信息一律由解析函数产出，顺带覆盖 parse → decide 的接缝。
+        let tail = parse_content_range("bytes 400-999/1000").expect("bytes 400-999/1000");
+        let shifted_start = parse_content_range("bytes 300-999/1000").expect("bytes 300-999/1000");
+        let file_grew = parse_content_range("bytes 400-1499/1500").expect("bytes 400-1499/1500");
+        let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
+        let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
         // 顺序对应 issue #5 验收里的九个分支。
         let cases = [
             (
@@ -172,6 +152,11 @@ mod resume_tests {
             (
                 "206 缺范围头",
                 probe(400, 1000, KEY, KEY, 206, None),
+                ResumeAction::RestartFromZero,
+            ),
+            (
+                "206 只给总长不给区间",
+                probe(400, 1000, KEY, KEY, 206, Some(&only_total)),
                 ResumeAction::RestartFromZero,
             ),
             (
@@ -295,5 +280,18 @@ mod resume_tests {
         assert_eq!(parse_content_range("bytes */*"), None);
         assert_eq!(parse_content_range("bytes 400/1000"), None);
         assert_eq!(parse_content_range(""), None);
+    }
+
+    #[test]
+    fn rejects_numbers_too_long_to_be_trusted() {
+        // 解析不出可靠数字就不能当长度用；这里没有任何按长度分配的容器
+        assert_eq!(
+            parse_content_range("bytes 0-99999999999999999999999/1000"),
+            None
+        );
+        assert_eq!(
+            parse_content_range("bytes 0-499/99999999999999999999999"),
+            None
+        );
     }
 }

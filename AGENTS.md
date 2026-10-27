@@ -12,7 +12,9 @@
 1. **行为对齐上游，而不是"重新设计"。** 函数语义、错误文案、音质排序、字段命名
    都应能一一对应到上游 Go 代码；上游没有的能力不要凭空发明。
 2. **不要破坏既有公开 API 的稳定性。** 新增用 `pub`，修改或删除公开项要在
-   `docs/PORTING.md` 里记录原因。
+   `docs/PORTING.md` 里记录原因。例外：规则还没定型的内部判据（如 `resume.rs` 的续传
+   判断）用 `pub(crate)` 且模块不 `pub` —— 公开它等于对判断规则做出承诺；这条偏离
+   同样记进 `docs/PORTING.md`。
 
 ## 目录与对照关系
 
@@ -29,7 +31,7 @@
 | `soda/user_playlist.go` | `src/soda/user_playlist.rs` |
 | `soda/crypto.go` | `src/soda/crypto.rs` |
 | `soda/login.go` | `src/soda/qr_login.rs`（二维码创建/轮询/会话，**部分移植**）+ `src/soda/browser.rs`（可选外部请求器） |
-| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断）、`src/soda/resume.rs`（续传判断纯函数，`pub(crate)` 不对外） |
+| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断）、`src/soda/resume.rs`（续传判断纯函数） |
 | （上游无对应）| 客户端能力：`feed.rs`（推荐流/听歌模式）、`playlist_edit.rs`（歌单写操作）、`collection.rs`（收藏/我收藏的）、`playback.rs`（最近播放/播放统计）、`artist.rs`（艺人）、`media_ref.rs`（`{id,type}` 媒体引用） |
 | `model/*.go` | `src/model.rs` |
 | `utils/request.go` | `src/http.rs` |
