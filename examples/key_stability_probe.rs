@@ -540,18 +540,29 @@ fn main() {
         ids.len()
     );
     println!("其中「换过 CDN 主机仍是同一把密钥」：{host_verified} 首 ← 票面第 2 条的直接证据");
+    println!("主机由平台自行分配，本程序没有改写 URL host：换主机是**观察到**的，不是构造出来的。");
     println!("证据窗口：所有取流都在**同一次会话内**完成；跨会话/跨天会不会换密钥，本表没有证据。");
+    // `extract_key` 是 `play_auth` 的纯函数：authFp 不变 ⇒ 密钥必然不变。所以「密钥同一把」
+    // 只有在 play_auth 真的换发过时才算测到平台行为，否则它是同义反复，
+    // 不能当作「隔一段时间续传时重取流还能接上」的证据。
+    let auth_unverified = rows
+        .iter()
+        .all(|row| row.auth == "未触发" || row.auth == "无样本");
     println!(
         "「换发 play_auth 而密钥不变」（#2 要记密钥哈希而不是 play_auth 串的依据）：{} ← 写回 #2 时必须带上这句",
-        if rows
-            .iter()
-            .all(|row| row.auth == "未触发" || row.auth == "无样本")
-        {
+        if auth_unverified {
             "本窗口内一次都没被触发，仍是未验证的假设，不等于被证伪"
         } else {
             "见上表 auth轮换 列"
         }
     );
+    if auth_unverified {
+        println!(
+            "⚠ 所以本表的「密钥同一把」是同义反复（auth 没换发，纯函数当然给出同一把）。\n\
+             这次真正测到的只有两件事：同一曲目重复取流拿到的 play_auth 不换发；换 CDN 主机也不换发 play_auth。\n\
+             续传真正依赖的「隔一段时间后重取流还能不能接上」仍然没有证据。"
+        );
+    }
     if odd_len > 0 {
         println!("⚠ 有 {odd_len} 次解出的密钥长度不是 16 字节（与「没发 play_auth」分开记）");
     }
@@ -570,7 +581,15 @@ fn main() {
         println!("总判定：密钥稳定，但所有无损取流都落在同一个 CDN 主机，「换主机之后呢」没被测到，结论不完整。");
         5
     } else {
-        println!("总判定：本窗口内同一曲目重复取流密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据有收益，可按现设计推进（跨会话未测；#2 的 play_auth 换发假设仍未验证）。");
+        println!(
+            "总判定：同一曲目重复取流的 16 字节密钥同一把，且换 CDN 主机后仍是同一把 → 续传用密钥指纹做判据{}（跨会话未测；play_auth 换发假设{}）。",
+            if auth_unverified {
+                "有初步支持，但本次不构成定案"
+            } else {
+                "有收益，可按现设计推进"
+            },
+            if auth_unverified { "仍未验证" } else { "见上表" }
+        );
         0
     };
     println!("提示：写回 #2 时只写结论与本表；track id 已是指纹形式，不要另附全值、密钥或签名。");
