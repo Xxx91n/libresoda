@@ -1,5 +1,5 @@
 # 本文件只属于 fork 的 ci/verify 分支：它是本次工作的验证手段，不是仓库产物。
-# 合入上游前必须删掉它——上游 PR 里不含任何 CI 配置文件（见 issue #4）。
+# 合入上游前必须删掉它——上游 PR 里不含任何 CI 配置文件（见 sodahub-org/libresoda#4）。
 name: CI
 
 on:
@@ -26,8 +26,10 @@ jobs:
           rustup toolchain install "$RUST" -c rustfmt -c clippy --profile minimal
           rustup default "$RUST"
 
-      - name: Record toolchain versions
-        run: rustc -V && cargo -V && cargo clippy --version
+      - name: Verify pinned toolchain
+        run: |
+          rustc -V && cargo -V && cargo clippy --version
+          rustup show active-toolchain | grep -F "${RUST}-"
 
       - name: Format check
         run: cargo fmt --all -- --check
