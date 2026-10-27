@@ -35,7 +35,7 @@ pub mod playlist_edit;
 pub mod qr_login;
 pub mod quality;
 pub mod report;
-// 续传判断故意不对外（理由记在 docs/PORTING.md 的铁律 2 例外）。
+// 续传判断故意不对外：AGENTS.md 铁律 2 的例外，个案记在 docs/PORTING.md。
 pub(crate) mod resume;
 pub mod search;
 pub mod signature;

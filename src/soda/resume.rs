@@ -6,7 +6,7 @@
 //!
 //! 消费方是取数层与记录文件（#6/#7），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
-// 消费方（#6/#7）尚未落地，先允许 dead_code；它们接上后删除本行。
+// 消费方（#6/#7）尚未落地，先允许 dead_code；它们接上后删掉下面的 allow。
 #![allow(dead_code)]
 
 /// `Content-Range` 的解析结果。
@@ -67,8 +67,8 @@ pub(crate) enum ResumeAction {
 
 /// 判断所需的全部事实：本地有什么、记录里写了什么、这次服务器回了什么。
 ///
-/// ETag 不在其中：#2 的判据只看这次响应自己（起点、总长、密钥指纹），ETag 只写进记录
-/// 文件、供 `If-Range` 这个优化使用，不参与「能不能接上」的判断。
+/// ETag 不在其中：#2 让这次响应的起点与总长去对记录、密钥指纹去对本地数据，
+/// ETag 只写进记录文件、供 `If-Range` 这个优化使用，不参与「能不能接上」的判断。
 pub(crate) struct ResumeProbe<'a> {
     /// 本地 `.part` 的实际字节数。
     pub(crate) local_len: u64,
