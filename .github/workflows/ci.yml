@@ -10,18 +10,22 @@ permissions:
 jobs:
   check:
     name: fmt / clippy / test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v7.0.1，按提交固定：同一个运行结果可复现、可追溯。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Add rustfmt and clippy
         run: rustup component add rustfmt clippy
+
+      - name: Record toolchain versions
+        run: rustc -V && cargo -V && cargo clippy --version
 
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Static check
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
