@@ -79,7 +79,7 @@
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
-| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个状态码回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 坏范围头），断言取数层拿到的三个事实与线上真发了 `Range`；不引 mock 库 |
+| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag`），断言拿到的三个事实；按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
 
 ## 与上游的实现差异
 
@@ -119,7 +119,8 @@
     出现外部调用方时再评估，并在这里记原因。实现票
     [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级
     [`#2`](https://github.com/sodahub-org/libresoda/issues/2)。
-  - **交给 #8 的三条边界**（都写进 `RangeResponse` 的字段注释，这里汇总以免重新发现）：
+  - **交给 #8 的三条边界**（都写在取数层的注释里：前两条在 `RangeResponse` 的字段上，
+    重定向那条在 `fetch_range` 的函数注释上；这里汇总以免重新发现）：
     状态码是 4xx/5xx 时 `reader` 读出的是**错误页**而不是音频片段；范围请求不带
     `Accept-Encoding`（ureq 见请求里有 `Range` 就不加），服务器仍硬回 `Content-Encoding`
     时字节已被它解压过、与 `Content-Range` 不符，而 ureq 会把 `Content-Encoding` 与
