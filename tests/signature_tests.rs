@@ -82,7 +82,9 @@ fn command_signature_reads_json_from_stdout() {
 
 #[test]
 fn command_signature_reports_failure() {
-    let provider = CommandSignature::new("sh").args(["-c", "exit 3"]);
+    // 子进程要先吃掉 stdin：直接 exit 会让 write_all 撞上断管，
+    // 报出 "signer stdin write" 而不是我们想断言的退出码错误。
+    let provider = CommandSignature::new("sh").args(["-c", "cat >/dev/null; exit 3"]);
     let error = provider
         .sign(&sign_request("https://api.qishui.com/x", "GET", ""))
         .expect_err("should fail");
