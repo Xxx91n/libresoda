@@ -66,14 +66,13 @@ pub(crate) enum ResumeAction {
     /// 这次响应不能用来续传：本地这段接不上，只能从 0 重新发一次整份请求。
     /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
-    /// `416` 以 `bytes */N` 报的总长等于本地字节数：按 #2 的 416 判据算已经下完。
+    /// `416` 以 `bytes */N` 报的总长**同时**等于本地字节数与记录总长：算已经下完。
     /// 只认 `*/N` 形态：RFC 9110 对 416 推荐的就是 unsatisfied-range，带闭区间的按
     /// 「没带我们要读的头」那档作废重下。
     ///
-    /// 残余风险：文件若在两次取流之间被平台重新编码成**恰好**等于本地的长度，交出去的是旧
-    /// 文件的前缀 —— 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要
-    /// 再比 `recorded_total`」列为待决口径（[`#2` 的 10-28 评论](https://github.com/sodahub-org/libresoda/issues/2)），
-    /// 定稿前按票面字面实现：只比 `local_len`。
+    /// 残余风险（#2 定 A 口径后仍需人工知情）：文件若在两次取流之间被重新编码成恰好等于
+    /// 「本地 = 记录」的那个长度、且密钥指纹没变，交出去的仍是旧前缀。三处一致已经排除了
+    /// 可机判的那部分，剩下的这一种没有能对比的证据。
     Complete,
 }
 
@@ -116,7 +115,10 @@ pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
         // 两个 `is_none` 都要判：`ContentRange` 的字段可以自由构造，这格判断不该依赖
         // 解析器「要么都有、要么都无」这个别处的不变量。
         (416, Some(range))
-            if range.first.is_none() && range.last.is_none() && range.total == probe.local_len =>
+            if range.first.is_none()
+                && range.last.is_none()
+                && range.total == probe.local_len
+                && range.total == probe.recorded_total =>
         {
             ResumeAction::Complete
         }
@@ -165,7 +167,8 @@ mod resume_tests {
         let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
         let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
         let closed_on_416 = parse_content_range("bytes 0-999/1000").expect("bytes 0-999/1000");
-        // 前九行 = issue #5 验收列出的九个分支，同序；后面补的是边界与守卫优先级用例。
+        // 票面九个分支按序落在前 10 行：#5 把「416 总长与本地或记录不等」列为一条分支，
+        // 它有两判据腿，第 6、7 行各单独断一条。后面补的是边界与守卫优先级用例。
         let cases = [
             (
                 "206 起点吻合",
@@ -188,13 +191,18 @@ mod resume_tests {
                 ResumeAction::FullResponse,
             ),
             (
-                "416 且总长等于本地",
+                "416 三处总长一致",
                 probe(1000, 1000, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::Complete,
             ),
             (
-                "416 且总长不等",
+                "416 总长与本地不等",
                 probe(1000, 1000, KEY, KEY, 416, Some(&shorter_total)),
+                ResumeAction::RestartFromZero,
+            ),
+            (
+                "416 总长与记录不等",
+                probe(1000, 1200, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::RestartFromZero,
             ),
             (
@@ -233,14 +241,9 @@ mod resume_tests {
                 ResumeAction::FullResponse,
             ),
             (
-                "416 且记录总长与本地不等",
-                probe(1000, 1200, KEY, KEY, 416, Some(&only_total)),
-                ResumeAction::Complete,
-            ),
-            (
-                // #2 的 416 判据只比本地长度：总长等于记录、却小于本地 → 不认「已完整」。
-                // 反向那格（记录 1200、本地与服务端都 1000）判 Complete，就在上一格。
-                "416 总长等于记录但不等于本地",
+                // 三处一致才算完成。这一格只失败在本地侧（总长 = 记录 1000，但小于本地 1200），
+                // 记录侧那格在前面；顺带覆盖 `.part` 比记录还长这个不一致态：它永远成不了 Complete。
+                "416 总长与本地不等（本地比记录长）",
                 probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::RestartFromZero,
             ),
