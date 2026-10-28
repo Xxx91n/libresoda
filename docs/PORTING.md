@@ -122,9 +122,18 @@
   - **交给 #8 的三条边界**（都写进 `RangeResponse` 的字段注释，这里汇总以免重新发现）：
     状态码是 4xx/5xx 时 `reader` 读出的是**错误页**而不是音频片段；范围请求不带
     `Accept-Encoding`（ureq 见请求里有 `Range` 就不加），服务器仍硬回 `Content-Encoding`
-    时字节已被它解压过、与 `Content-Range` 不符，这层不检测，靠「写入字节数 + 总长」的
-    校验拦；ureq 在每一跳重定向时剥掉 `Cookie`（既有 `get_reader` 行为，非本次引入），
-    且 `get_raw` 不像 `get_full` 那样回 `final_url`，所以这层看不出「被重定向去了别处」。
+    时字节已被它解压过、与 `Content-Range` 不符，而 ureq 会把 `Content-Encoding` 与
+    `Content-Length` 一并抹掉，这层检测不到 —— 兜底是 `Append` 那档比「实际写入字节数 vs
+    `末-首+1`」（`200` 那档没有范围事实可比，但它本来就走整份重写，接不上错前缀）；
+    ureq 每一跳重定向都剥掉 `Cookie`，`get_raw` 又不像 `get_full` 那样回 `final_url`，
+    所以这层看不出「被重定向去了别处」—— 剥 `Cookie` 是 ureq 的既有行为（`get_reader`
+    走的是同一套），但今天 `download_with_info` 发流只带 UA 不带 Cookie，
+    「带 Cookie 穿重定向」这条路是续传链才走到的。
+  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。真机结论（尤其 `416` 到底带不带
+    `bytes */N`）要等 #8 的联网用例，届时按仓库规矩进 `CLIENT-API.md` 的实测状态总表。
+  - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
+    `http::{get, get_full, post_json}`，既漏了既有的 `get_reader`，也没含本层新加的 `get_raw`。
+    改那行规则正文要单独取授权，先在这里记着，别把它当成「`get_raw` 是绕过 http 封装的私拉 HTTP」。
 
 ## 未移植项
 
