@@ -55,13 +55,20 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResumeAction {
     /// 旧数据是同一文件的前缀：从 `offset` 起继续追加本次响应。
+    /// 「追加完有没有到文件末尾」（`offset + 本次字节数 == total`）是调用方的收尾判定，
+    /// 这里只回答能不能接。
     Append { offset: u64 },
     /// 服务器忽略了范围请求：本次响应本身就是整份文件，作废旧数据后整份重写。
     FullResponse,
     /// 这次响应不能用来续传：本地这段接不上，只能从 0 重新发一次整份请求。
     /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
-    /// 服务器说文件就到本地长度为止：旧数据其实已经完整。
+    /// `416` 报的总长等于本地字节数、且密钥指纹与记录相符：按 #2 的 416 判据算已经下完。
+    ///
+    /// 这一格没有证明「本地这段就是这个文件的前缀」——指纹只证明同一把密钥，不证明同一个
+    /// 文件。若平台在两次取流之间把文件重新编码成恰好等于本地的长度，交出去的就是旧文件前缀，
+    /// 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要再比
+    /// `recorded_total`」列为待决口径（见 #2 的评论），定稿前按票面字面实现：只比 `local_len`。
     Complete,
 }
 
@@ -69,8 +76,12 @@ pub(crate) enum ResumeAction {
 ///
 /// ETag 不在其中：#2 让这次响应的起点与总长去对记录、密钥指纹去对本地数据，
 /// ETag 只写进记录文件、供 `If-Range` 这个优化使用，不参与「能不能接上」的判断。
+///
+/// 记录文件自身的一致性也不在这里：`.part` 与 `.meta` 只有一方存在、或 `.meta` 写的
+/// 字节数与实际不符，属于 #7，必须在调用本函数**之前**查完并直接作废重下。本函数只拿
+/// 已经信得过的记录事实回答「能不能接」。
 pub(crate) struct ResumeProbe<'a> {
-    /// 本地 `.part` 的实际字节数。
+    /// 本地 `.part` 的实际字节数（记录写的字节数与实际不符属于 #7 的前置检查，不传进来）。
     pub(crate) local_len: u64,
     /// 记录文件里的文件总长。
     pub(crate) recorded_total: u64,
@@ -167,6 +178,11 @@ mod resume_tests {
                 ResumeAction::FullResponse,
             ),
             (
+                "200 却带着范围头",
+                probe(400, 1000, KEY, KEY, 200, Some(&tail)),
+                ResumeAction::FullResponse,
+            ),
+            (
                 "416 且总长等于本地",
                 probe(1000, 1000, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::Complete,
@@ -205,6 +221,11 @@ mod resume_tests {
                 "416 且记录总长与本地不等",
                 probe(1000, 1200, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::Complete,
+            ),
+            (
+                "本地比记录总长还长",
+                probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
+                ResumeAction::RestartFromZero,
             ),
             (
                 "416 且密钥指纹不符",
