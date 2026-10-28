@@ -286,8 +286,9 @@ mod fetch_tests {
 
     #[test]
     fn the_first_of_two_same_named_headers_is_the_one_we_hand_back() {
-        // `RawResponse::headers` 写着「同名多个值只保留第一个」，这里把这条承诺钉住：
-        // 一个 CDN 真会把同一个头写两行，范围信息不该因此变成「没带这个头」。
+        // `RawResponse::headers` 里同名写几行就有几项，`header()` 取的是第一行的值 —— 把这个
+        // 口径钉住：一个 CDN 真会把同一个头写两行，范围信息不该因此变成「没带这个头」，
+        // 也不该悄悄换成第二行。
         let (url, server) = fake_server(http_response(
             "206 Partial Content",
             &[
