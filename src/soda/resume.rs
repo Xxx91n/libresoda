@@ -22,7 +22,8 @@ pub(crate) struct ContentRange {
     pub(crate) total: u64,
 }
 
-/// 解析 `Content-Range`；单位不是 `bytes`、或区间形态不合法的返回空。
+/// 解析 `Content-Range`；单位不是 `bytes`、或区间数值不成比例的返回空。
+/// 认不认这个形态是判断函数的事，这里只管头本身讲不讲得通。
 pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
     // 单位是大小写不敏感的 token（各家 CDN 改写过头部大小写），分隔符按 OWS 收空格与制表符。
     let (unit, rest) = value.trim().split_once(char::is_whitespace)?;
@@ -66,7 +67,8 @@ pub(crate) enum ResumeAction {
     /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
     /// `416` 以 `bytes */N` 报的总长等于本地字节数：按 #2 的 416 判据算已经下完。
-    /// 只认 `*/N` 形态；416 带闭区间属于违规响应，按「没带我们要读的头」那档作废重下。
+    /// 只认 `*/N` 形态：RFC 9110 对 416 推荐的就是 unsatisfied-range，带闭区间的按
+    /// 「没带我们要读的头」那档作废重下。
     ///
     /// 残余风险：文件若在两次取流之间被平台重新编码成**恰好**等于本地的长度，交出去的是旧
     /// 文件的前缀 —— 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要
@@ -111,10 +113,8 @@ pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
         (200, _) => ResumeAction::FullResponse,
         // 另两个「能接上」的结论都靠旧数据：密钥换了，那段字节的身份就没人能证明。
         _ if key_changed => ResumeAction::RestartFromZero,
-        // #2 要读的只有 `bytes */N`；416 带闭区间是违规响应，不是那个头，
-        // 所以按票面「没带这个头」那一档处理：删旧重下，不从它推断「已完整」。
-        // 两个 `is_none` 都写上是必要的：解析器虽然只会产出「都有」或「都无」两种形态，
-        // 但 `ContentRange` 的字段可自由构造，不该让这格判断依赖另一个模块的不变量。
+        // 两个 `is_none` 都要判：`ContentRange` 的字段可以自由构造，这格判断不该依赖
+        // 解析器「要么都有、要么都无」这个别处的不变量。
         (416, Some(range))
             if range.first.is_none() && range.last.is_none() && range.total == probe.local_len =>
         {
