@@ -29,13 +29,14 @@ pub mod feed;
 pub mod link;
 pub mod lyric;
 pub mod media_ref;
+// 记录文件与下面的续传判断都故意不对外：AGENTS.md 铁律 2 的例外，个案记在 docs/PORTING.md。
+pub(crate) mod part_record;
 pub mod playback;
 pub mod playlist;
 pub mod playlist_edit;
 pub mod qr_login;
 pub mod quality;
 pub mod report;
-// 续传判断故意不对外：AGENTS.md 铁律 2 的例外，个案记在 docs/PORTING.md。
 pub(crate) mod resume;
 pub mod search;
 pub mod signature;

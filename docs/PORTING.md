@@ -36,6 +36,7 @@
 | （上游无对应）| `crypto::{decrypt_stream, decrypt_stream_with_auth}`：边读边解边写，输出与 `decrypt_audio*` 逐字节一致，峰值内存从「2×整曲」降到「单样本」 |
 | （上游无对应）| `http::get_reader`：返回流式读取器，供整曲下载使用（上游 `utils.Get` 总是整块读入） |
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
+| （上游无对应）| `part_record::{staged_paths, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由同 `resume`；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段与判龄的取舍见下文「断点续传的记录文件」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -76,7 +77,7 @@
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
-| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 
 ## 与上游的实现差异
 
@@ -101,6 +102,32 @@
   - **可见性（2026-10-28 定）**：`resume` 保持 `pub(crate)`。铁律 2 例外的出口是「出现外部
     调用方」而不是「口径定稿」——A 定稿只说明规则不再变，不代表该对外承诺；`resume` 是下载
     路径的内部件，将来若真有消费方要公开，公开前在这里记原因。
+
+* **断点续传的记录文件（`soda::part_record`，上游无对应）**：实现票
+  [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径来自
+  [`#2`](https://github.com/sodahub-org/libresoda/issues/2)「记录文件与「还能不能接上」的判据」一节。
+  三个落盘名字都由目标路径推导（规则也写在 `part_record` 的模块头 —— #2 的用户故事 20 要求
+  「命名规则固定并写进文档」）：`{目标}.part` 装未下完的**加密**字节、`{目标}.part.meta` 是记录、
+  `{目标}.part.meta.tmp` 只是原子写的临时名（改名成功后不残留，读记录那条路永远不认它）。
+  `{目标}.part.lock` 归 #8。
+
+  - 记录只有票面那四样：总长、强 `ETag`、密钥指纹、写入时的字节数。JSON + `deny_unknown_fields`，
+    认不出的字段不当「半可信的记录」用。
+  - 判龄用文件 mtime，**不记时间戳**：票面把记录限定成四样，加第五个字段要先改票。拿不到 mtime
+    （文件系统不支持、时钟回跳）就不判过期 —— 删除不可逆，宁可把这一轮的垃圾留到下次。
+  - 指纹是**密钥字节**的 MD5，复用 `qr_login::md5_hex_upper`（只为「两次是不是同一把」的等值判断，
+    不承诺安全强度，也不为此新增依赖）。输入取 `crypto::hex_decode(crypto::extract_key(..))` 的
+    字节，不是 `play_auth` 串、也不是它的十六进制文本：#3 记下过同一个密钥可能有大小写两种写法。
+  - `ETag` 只存强校验器（`W/` 前缀归成空），比较忽略大小写（票面第 2 条的依据是厂商会改写大小写）。
+    它仍然只服务 `If-Range` 这个优化，不参与「能不能接上」（同 `ResumeProbe` 的口径）。
+  - 「记录与数据只有一方在、或记录写的字节数与磁盘真实长度不符 → 两边一起删」发生在调用
+    `decide_resume_action` **之前**：这条边界写在 `ResumeProbe` 的文档里，#7 票面没写。
+  - 7 天清扫只动**有配对记录**的暂存对：`.part` 这个后缀不是本 crate 独占的，扫目录不替别人的程序
+    删文件；没有记录的 `.part` 留给同一目标的下次下载由 `load_record` 作废。清扫失败不挡下载。
+  - **可见性**：整模块 `pub(crate)`，理由与出口同上一条 `resume`。#8 落地前 `resume.rs` 与本模块
+    顶部的 `#![allow(dead_code)]` 都不能删 —— #7 不调 `decide_resume_action`（它的检查在那之前），
+    去掉 allow 后 `parse_content_range`、`ResumeAction`、`decide_resume_action` 都报 never used
+    （2026-10-28 实测）。
 
 ## 未移植项
 
