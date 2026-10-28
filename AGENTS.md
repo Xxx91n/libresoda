@@ -36,7 +36,7 @@
 | `soda/user_playlist.go` | `src/soda/user_playlist.rs` |
 | `soda/crypto.go` | `src/soda/crypto.rs` |
 | `soda/login.go` | `src/soda/qr_login.rs`（二维码创建/轮询/会话，**部分移植**）+ `src/soda/browser.rs`（可选外部请求器） |
-| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断）、`src/soda/resume.rs`（续传判断纯函数） |
+| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断）、`src/soda/resume.rs`（续传判断纯函数）、`src/soda/fetch.rs`（续传取数层：一次范围请求拿回状态码/范围头/`ETag`，配 `src/http.rs` 的 `get_raw`） |
 | （上游无对应）| 客户端能力：`feed.rs`（推荐流/听歌模式）、`playlist_edit.rs`（歌单写操作）、`collection.rs`（收藏/我收藏的）、`playback.rs`（最近播放/播放统计）、`artist.rs`（艺人）、`media_ref.rs`（`{id,type}` 媒体引用） |
 | `model/*.go` | `src/model.rs` |
 | `utils/request.go` | `src/http.rs` |

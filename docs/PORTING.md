@@ -35,7 +35,9 @@
 | `DecryptAudio` / `extractKey` / `decryptSpadeInner` | `crypto::{decrypt_audio, extract_key, decrypt_spade_inner}` |
 | （上游无对应）| `crypto::{decrypt_stream, decrypt_stream_with_auth}`：边读边解边写，输出与 `decrypt_audio*` 逐字节一致，峰值内存从「2×整曲」降到「单样本」 |
 | （上游无对应）| `http::get_reader`：返回流式读取器，供整曲下载使用（上游 `utils.Get` 总是整块读入） |
+| （上游无对应）| `http::get_raw`：一次 GET 把状态码、响应头、流式读取器一并交回，**4xx/5xx 不当错误**（ureq 2.x 没有这种开关，靠匹配它的 `Error::Status` 变体，响应头就随那个变体回来）。`pub(crate)`，只给下面的取数层用 |
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
+| （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -77,6 +79,7 @@
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个状态码回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 坏范围头），断言取数层拿到的三个事实与线上真发了 `Range`；不引 mock 库 |
 
 ## 与上游的实现差异
 
@@ -101,6 +104,21 @@
   - **可见性（2026-10-28 定）**：`resume` 保持 `pub(crate)`。铁律 2 例外的出口是「出现外部
     调用方」而不是「口径定稿」——A 定稿只说明规则不再变，不代表该对外承诺；`resume` 是下载
     路径的内部件，将来若真有消费方要公开，公开前在这里记原因。
+
+* **断点续传的取数层（`soda::fetch` 加 `http::get_raw`，上游无对应）**：续传要按这次响应的状态码
+  分支，而 `416` 的判断依据就在它的响应头里，所以这一层必须能在 4xx/5xx 时拿到状态码与响应头，
+  不能折成一句错误文本。上游 `utils/request.go` 是「非 2xx 即错」的写法，给不了这个；ureq 2.x
+  也没有把状态码当正常响应的开关，于是 `http::get_raw` 自己匹配 `Error::Status`，把随它带回来的
+  `Response` 当正常响应用（状态码、响应头、流式 body 一个不丢），`fetch::fetch_range` 在它之上
+  拼 `Range: bytes={offset}-` 并交回三个事实。
+  - **只取数不判断**：范围头交回的就是 `resume::ContentRange`，「能不能接上」仍然只在 `resume`
+    那一处；`If-Range` 不由这层拼，走 `options` 透传（#2 定它只作「省一次白下载」的优化）。
+  - **可见性（沿用上面 #5 的口径）**：`soda::fetch` 与 `http::get_raw` 都保持 `pub(crate)`。
+    这不是把铁律 2 的例外再扩一格：取数层交回的类型就是那个不外见的 `ContentRange`，公开它等于
+    绕过 #5 把范围头规则端出去，而且它也没有外部调用方（消费方是 #8 的下载主路径）。出口同一条：
+    出现外部调用方时再评估，并在这里记原因。实现票
+    [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级
+    [`#2`](https://github.com/sodahub-org/libresoda/issues/2)。
 
 ## 未移植项
 
