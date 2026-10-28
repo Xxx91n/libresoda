@@ -19,7 +19,8 @@
 //! 并发：#2 规定 `{目标}.part` 的所有读写都必须在 `{目标}.part.lock` 那把不等待的独占锁下做，
 //! 不能有绕过的分支。**这把锁由 #8 取**（它才知道取流与写盘的整条顺序），本模块的
 //! [`write_record`] / [`load_record`] / [`discard_parts`] 都假定调用方已经持有它 —— 临时名由目标
-//! 推导、不是每次唯一，两个写者同时动同一个目标就会互相搅在同一个 `.tmp` 里。
+//! 推导、不是每次唯一，同一目标的并发写只能靠那把锁挡（[`open_record_tmp`] 用 `create_new`
+//! 保证至少不会静默截断或写穿别人的东西，但「删掉残骸重来」救不了两个真写者）。
 //! [`purge_expired_parts`] 是唯一的例外：它动的是**别的目标**的暂存，当前目标的锁管不到它们，
 //! 所以它的「不会误删在下的文件」靠的是「只删两边都 7 天没被写过的一对」，见那个函数的文档。
 //!
@@ -75,7 +76,8 @@ impl PartRecord {
     ///
     /// `key_bytes` 必须是**解出来的 AES 密钥字节**：先 `crypto::extract_key(play_auth)` 拿到
     /// 十六进制文本，再 `crypto::hex_decode(..)` 解成字节，传后者。不能传 `play_auth` 字符串，
-    /// 也不能传那串十六进制文本本身：#3 记下过同一个密钥可能有大小写与补零两种写法。
+    /// 也不能传那串十六进制文本本身 —— #3 记下过同一个密钥可能有大写和小写两种写法，比文本会
+    /// 把同一把判成两把。长度这里不校验：不是 16 字节的东西 `crypto` 在解密时本来就会拒。
     pub(crate) fn new(
         total_len: u64,
         etag: Option<&str>,
@@ -163,18 +165,18 @@ pub(crate) fn staged_paths(target: &Path) -> Result<StagedPaths> {
     }
 }
 
-/// 原子写记录文件：先写 `{目标}.part.meta.tmp`，成功后改名到 `{目标}.part.meta`。
+/// 原子写记录文件：先以独占新建写 `{目标}.part.meta.tmp`，成功后改名到 `{目标}.part.meta`。
 ///
-/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以同一个目标在锁下（#8 的
-/// `.part.lock`）单写者时不会留下半个**能读**的记录：临时名是按目标推导的固定名字，两个进程
-/// 同时写同一个目标会互相搅在同一个 `.tmp` 里，那属于 #8 的锁要挡住的分支。
+/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以不会留下半个**能读**的记录。
+/// 临时名是按目标推导的固定名字、不是每次唯一，同一目标的并发写要靠 #8 的 `{目标}.part.lock`
+/// 挡住；[`open_record_tmp`] 的 `create_new` 只保证不会被我们自己的重试坑到（不静默截断、
+/// 不写穿链接），撞车时如实报错。
 /// 只 `write_all` 交给内核，不做 `fsync`（#2 明确不为掉电一致性付每次几十 MB 的代价）。
 pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
     let paths = staged_paths(target)?;
     let bytes = serde_json::to_vec(record)?;
     let written = (|| -> Result<()> {
-        // `File::create` 会截断上一次崩溃留下的同名临时文件
-        let mut file = std::fs::File::create(&paths.record_tmp)?;
+        let mut file = open_record_tmp(&paths.record_tmp)?;
         file.write_all(&bytes)?;
         drop(file);
         std::fs::rename(&paths.record_tmp, &paths.record)?;
@@ -185,6 +187,25 @@ pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
         let _ = std::fs::remove_file(&paths.record_tmp);
         err
     })
+}
+
+/// 以「独占新建」打开临时名（`create_new` = O_EXCL），而不是 `File::create` 那种「有就截断」。
+/// 临时名是按目标推导的固定名字，撞车只有两种来源，两种都不该由我们默默接管：
+///
+/// * 上次崩溃留下的残骸 → 删掉重来。
+/// * 没拿到 #8 那把锁的并发写者 → 如实失败，不让两个人的字节搅进同一个 `.tmp`；
+///   顺带也不写穿一个被人提前放在那个位置上的符号链接（`File::create` 会跟着它写到别处）。
+fn open_record_tmp(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    match options.open(path) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            remove_existing(path)?;
+            options.open(path).map_err(Into::into)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// 读回 `.part` 与它的记录：返回 `Some` 时**两边都可信**，返回 `None` 时这次没有可用的暂存。
@@ -199,10 +220,16 @@ pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
 ///
 /// 作废只删我们自己那种普通文件：那个位置要是被目录、管道或别人的东西占着就留着不动
 /// （占了 `.part` 那个位置的东西不是本 crate 的暂存，删它才是越界；这种目标本来也续不起来，
-/// #8 往 `.part` 写第一个字节时自然会拿到自己的 I/O 错误）。
+/// #8 往 `.part` 写第一个字节时自然会拿到自己的 I/O 错误）。真要删的那个文件删不动时（杀软或
+/// 索引器正占着，Windows 上是共享冲突）**如实报错**：宁可这次失败，也不能让调用方以为旧数据
+/// 已经没了、转身往一份还在盘上的旧字节后面追加。
 ///
 /// 过期（[`MAX_AGE`]）不在这里判：由 [`purge_expired_parts`] 在每次下载开始时扫一次目录 ——
 /// 只有扫目录这一条能覆盖「用户再也不播」的曲目。
+///
+/// 给调用方的一条约束：`record.total_len` 是**磁盘上的一个数字**，`load_record` 只保证它不小于
+/// 本地长度，不保证它是真的 —— 不能拿它预分配缓冲区（AGENTS.md「内存安全铁律」第 1 条）。
+/// 服务端这次给的总长才是判据（`ResumeProbe::recorded_total` 只用它跟响应对照）。
 pub(crate) fn load_record(target: &Path) -> Result<Option<StagedPart>> {
     let paths = staged_paths(target)?;
     let local_len = file_len(&paths.part)?;
@@ -241,19 +268,21 @@ fn discard(paths: &StagedPaths) -> Result<()> {
 
 /// 清掉**这次下载所在目录**里超过 [`MAX_AGE`] 的暂存对（#2：任一次下载开始时顺带清一次）。
 ///
-/// 目录由目标路径推导，调用方不传（#2 把「调用方只需要知道最终路径一个概念」当成约定）；
-/// 目标是个裸文件名时扫当前目录。
+/// 目录取自推导出来的 `{目标}.part` 所在目录，调用方不传（#2 把「调用方只需要知道最终路径一个
+/// 概念」当成约定）；目标是个裸文件名时扫当前目录。
 ///
 /// * 先按名字认出本模块的命名族（`*.part.meta` 与它的临时名 `*.part.meta.tmp`）**才 stat** ——
 ///   下载目录里成千上万个无关文件不该被逐个问一遍。判龄用文件 mtime。
-/// * 一对里任一边还年轻就整对都不动——正在下的那首不该被这一轮扫掉：写方每次都重写记录，
-///   它的 mtime 一直是新的。
+/// * 只动普通文件：名字撞上目录、管道、符号链接、拿不到 mtime 的位置，或 stat 读不动的位置，
+///   一律整对不动。唯一的例外是临时名 `*.part.meta.tmp` —— 它没有配对可言（写成功就被改名走），
+///   留在那儿的一定是崩溃残骸，按自己的 mtime 清。
+/// * 一对里两个都过期时**先删数据再删记录**：反过来一旦只有第一步成功，就正好造出下面那种
+///   本模块扫不掉的孤儿 `.part`，留给下一轮的反而更多。
 /// * **没有配对记录的 `.part` 不动**：`.part` 这个后缀不是本 crate 独占的（Transmission 这类
 ///   下载器的未完成文件就叫 `X.part`），扫目录不该替别人的程序删文件。代价是本 crate 自己在
 ///   「记录还没写下就崩溃」时留下的孤立 `.part` 会一直占着，直到同一个目标再次下载才由
 ///   [`load_record`] 一起作废 —— 这是拿「不删别人的文件」换来的漏，不是漏写。（`load_record`
 ///   敢删没配对的 `.part`，因为它只动**调用方正要写的那个目标**；扫目录动的是一堆别的目标。）
-/// * 只动普通文件：名字撞上目录、管道、拿不到 mtime 的位置一律整对不动。
 /// * 尽力而为：单个条目的名字读不到、stat 失败、删不掉（OneDrive 占位符、杀软占用都会这样）
 ///   就跳过它、留给下一轮；只有「整个目录打不开」才返回错误。这是一次顺带的回收，不该挡住下载。
 ///
@@ -262,14 +291,15 @@ fn discard(paths: &StagedPaths) -> Result<()> {
 /// 一个真在下的文件不会 7 天没被写过。跨进程同时扫同一目录时最多多删一次对方已过期的暂存，
 /// 而那种文件的身份本来就已经没人认得了。
 pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
-    // 与兄弟函数同一道校验：推不出暂存名就没有「这次下载所在目录」可言
-    let _ = staged_paths(target)?;
-    let dir = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
+    // 与兄弟函数同一道校验（目标推不出暂存名就没有「这次下载所在目录」可言），并且直接把
+    // 推导出来的 `.part` 路径当目录的唯一来源，不在 `target` 上再算一次 parent
+    let paths = staged_paths(target)?;
+    let dir = match paths.part.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
     };
     let now = SystemTime::now();
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         // 目录还没有（第一次下载）就没有可清的
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -291,12 +321,18 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
         if !record_name.ends_with(RECORD_SUFFIX) {
             continue;
         }
-        let Ok(Slot::Aged(age)) = slot_of(&path, now) else {
+        // 只有「是普通文件、且拿得出 mtime」的这一格才允许往下判；目录、管道、符号链接、
+        // 没有 mtime 的文件系统、stat 失败，全部整对不动
+        let Ok(entry_slot) = slot_of(&path) else {
+            continue;
+        };
+        let Some(age) = age_of(&entry_slot, now) else {
             continue;
         };
         if age <= MAX_AGE {
             continue;
         }
+        // 临时名没有配对可言：写成功就被改名走，留在这儿的一定是崩溃的残骸
         if is_tmp {
             let _ = remove_existing(&path);
             continue;
@@ -306,73 +342,87 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
             continue;
         };
         let data_path = dir.join(data_name);
-        match slot_of(&data_path, now) {
-            Ok(Slot::Aged(data_age)) if data_age <= MAX_AGE => continue,
-            Ok(Slot::Aged(_)) => {
-                let _ = remove_existing(&data_path);
+        let Ok(data_slot) = slot_of(&data_path) else {
+            continue;
+        };
+        // 数据的四种落点：还年轻、或拿不出可判的年龄（位置被别的东西占着、文件系统没 mtime、
+        // stat 失败）→ 整对都不动；真的不存在 → 只剩这条孤立记录要清；也过期 → 一起删
+        match age_of(&data_slot, now) {
+            Some(data_age) if data_age <= MAX_AGE => continue,
+            Some(_) => {
+                // **先删数据再删记录**：反过来一旦只有第一步成功，就正好造出上面那种扫不掉的孤儿
+                if remove_existing(&data_path).is_err() {
+                    continue;
+                }
             }
-            // 数据本来就不在：只剩这条过期的孤立记录要清
-            Ok(Slot::Absent) => {}
-            // 数据那个位置被怪东西占着，或者 stat 失败：整对都不动
-            Ok(Slot::Untouchable) | Err(_) => continue,
+            None if matches!(data_slot, Slot::Absent) => {}
+            None => continue,
         }
         let _ = remove_existing(&path);
     }
     Ok(())
 }
 
-/// 扫目录时对暂存名字上那个位置的判断 —— 删除不可逆，所以只有 `Aged` 这一格才允许动手。
+/// 暂存名字上那个位置的分类。删除与改名都不可逆，所以只有 `File` 这一格算「我们自己的文件」。
+///
+/// 用 `symlink_metadata`（lstat）判：符号链接不是本模块写出来的东西，跟着它去 stat 会把
+/// `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，进而删掉它配对的记录、却让链接本身
+/// 留在原地（`remove_file` 删的是链接，下一次 `File::create` 又会写穿过去）。
 enum Slot {
-    /// 普通文件，年龄可判。
-    Aged(Duration),
-    /// 是普通文件但拿不到 mtime（文件系统不支持），或那个位置根本不是普通文件（目录、管道、
-    /// 别人的东西）。
-    Untouchable,
-    /// 什么都没有。
+    /// 普通文件。`modified` 为 `None` 表示这个文件系统给不出 mtime。
+    File {
+        len: u64,
+        modified: Option<SystemTime>,
+    },
+    /// 什么都没有：路径或它的某一段不存在。
     Absent,
+    /// 那个位置被别的东西占着（目录、管道、符号链接），或者读不动它的元数据。
+    Untouchable,
 }
 
-/// 暂存位置上的普通文件元数据；不存在、或那个位置不是普通文件（目录、管道…）时给 `None`。
-fn staged_file_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => Ok(Some(meta)),
-        Ok(_) => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
-
-/// 文件真实长度；不存在或不是普通文件时给 `None`。
-fn file_len(path: &Path) -> Result<Option<u64>> {
-    Ok(staged_file_meta(path)?.map(|meta| meta.len()))
-}
-
-/// 暂存位置的年龄，一次 stat 判成 [`Slot`] 那三种处置。
-fn slot_of(path: &Path, now: SystemTime) -> Result<Slot> {
-    let meta = match std::fs::metadata(path) {
+/// 一次 lstat 出一个位置的 [`Slot`]。权限之类的 I/O 错误照原样返回：`load_record` 那条路要如实
+/// 报错（宁可这次失败也不能拿不可信的数据续传），扫目录那条路自己吞掉（一个条目挡不住整轮）。
+fn slot_of(path: &Path) -> Result<Slot> {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         // 路径或它的某一段已经不在了
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Slot::Absent),
         Err(err) => return Err(err.into()),
     };
-    if !meta.is_file() {
+    if !meta.file_type().is_file() {
         return Ok(Slot::Untouchable);
     }
-    let Ok(modified) = meta.modified() else {
-        return Ok(Slot::Untouchable);
+    Ok(Slot::File {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+/// 文件真实长度；不存在、或不是我们那种普通文件（目录、管道、符号链接）时给 `None`。
+fn file_len(path: &Path) -> Result<Option<u64>> {
+    match slot_of(path)? {
+        Slot::File { len, .. } => Ok(Some(len)),
+        Slot::Absent | Slot::Untouchable => Ok(None),
+    }
+}
+
+/// `File` 那一格的年龄。拿不到 mtime 时给 `None`，调用方按不动处理。
+/// 时间戳在未来（有人把时钟往回拨过）按 0 龄算：这份暂存要等时钟追回去才会被扫掉。
+fn age_of(slot: &Slot, now: SystemTime) -> Option<Duration> {
+    let Slot::File { modified, .. } = slot else {
+        return None;
     };
-    // 时间戳在未来（有人把时钟往回拨过）按 0 龄算：这份暂存要等时钟追回去才会被扫掉
-    Ok(Slot::Aged(
-        now.duration_since(modified).unwrap_or(Duration::ZERO),
-    ))
+    modified.map(|modified| now.duration_since(modified).unwrap_or(Duration::ZERO))
 }
 
 /// 读并解析记录文件；读不出（不存在、超大、半截、字段不认识）一律给 `None`，
 /// 由调用方按「记录与数据一起作废」处理。I/O 错误本身照原样返回。
 fn read_record(path: &Path) -> Result<Option<PartRecord>> {
-    // 先判类型再打开：`File::open` 在一个目录上，Linux 会成功、Windows 直接
-    // ACCESS_DENIED；在一个管道上则会卡在 open 里等一个不来的写者（AGENTS.md 内存安全铁律 2）。
-    if staged_file_meta(path)?.is_none() {
+    // 先判类型再打开：`File::open` 在一个目录上，Linux 会成功、Windows 直接 ACCESS_DENIED；
+    // 在一个管道上则会卡在 open 里等一个不来的写者（AGENTS.md 内存安全铁律 2）。
+    // 判完再 open 中间有一个理论上的替换窗口：能把暂存目录变成攻击面的人本来就能直接改暂存本身，
+    // 那条路靠 #2 的「锁不可靠时退回重下、不产出坏文件」兜，这里不再加第二层。
+    if file_len(path)?.is_none() {
         return Ok(None);
     }
     let file = std::fs::File::open(path)?;
@@ -752,6 +802,64 @@ mod part_record_tests {
             purge_expired_parts(Path::new("/")),
             Err(SodaError::InvalidInput(_))
         ));
+    }
+
+    /// 悬空符号链接只在类 Unix 系统上好造（Windows 建符号链接要额外权限，CI 里不可靠）。
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_in_the_data_slot_keeps_the_whole_pair() {
+        // `metadata` 会跟着链接走，悬空链接于是报「不存在」：扫目录会把配对的记录删掉，
+        // 而 `remove_file` 删的是链接本身、链接还会留在原地。类型判断改用 lstat 之后，
+        // 这一对必须整个不动
+        let dir = sandbox("dangling-link");
+        let data_path = dir.join("ghost.m4a.part");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &data_path).expect("symlink");
+        let record_path = dir.join("ghost.m4a.part.meta");
+        std::fs::write(&record_path, b"{}").expect("write record");
+        set_mtime(
+            &record_path,
+            SystemTime::now() - MAX_AGE - Duration::from_secs(60),
+        );
+
+        purge_expired_parts(&dir.join("anything.m4a")).expect("purge");
+        assert!(record_path.exists(), "数据是个悬空链接却把记录删了");
+        assert!(data_path.symlink_metadata().is_ok(), "链接本身被删了");
+        cleanup(&dir);
+    }
+
+    /// 同上：符号链接只在类 Unix 上好造。
+    #[cfg(unix)]
+    #[test]
+    fn temp_name_symlink_is_not_written_through() {
+        // 临时名用 `create_new` 独占新建，而不是 `File::create` 那种「有就截断」：
+        // 有人先把临时名做成指向别处的链接时，记录不能顺着它写进别人的文件
+        let dir = sandbox("tmp-symlink");
+        let target = dir.join("song.m4a");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"do not touch").expect("write victim");
+        std::os::unix::fs::symlink(&victim, tmp_path(&target)).expect("symlink at the temp name");
+
+        write_record(&target, &record(1000, None, 10)).expect("write record");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"do not touch",
+            "记录被写进了链接指向的那个文件"
+        );
+        assert!(paths(&target).1.is_file(), "障碍去掉后记录没写出来");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn stale_temp_residue_is_replaced_by_the_next_write() {
+        // 「撞车是上次崩溃的残骸」这一格：残留的临时名要被删掉重来，而不是让写失败
+        let dir = sandbox("stale-tmp");
+        let target = dir.join("song.m4a");
+        std::fs::write(tmp_path(&target), b"half a json").expect("plant residue");
+
+        write_record(&target, &record(1000, None, 10)).expect("write over residue");
+        assert!(paths(&target).1.is_file(), "记录没写出来");
+        assert!(!tmp_path(&target).exists(), "残骸留在临时名上");
+        cleanup(&dir);
     }
 
     #[test]

@@ -36,7 +36,7 @@
 | （上游无对应）| `crypto::{decrypt_stream, decrypt_stream_with_auth}`：边读边解边写，输出与 `decrypt_audio*` 逐字节一致，峰值内存从「2×整曲」降到「单样本」 |
 | （上游无对应）| `http::get_reader`：返回流式读取器，供整曲下载使用（上游 `utils.Get` 总是整块读入） |
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
-| （上游无对应）| `part_record::{staged_paths, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由同 `resume`；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段与判龄的取舍见下文「断点续传的记录文件」 |
+| （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由同 `resume`；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -127,30 +127,43 @@
     `decide_resume_action` **之前**：这条边界写在 `ResumeProbe` 的文档里，#7 票面没写。
     一起作废只删**普通文件**：那个位置要是被目录或别人的文件占着就留着不动 —— 那种东西不是本
     crate 的暂存，删它才是越界（`write_record` 只碰记录那一侧，数据位置上的障碍由 #8 写第一个
-    字节时拿到自己的 I/O 错误）。`.part` 是 0 字节时也一并作废：没有可接的字节，而「总长 0 +
-    `416 bytes */0`」会被判成「已下完」，交出去的是个空文件 —— 正是用户故事 8 排除的那种。
-    记录位置被目录占着时也不能先 `File::open`：同一个调用在 Linux 上成功、在 Windows 上是
-    ACCESS_DENIED，类型判断必须排在打开前面，否则两个平台的分支不一样。
+    字节时拿到自己的 I/O 错误）。真要删的那个文件**删不动时如实报错**：Windows 上杀软或索引器的
+    共享冲突会让 `remove_file` 失败，Linux 的 `unlink` 却几乎总能成功 —— 这里不能假装「已作废」，
+    否则调用方会往一份还在盘上的旧字节后面追加。`.part` 是 0 字节时也一并作废：没有可接的字节，
+    而「总长 0 + `416 bytes */0`」会被判成「已下完」，交出去的是个空文件 —— 正是用户故事 8 排除
+    的那种。记录位置被目录占着时也不能先 `File::open`：同一个调用在 Linux 上成功、在 Windows 上是
+    ACCESS_DENIED，类型判断必须排在打开前面，否则两个平台的分支不一样。`record.total_len` 交给
+    调用方时只保证「不小于本地长度」，**不保证是真的**：#8 不能拿它预分配（内存安全铁律 1）。
+  - 类型判断一律用 `symlink_metadata`（lstat）而不是 `metadata`：跟着链接去 stat 会把
+    `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，于是扫目录删掉它配对的记录、链接却留在
+    原地（`remove_file` 删的是链接本身，下次 `File::create` 又写穿过去）。判不成普通文件的位置统一
+    按「不动」。临时名的写入用 `create_new`（O_EXCL）而不是 `File::create`：既不静默截断另一个写者
+    正在用的同名临时文件，也不写穿被人放在那个位置上的链接。判类型与打开之间还剩一个理论上的替换
+    窗口 —— 能把暂存目录变成攻击面的人本来就能直接改暂存内容，那条路归 #2 已有的「锁不可靠时退回
+    重下、不产出坏文件」。
   - 7 天清扫只动**有配对记录**的暂存对：`.part` 这个后缀不是本 crate 独占的（Transmission 之类
     的未完成文件就叫 `X.part`），扫一整个目录时不替别人的程序删文件。代价是本 crate 自己在
     「记录还没写下就崩溃」时留下的孤立 `.part` 会一直占着，直到同一目标再次下载才由
     `load_record` 作废；这是换来的漏，不是漏写。`load_record` 敢删没配对的 `.part` 是因为它只动
-    **调用方正要写的那个目标**，扫目录动的是一堆别的目标。
+    **调用方正要写的那个目标**，扫目录动的是一堆别的目标。两边都过期时**先删数据再删记录** ——
+    反过来一旦只有第一步成功，就正好造出上面那种扫不掉的孤儿。
   - 清扫是**尽力而为**：先按名字认出记录族再 stat（下载目录里成千上万个无关文件不该被逐个问一遍），
     单个条目 stat 失败或删不掉（OneDrive 占位符、杀软占用）就跳过它留给下一轮，只有「整个目录
     打不开」才返回错误 —— 一次顺带回收不该挡住下载。目标必须推得出暂存名（`/` 这种报
-    `invalid_input`），目录由 `target.parent()` 取，裸文件名退到当前目录。
+    `invalid_input`），目录取自推导出来的 `.part` 的 `parent()`，裸文件名退到当前目录。
   - **锁**：#2 规定 `.part` 的所有读写都在 `{目标}.part.lock` 下、不能有绕过分支。那把锁由 #8 取，
-    `write_record` / `load_record` / `discard_parts` 都假定调用方已持有（临时名是按目标推导的固定
-    名字、不是每次唯一，两个写者同时动同一个目标会互相搅在同一个 `.tmp` 里）。
-    **`purge_expired_parts` 是唯一的例外**：它动的是别的目标的暂存，当前目标的锁管不到，所以它靠
-    「只删两边都超过 7 天没被写过的一对」自证安全 —— 真在下的文件不会 7 天没被写过。
+    `write_record` / `load_record` / `discard_parts` 都假定调用方已持有；临时名是按目标推导的固定
+    名字、不是每次唯一，`create_new` 只保证「不会静默截断/写穿」，救不了两个真写者，同目标的并发
+    仍然只能靠那把锁。**`purge_expired_parts` 是唯一的例外**：它动的是别的目标的暂存，当前目标的
+    锁管不到，所以它靠「只删两边都超过 7 天没被写过的一对」自证安全 —— 真在下的文件不会 7 天没被
+    写过。
   - 票面第 6 条「**在下次下载时**被清掉」的那个调用点是 #8 的下载主路径，本票只提供并测试
     `purge_expired_parts`；#8 落地前它在库里还没有调用方。同理，`ETag` 的比较（`etag_matches`）
     也只有 #8 发 `If-Range` 时才会用到。
-  - 已知限制：暂存路径上的符号链接按平台默认语义**跟随**（`metadata`/`File::open`/`rename` 都是）。
-    缓存目录本身不可信时，续传可能读到别人的文件、或写穿一个软链 —— 与 #2 已写明的「网络文件系统
-    上的锁不可靠」同类：后果限于这份暂存自己，不会产出坏的目标文件。
+  - 已知限制：本模块**判类型**用 lstat（不跟随链接），但**改名**与**打开**仍按平台语义处理链接位置：
+    `rename` 会把链接本身替换掉、`remove_file` 删的是链接而不是它的目标。缓存目录本身不可信时，
+    续传可能作废重下而不是接上 —— 与 #2 已写明的「网络文件系统上的锁不可靠」同类：后果限于这份
+    暂存自己，不会产出坏的目标文件。
   - **可见性**：整模块 `pub(crate)`，理由与出口同上一条 `resume`。#8 落地前 `resume.rs` 与本模块
     顶部的 `#![allow(dead_code)]` 都不能删 —— #7 不调 `decide_resume_action`（它的检查在那之前），
     去掉 allow 后 `parse_content_range`、`ResumeAction`、`decide_resume_action` 都报 never used
