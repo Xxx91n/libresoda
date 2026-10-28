@@ -8,8 +8,8 @@
 //!
 //! 消费方是取数层与记录文件（#6/#7），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
-// 消费方（#6/#7）尚未落地，先允许 dead_code；它们接上后删掉下面的 allow。
-#![allow(dead_code)]
+// #6 的取数层已经用上了 `Content-Range` 解析；剩下三处（动作枚举、事实结构、判断函数）
+// 在各自声明处 `#[allow(dead_code)]`，等 #8 的可续传主路径接上后删掉。
 
 /// `Content-Range` 的解析结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,7 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
 }
 
 /// 续传判断的动作。
+#[allow(dead_code)] // #8 消费
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResumeAction {
     /// 这次响应能接在本地那段后面：从 `offset` 起继续追加。
@@ -87,6 +88,7 @@ pub(crate) enum ResumeAction {
 /// 记录文件自身的一致性也不在这里：`.part` 与 `.meta` 只有一方存在、或 `.meta` 写的
 /// 字节数与实际不符，属于 #7，必须在调用本函数**之前**查完并直接作废重下。本函数只拿
 /// 已经信得过的记录事实回答「能不能接」。
+#[allow(dead_code)] // #8 消费
 pub(crate) struct ResumeProbe<'a> {
     /// 本地 `.part` 的实际字节数。
     pub(crate) local_len: u64,
@@ -105,6 +107,7 @@ pub(crate) struct ResumeProbe<'a> {
 /// 由这次响应自己证明本地那段字节还能不能接上。
 ///
 /// 这里只回答「能不能接」。错误响应该不该留旧数据是调用方的判断，不要把处置表搬进来。
+#[allow(dead_code)] // #8 消费
 pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
     let key_changed = probe.current_fingerprint != probe.recorded_fingerprint;
     match (probe.status, probe.range) {
