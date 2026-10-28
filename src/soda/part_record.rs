@@ -227,6 +227,10 @@ fn open_record_tmp(path: &Path) -> Result<std::fs::File> {
 
 /// 读回 `.part` 与它的记录：返回 `Some` 时**两边都可信**，返回 `None` 时这次没有可用的暂存。
 ///
+/// 返回 `Err` 不等于「暂存还在、可以下次再试」：作废走到一半删不动（被杀软或索引器占着、
+/// 权限不够）也会报错，此时盘上是「部分清空」的状态。调用方要按 #2 的处置表当成失败处理，
+/// 不能把 `Err` 当 `None` 继续往旧字节后面追加。
+///
 /// 以下情况都算「与数据不匹配」，一律一起作废（#7 验收第 5 条）：只有一方存在；记录读不出
 /// （半截 / 字段不认识 / 数字不合法）；`.part` 真实长度与 `written_bytes` 不等；记录写的总长
 /// 比磁盘上已有的还短；`.part` 长度是 0 —— 没有可接的字节，接下去本来就等价于从 0 开始，而
@@ -255,10 +259,9 @@ pub(crate) fn load_record(target: &Path) -> Result<Option<StagedPart>> {
         {
             StagedPart { record, local_len }
         }
-        // 凑不成可信的一对就走一起作废，**不在这里早退**：`file_len` 与 `read_record` 都会把
-        // 「链接 / 目录 / 读不出的记录」报成没有，早退等于把这些位置原样留给 #8 ——
-        // 它下一次是拿跟随语义的 `File::create` 来建 `.part` 的。三个名字本来就空着时，
-        // `discard` 也就是逐个确认一遍「没什么可删」
+        // 凑不成可信的一对就走一起作废，**不在这里早退**：`file_len` 与 `read_record` 都把
+        // 「链接 / 目录 / 读不出的记录」报成「没有」，早退等于把这些位置原样留给 #8。
+        // 三个名字本来就空着时，`discard` 就是逐个确认一遍「没什么可删」
         _ => return discard(&paths).map(|()| None),
     };
     Ok(Some(staged))
@@ -374,30 +377,29 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
             continue;
         };
         match &data_slot {
-            // 数据位置是链接，或被目录/管道占着：不是我们能认账的暂存，整对不动
-            Slot::Link | Slot::Occupied => continue,
             // 数据本来就不在：只剩这条过期的孤立记录要清
             Slot::Absent => {}
-            // 数据也在：只有它同样过期才动整对，而且**先删数据再删记录** ——
-            // 反过来一旦只有第一步成功，就正好造出上面那种扫不掉的孤儿
+            // 数据也在且同样过期：动整对，而且**先删数据再删记录** —— 反过来一旦只有第一步
+            // 成功，就正好造出上面那种扫不掉的孤儿
             Slot::File { .. } if expired(&data_slot, now) => {
                 if remove_existing(&data_path).is_err() {
                     continue;
                 }
             }
-            // 还年轻，或这个文件系统给不出 mtime（判不了年龄）
-            Slot::File { .. } => continue,
+            // 其余一律不动：还年轻、判不出年龄、或那个位置是链接/目录/管道
+            _ => continue,
         }
         let _ = remove_existing(&path);
     }
     Ok(())
 }
 
-/// 暂存名字上那个位置的分类。删除与改名都不可逆，所以只有 `File` 这一格算「我们自己的文件」。
+/// 暂存名字上那个位置的分类。删除不可逆，所以四格里只有两格允许动手：`File`（我们写的东西）
+/// 与 `Link`（别人放在我们名字上的占位，只 unlink、不碰它的目标，见 [`discard`]）；
+/// `Occupied` 与 `Absent` 一律不碰。
 ///
-/// 用 `symlink_metadata`（lstat）判：符号链接不是本模块写出来的东西，跟着它去 stat 会把
-/// `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，进而删掉它配对的记录、却让链接本身
-/// 留在原地（`remove_file` 删的是链接，下一次 `File::create` 又会写穿过去）。
+/// 用 `symlink_metadata`（lstat）而不是 `metadata`：跟着链接去 stat 会把
+/// `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，于是扫目录删掉它配对的记录、链接却留下。
 ///
 /// 全模块只有这一处分类：`discard`、`load_record` 与扫目录都读它，不再各自发明一遍判型。
 enum Slot {
@@ -407,7 +409,7 @@ enum Slot {
         modified: Option<SystemTime>,
     },
     /// 符号链接（含悬空的）：占着我们推导出来的名字，但不是本 crate 写出来的暂存。
-    /// 作废时 unlink 掉它（ unlink 不碰它指向的文件），扫目录时整对不动。
+    /// 作废时 unlink 掉它（unlink 不碰它指向的文件），扫目录时整对不动。
     Link,
     /// 什么都没有：路径或它的某一段不存在。
     Absent,
@@ -447,8 +449,8 @@ fn file_len(path: &Path) -> Result<Option<u64>> {
 }
 
 /// 超过 [`MAX_AGE`] 没再被写过 —— **7 天这条判据只写在这一处**。
-/// 拿不出 mtime（不是普通文件、文件系统不给、stat 读不动）都算「不老」：删除不可逆，
-/// 宁可让这一轮的垃圾留到下次。时间戳在未来（有人把时钟往回拨过）按 0 龄算，
+/// `File` 之外的格子、以及文件系统给不出 mtime 的 `File`，都算「不老」：删除不可逆，
+/// 宁可让这一轮的垃圾留到下次。（`slot_of` 报 `Err` 的那种 stat 失败走不到这里。）时间戳在未来（有人把时钟往回拨过）按 0 龄算，
 /// 这份暂存要等时钟追回去才会被扫掉。
 fn expired(slot: &Slot, now: SystemTime) -> bool {
     let Slot::File { modified, .. } = slot else {
