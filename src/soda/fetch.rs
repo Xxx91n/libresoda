@@ -19,18 +19,21 @@ pub(crate) struct RangeResponse {
     pub(crate) status: u16,
     /// 响应头 `Content-Range` 的解析结果；没带这个头、或形态读不通则为空。
     pub(crate) range: Option<ContentRange>,
-    /// 响应头 `ETag` 的**原值**（弱校验的 `W/` 前缀也在里面）。
-    /// 强/弱怎么取舍、比较时是否忽略大小写属于记录文件（#7）与调用方；
-    /// 发 `If-Range` 时要按这个原值回发。
+    /// 响应头 `ETag` 的**原值**（弱校验的 `W/` 前缀也留在值里，这层不替 #7 判定）。
+    /// 要不要拿它记录、比较时是否忽略大小写、要不要拿它发 `If-Range`，都是记录文件（#7）
+    /// 与调用方的事。一条相关的规矩：RFC 9110 §13.1.5 规定弱标记的 entity-tag **不能**进
+    /// `If-Range`，服务端按强比较判定，弱的一律不成立 —— 那时服务器会回整份，旧数据白扔。
     pub(crate) etag: Option<String>,
     /// 响应体读取器，尚未解密。不预分配、也不按响应里的任何长度开内存，由调用方边读边写盘。
     ///
     /// 状态码是 4xx/5xx 时这里读出的是**错误页**，不是音频片段，别往 `.part` 里写。
-    /// 另有一条要知的边界：范围请求一定不带 `Accept-Encoding`（ureq 见请求里有 `Range`
-    /// 就不加），服务器仍硬回 `Content-Encoding` 时，交回的字节已经被它解压过、与
-    /// `Content-Range` 说的区间不符。这层不做检测，靠调用方的「写入字节数 + 总长」
-    /// 校验拦住（见 [`sodahub-org/libresoda#2`](https://github.com/sodahub-org/libresoda/issues/2)
-    /// 的记录文件判据）。
+    /// 另有一条边界：范围请求不带 `Accept-Encoding`（ureq 见请求里有 `Range` 就不加），
+    /// 服务器仍硬回 `Content-Encoding` 时，交回的字节已经被它解压过、与 `Content-Range`
+    /// 的区间对不上，而 ureq 顺手把 `Content-Encoding` 与 `Content-Length` 一起抹掉，
+    /// 这层检测不到。兜底在调用方：`Append` 那档比一下「实际写入字节数 vs `末-首+1`」
+    /// 就能发现（[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 记录文件的
+    /// 「写入时的字节数」）；`200` 那档没有范围事实可比，但它本来就是整份重写，
+    /// 不存在接错前缀的问题。
     pub(crate) reader: Box<dyn Read>,
 }
 
@@ -298,6 +301,25 @@ mod fetch_tests {
                 last: Some(999),
                 total: 1000
             })
+        );
+    }
+
+    #[test]
+    fn a_weak_etag_comes_back_untouched() {
+        // `W/` 前缀一个字都不动：#2 让记录文件只存强 ETag，判定归 #7，不归这层。
+        // 顺带把字段注释那句「原值」钉住 —— 剥掉前缀就没法再判强弱了。
+        let (url, server) = fake_server(http_response(
+            "206 Partial Content",
+            &["ETag: W/\"weak-but-all-we-got\""],
+            &body_of(600),
+        ));
+        let fetched = fetch_range(&url, 400, &[]).expect("weak etag");
+        server.join().expect("server");
+
+        assert_eq!(
+            fetched.etag.as_deref(),
+            Some("W/\"weak-but-all-we-got\""),
+            "弱标记被改动过"
         );
     }
 
