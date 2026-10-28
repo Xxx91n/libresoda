@@ -155,7 +155,7 @@ mod resume_tests {
         let file_grew = parse_content_range("bytes 400-1499/1500").expect("bytes 400-1499/1500");
         let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
         let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
-        // 前九行就是 issue #5 验收列出的九个分支（同序）；后面是补充的边界与守卫优先级用例。
+        // 前九行 = issue #5 验收列出的九个分支，同序；后面补的是边界与守卫优先级用例。
         let cases = [
             (
                 "206 起点吻合",
@@ -173,18 +173,8 @@ mod resume_tests {
                 ResumeAction::RestartFromZero,
             ),
             (
-                "206 只给总长不给区间",
-                probe(400, 1000, KEY, KEY, 206, Some(&only_total)),
-                ResumeAction::RestartFromZero,
-            ),
-            (
                 "200 没理范围请求",
                 probe(400, 1000, KEY, KEY, 200, None),
-                ResumeAction::FullResponse,
-            ),
-            (
-                "200 却带着范围头",
-                probe(400, 1000, KEY, KEY, 200, Some(&tail)),
                 ResumeAction::FullResponse,
             ),
             (
@@ -211,6 +201,16 @@ mod resume_tests {
                 "记录总长变化",
                 probe(400, 1000, KEY, KEY, 206, Some(&file_grew)),
                 ResumeAction::RestartFromZero,
+            ),
+            (
+                "206 只给总长不给区间",
+                probe(400, 1000, KEY, KEY, 206, Some(&only_total)),
+                ResumeAction::RestartFromZero,
+            ),
+            (
+                "200 却带着范围头",
+                probe(400, 1000, KEY, KEY, 200, Some(&tail)),
+                ResumeAction::FullResponse,
             ),
             (
                 "其它状态码兜底",
