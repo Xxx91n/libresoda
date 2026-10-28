@@ -123,8 +123,10 @@ fn strong_etag(value: Option<&str>) -> String {
 }
 
 /// `ETag` 比较忽略大小写：实测不同厂商会改写头部里的大小写（#7 验收第 2 条）。
+/// 两侧都先过一遍 [`strong_etag`] —— 记录是从磁盘读回来的，写它的人未必守过同一个口径。
 /// 任一侧没有可用的强校验器就不算匹配——`If-Range` 宁可不发。
 pub(crate) fn etag_matches(recorded: &str, current: Option<&str>) -> bool {
+    let recorded = strong_etag(Some(recorded));
     let current = strong_etag(current);
     !recorded.is_empty() && !current.is_empty() && recorded.eq_ignore_ascii_case(&current)
 }
@@ -167,11 +169,16 @@ pub(crate) fn staged_paths(target: &Path) -> Result<StagedPaths> {
 
 /// 原子写记录文件：先以独占新建写 `{目标}.part.meta.tmp`，成功后改名到 `{目标}.part.meta`。
 ///
-/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以不会留下半个**能读**的记录。
-/// 临时名是按目标推导的固定名字、不是每次唯一，同一目标的并发写要靠 #8 的 `{目标}.part.lock`
-/// 挡住；[`open_record_tmp`] 的 `create_new` 只保证不会被我们自己的重试坑到（不静默截断、
-/// 不写穿链接），撞车时如实报错。
+/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以不会留下半个**能读**的记录：
+/// 改名要么没发生（`.tmp` 还在，没人认它），要么搬过去的是写完整了的那一份。
 /// 只 `write_all` 交给内核，不做 `fsync`（#2 明确不为掉电一致性付每次几十 MB 的代价）。
+///
+/// 临时名是按目标推导的固定名字、不是每次唯一，所以同一目标的并发写**必须**由 #8 的
+/// `{目标}.part.lock` 挡住：[`open_record_tmp`] 用 `create_new` 避免了 `File::create` 的两种
+/// 更坏的失败（截断别人正打开的同名文件、顺着人放好的符号链接写到别处），但它分不出
+/// 「上次崩溃的残骸」和「没拿到锁的另一家」，只能删掉重来。真撞车时的最坏结果是两份都完整的
+/// 记录里有一份被改名走、另一家在改名上失败报错 —— 仍然不是半个能读的记录，而 #7 交给
+/// #8 的 `load_record` 会因为「记录写的字节数与磁盘上的长度不符」把它一起作废。
 pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
     let paths = staged_paths(target)?;
     let bytes = serde_json::to_vec(record)?;
@@ -183,18 +190,18 @@ pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
         Ok(())
     })();
     written.map_err(|err| {
-        // 半截的临时文件删不掉也不影响正确性：下一次写会截断重来
+        // 半截的临时文件删不掉也不影响正确性：下一次写会把它当残骸换掉
         let _ = std::fs::remove_file(&paths.record_tmp);
         err
     })
 }
 
-/// 以「独占新建」打开临时名（`create_new` = O_EXCL），而不是 `File::create` 那种「有就截断」。
-/// 临时名是按目标推导的固定名字，撞车只有两种来源，两种都不该由我们默默接管：
+/// 以「独占新建」打开临时名（`create_new` = O_EXCL），而不是 `File::create` 那种「有就截断」：
+/// 后者在一个被人正打开的同名临时文件上是「把对方的字节换成我的」，在一个被人做成符号链接的
+/// 位置上则是写到别处去。
 ///
-/// * 上次崩溃留下的残骸 → 删掉重来。
-/// * 没拿到 #8 那把锁的并发写者 → 如实失败，不让两个人的字节搅进同一个 `.tmp`；
-///   顺带也不写穿一个被人提前放在那个位置上的符号链接（`File::create` 会跟着它写到别处）。
+/// 撞上已有东西时删掉重来。这里**分不清**撞的是上次崩溃留下的残骸还是没拿到 #8 那把锁的
+/// 另一个写者 —— 那条区分需要锁本身，见 [`write_record`]。
 fn open_record_tmp(path: &Path) -> Result<std::fs::File> {
     let mut options = std::fs::File::options();
     options.write(true).create_new(true);
@@ -285,26 +292,30 @@ fn discard(paths: &StagedPaths) -> Result<()> {
 ///
 /// * 先按名字认出本模块的命名族（`*.part.meta` 与它的临时名 `*.part.meta.tmp`）**才 stat** ——
 ///   下载目录里成千上万个无关文件不该被逐个问一遍。判龄用文件 mtime。
+/// * **认得出是我们的才动**：记录必须按那四样字段读得出来。少了这一道，一对同样叫
+///   `X.part` / `X.part.meta` 的别人家的文件就会被按名字删掉。唯一的例外是临时名 —— 它的
+///   **定义**就是「可能只写了一半」，内容判不了，只能靠那个又长又特定的后缀认；写成功就被
+///   改名走，留在那儿的一定是崩溃残骸。
+/// * **没有可认出的配对的 `.part` 不动**：`.part` 这个后缀不是本 crate 独占的（Transmission
+///   这类下载器的未完成文件就叫 `X.part`）。代价是本 crate 自己在「记录还没写下就崩溃」时
+///   留下的孤立 `.part` 会一直占着，直到同一个目标再次下载才由 [`load_record`] 一起作废 ——
+///   这是拿「不删别人的文件」换来的漏，不是漏写。（`load_record` 敢删没配对的 `.part`，因为
+///   它只动**调用方正要写的那个目标**；扫目录动的是一堆别的目标。）
 /// * 只动普通文件：名字撞上目录、管道、符号链接、拿不到 mtime 的位置，或 stat 读不动的位置，
-///   一律整对不动。唯一的例外是临时名 `*.part.meta.tmp` —— 它没有配对可言（写成功就被改名走），
-///   留在那儿的一定是崩溃残骸，按自己的 mtime 清。
-/// * 一对里两个都过期时**先删数据再删记录**：反过来一旦只有第一步成功，就正好造出下面那种
-///   本模块扫不掉的孤儿 `.part`，留给下一轮的反而更多。
-/// * **没有配对记录的 `.part` 不动**：`.part` 这个后缀不是本 crate 独占的（Transmission 这类
-///   下载器的未完成文件就叫 `X.part`），扫目录不该替别人的程序删文件。代价是本 crate 自己在
-///   「记录还没写下就崩溃」时留下的孤立 `.part` 会一直占着，直到同一个目标再次下载才由
-///   [`load_record`] 一起作废 —— 这是拿「不删别人的文件」换来的漏，不是漏写。（`load_record`
-///   敢删没配对的 `.part`，因为它只动**调用方正要写的那个目标**；扫目录动的是一堆别的目标。）
+///   一律整对不动。
+/// * 一对里任一边还年轻就整对都不动 —— 正在下的那首不该被这一轮扫掉：写方每次都重写记录，
+///   它的 mtime 一直是新的。
+/// * 两边都过期时**先删数据再删记录**：反过来一旦只有第一步成功，就正好造出上面那种扫不掉的
+///   孤儿，留给下一轮的反而更多。
 /// * 尽力而为：单个条目的名字读不到、stat 失败、删不掉（OneDrive 占位符、杀软占用都会这样）
 ///   就跳过它、留给下一轮；只有「整个目录打不开」才返回错误。这是一次顺带的回收，不该挡住下载。
 ///
 /// 并发：扫的不是当前目标一家的文件，**它不能只靠 `{当前目标}.part.lock`** —— 那把锁管不到别人的
-/// 暂存。#2 的「`.part` 的所有读写都在锁下」在这里由「只删两边都超过 7 天没动过的整对」兜住：
-/// 一个真在下的文件不会 7 天没被写过。跨进程同时扫同一目录时最多多删一次对方已过期的暂存，
-/// 而那种文件的身份本来就已经没人认得了。
+/// 暂存。#2 的「`.part` 的所有读写都在锁下」在这里由「只删两边都超过 7 天没动过、且记录认得出
+/// 是我们格式的一对」兜住：一个真在下的文件不会 7 天没被写过。跨进程同时扫同一目录时最多多删一次
+/// 对方已过期的暂存，而那种文件的身份本来就已经没人认得了。
 pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
-    // 与兄弟函数同一道校验（目标推不出暂存名就没有「这次下载所在目录」可言），并且直接把
-    // 推导出来的 `.part` 路径当目录的唯一来源，不在 `target` 上再算一次 parent
+    // 目录取自推导出来的 `.part`，不在 `target` 上再算一次 parent：「这次下载所在目录」只有一个来源
     let paths = staged_paths(target)?;
     let dir = match paths.part.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -353,6 +364,11 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
         let Some(data_name) = record_name.strip_suffix(META_SUFFIX) else {
             continue;
         };
+        // 名字对上还不够：记录得真能按我们那四样读出来，才算本 crate 的暂存。少了这一道，
+        // 一对同样叫 `X.part` / `X.part.meta` 的别人家的文件就会被我们按名字删掉
+        if !matches!(read_record(&path), Ok(Some(_))) {
+            continue;
+        }
         let data_path = dir.join(data_name);
         let Ok(data_slot) = slot_of(&data_path) else {
             continue;
@@ -510,8 +526,33 @@ mod part_record_tests {
         file.set_modified(when).expect("set_modified");
     }
 
+    /// 造一个符号链接。平台或权限不允许时（Windows 要开发者模式或额外权限）返回 `false`，
+    /// 用例自己跳过 —— 跳过要打印出来，不能让「没测到」冒充「测过了」。
+    fn make_symlink(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(target, link);
+        #[cfg(not(any(unix, windows)))]
+        let made: std::io::Result<()> = Err(std::io::Error::other("这个平台不试符号链接"));
+        match made {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("跳过：建不了符号链接（{err}）");
+                false
+            }
+        }
+    }
+
     fn record(total_len: u64, etag: Option<&str>, written_bytes: u64) -> PartRecord {
         PartRecord::new(total_len, etag, KEY, written_bytes)
+    }
+
+    /// 往指定路径摆一条**读得出来**的记录：扫目录那几个用例要按名字手工摆文件，
+    /// 内容必须是真格式，否则「认不出不是我们的文件」这一道会先替被测的那道拦下来。
+    fn put_record_at(path: &Path) {
+        let bytes = serde_json::to_vec(&record(1000, None, 400)).expect("encode record");
+        std::fs::write(path, bytes).expect("write record bytes");
     }
 
     #[test]
@@ -791,7 +832,7 @@ mod part_record_tests {
         let data_dir = dir.join("weird.m4a.part");
         std::fs::create_dir(&data_dir).expect("directory in the data slot");
         let record_path = dir.join("weird.m4a.part.meta");
-        std::fs::write(&record_path, b"{}").expect("write record");
+        put_record_at(&record_path);
         set_mtime(
             &record_path,
             SystemTime::now() - MAX_AGE - Duration::from_secs(60),
@@ -816,8 +857,6 @@ mod part_record_tests {
         ));
     }
 
-    /// 悬空符号链接只在类 Unix 系统上好造（Windows 建符号链接要额外权限，CI 里不可靠）。
-    #[cfg(unix)]
     #[test]
     fn dangling_link_in_the_data_slot_keeps_the_whole_pair() {
         // `metadata` 会跟着链接走，悬空链接于是报「不存在」：扫目录会把配对的记录删掉，
@@ -825,9 +864,12 @@ mod part_record_tests {
         // 这一对必须整个不动
         let dir = sandbox("dangling-link");
         let data_path = dir.join("ghost.m4a.part");
-        std::os::unix::fs::symlink(dir.join("nowhere"), &data_path).expect("symlink");
+        if !make_symlink(&data_path, &dir.join("nowhere")) {
+            cleanup(&dir);
+            return;
+        }
         let record_path = dir.join("ghost.m4a.part.meta");
-        std::fs::write(&record_path, b"{}").expect("write record");
+        put_record_at(&record_path);
         set_mtime(
             &record_path,
             SystemTime::now() - MAX_AGE - Duration::from_secs(60),
@@ -839,8 +881,6 @@ mod part_record_tests {
         cleanup(&dir);
     }
 
-    /// 同上：符号链接只在类 Unix 上好造。
-    #[cfg(unix)]
     #[test]
     fn temp_name_symlink_is_not_written_through() {
         // 临时名用 `create_new` 独占新建，而不是 `File::create` 那种「有就截断」：
@@ -849,7 +889,10 @@ mod part_record_tests {
         let target = dir.join("song.m4a");
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"do not touch").expect("write victim");
-        std::os::unix::fs::symlink(&victim, tmp_path(&target)).expect("symlink at the temp name");
+        if !make_symlink(&tmp_path(&target), &victim) {
+            cleanup(&dir);
+            return;
+        }
 
         write_record(&target, &record(1000, None, 10)).expect("write record");
         assert_eq!(
@@ -874,22 +917,27 @@ mod part_record_tests {
         cleanup(&dir);
     }
 
-    /// 同上：符号链接只在类 Unix 上好造。
-    #[cfg(unix)]
     #[test]
-    fn discard_unlinks_a_link_at_the_data_name_without_touching_its_target() {
-        // 「从头下」的前提是那个位置真的空出来：`File::create` 是跟随语义的，
-        // 把链接留在 `.part` 上等于让 #8 下一次写穿到别人的文件里
+    fn discard_unlinks_a_link_at_our_own_name_without_touching_its_target() {
+        // 「一起作废」的终点是这个目标从头下一遍：把链接留在 `.part` 上，#8 下一次用
+        // 跟随语义的 `File::create` 建 `.part` 就会写进链接指向的那个文件
         let dir = sandbox("discard-link");
         let target = dir.join("song.m4a");
         let victim = dir.join("victim.m4a");
         std::fs::write(&victim, b"precious").expect("write victim");
-        std::os::unix::fs::symlink(&victim, paths(&target).0).expect("symlink at the data name");
+        if !make_symlink(&paths(&target).0, &victim) {
+            cleanup(&dir);
+            return;
+        }
         write_record(&target, &record(1000, None, 10)).expect("write record");
 
         assert!(load_record(&target).expect("load").is_none());
         assert!(!paths(&target).0.exists(), "链接没被一起作废掉");
-        assert_eq!(std::fs::read(&victim).expect("read victim"), b"precious");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"precious",
+            "作废链接时碰到了它指向的文件"
+        );
         cleanup(&dir);
     }
 
@@ -995,10 +1043,19 @@ mod part_record_tests {
         );
         // 孤立的记录与孤立的临时名是我们自己的垃圾，按各自的 mtime 清
         let orphan_record = dir.join("gone.m4a.part.meta");
+        put_record_at(&orphan_record);
         let orphan_tmp = dir.join("crashed.m4a.part.meta.tmp");
         let young_tmp = dir.join("running.m4a.part.meta.tmp");
-        for path in [&orphan_record, &orphan_tmp, &young_tmp] {
-            std::fs::write(path, b"{}").expect("write orphan");
+        for path in [&orphan_tmp, &young_tmp] {
+            std::fs::write(path, b"half a json").expect("write orphan temp");
+        }
+        // 名字撞车但内容不是我们的格式：认不出是谁家的，两个都不动
+        let junk_record = dir.join("foreign.m4a.part.meta");
+        let junk_data = dir.join("foreign.m4a.part");
+        std::fs::write(&junk_record, b"{}").expect("write junk record");
+        std::fs::write(&junk_data, b"half a torrent").expect("write junk data");
+        for path in [&junk_record, &junk_data] {
+            set_mtime(path, SystemTime::now() - MAX_AGE - Duration::from_secs(60));
         }
         set_mtime(
             &orphan_record,
@@ -1020,6 +1077,8 @@ mod part_record_tests {
 
         assert!(foreign.exists(), "把别人的 .part 删了");
         assert!(orphan_data.exists(), "没有记录的 .part 不该由扫目录删");
+        assert!(junk_data.exists(), "内容认不出的一对外不该动");
+        assert!(junk_record.exists(), "内容认不出的一对外不该动（记录侧）");
         assert!(!orphan_record.exists(), "孤立的过期记录没被清掉");
         assert!(!orphan_tmp.exists(), "孤立的过期临时名没被清掉");
         assert!(young_tmp.exists(), "还在写的临时名被清掉了");
