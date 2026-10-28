@@ -35,6 +35,7 @@
 | `DecryptAudio` / `extractKey` / `decryptSpadeInner` | `crypto::{decrypt_audio, extract_key, decrypt_spade_inner}` |
 | （上游无对应）| `crypto::{decrypt_stream, decrypt_stream_with_auth}`：边读边解边写，输出与 `decrypt_audio*` 逐字节一致，峰值内存从「2×整曲」降到「单样本」 |
 | （上游无对应）| `http::get_reader`：返回流式读取器，供整曲下载使用（上游 `utils.Get` 总是整块读入） |
+| （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -75,7 +76,7 @@
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
-| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 
 ## 与上游的实现差异
 
@@ -86,6 +87,19 @@
   音频流专用 Agent 使用建连 10s + 单次读取空闲 20s，不设整首下载总时限，
   避免慢 CDN 上的大体积无损文件被 30s 整体超时截断
   （见 [`sodahub-org/sodam#12`](https://github.com/sodahub-org/sodam/issues/12)）。
+
+* **断点续传的判据（`soda::resume`，上游无对应）**：判断函数与 `Content-Range` 解析都只做
+  纯计算，不碰网络与磁盘；`pub(crate)` 不对外，因为公开它等于对判断规则做出承诺
+  （铁律 2 的例外，见 `AGENTS.md`）。
+  - `416` 判据：服务端 `bytes */N` 的 `N` 需**同时**等于本地长度与记录总长才算已完成 ——
+    这是 [`#2`](https://github.com/sodahub-org/libresoda/issues/2) 2026-10-28 定的 A 口径，
+    已写进 #2 判据表与 #5 验收第 3 条。只比本地长度会把「文件被重新编码成恰好等于本地
+    长度、密钥指纹没变」判成已完成，交出旧文件前缀。
+  - `416` 只认 `*/N` 形态：带闭区间的 416 头按「没带我们要读的那个头」处理（作废重下）。
+    这条是从 #2「读 `Content-Range: bytes */N`」的措辞**推出来的**，票面未明文。
+  - **未决**：铁律 2 的例外写着「口径定稿后就改回 `pub` 并删掉例外」，而 #5 验收第 4 条
+    永久要求「判断函数不对外公开」。A 定稿后这两句直接相撞。没擅自改可见性，等维护者
+    二选一：把例外的出口收窄，或改 #5 第 4 条。
 
 ## 未移植项
 

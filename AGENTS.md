@@ -13,6 +13,11 @@
    都应能一一对应到上游 Go 代码；上游没有的能力不要凭空发明。
 2. **不要破坏既有公开 API 的稳定性。** 新增用 `pub`，修改或删除公开项要在
    `docs/PORTING.md` 里记录原因。
+   - **例外（内部判据）**：判断规则还没定型的模块可以 `pub(crate)` 且模块不 `pub`，
+     因为公开它等于对未定型的规则做出承诺（例：`resume.rs` 的续传判断）。走这条必须在
+     `docs/PORTING.md` 挂上**口径票号**——是定规则的那张票，不是实现它的那张；`resume.rs`
+     挂在 [`sodahub-org/libresoda#2`](https://github.com/sodahub-org/libresoda/issues/2)
+     的 416 判据上。口径定稿后就改回 `pub` 并删掉本条例外，别让「还没定型」长期充当豁免。
 
 ## 目录与对照关系
 
@@ -29,7 +34,7 @@
 | `soda/user_playlist.go` | `src/soda/user_playlist.rs` |
 | `soda/crypto.go` | `src/soda/crypto.rs` |
 | `soda/login.go` | `src/soda/qr_login.rs`（二维码创建/轮询/会话，**部分移植**）+ `src/soda/browser.rs`（可选外部请求器） |
-| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断） |
+| （上游无对应）| `src/soda/signature.rs`（应用签名凭证 + 实时签名器）、`src/soda/stream.rs`（整曲取流诊断）、`src/soda/resume.rs`（续传判断纯函数） |
 | （上游无对应）| 客户端能力：`feed.rs`（推荐流/听歌模式）、`playlist_edit.rs`（歌单写操作）、`collection.rs`（收藏/我收藏的）、`playback.rs`（最近播放/播放统计）、`artist.rs`（艺人）、`media_ref.rs`（`{id,type}` 媒体引用） |
 | `model/*.go` | `src/model.rs` |
 | `utils/request.go` | `src/http.rs` |
