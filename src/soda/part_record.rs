@@ -218,9 +218,10 @@ fn open_record_tmp(path: &Path) -> Result<std::fs::File> {
 /// 这些都在调用 `resume::decide_resume_action` **之前**在这里查完，所以 `ResumeProbe`
 /// 只需要回答「能不能接」，不必再防不完整的记录。
 ///
-/// 作废只删我们自己那种普通文件：那个位置要是被目录、管道或别人的东西占着就留着不动
-/// （占了 `.part` 那个位置的东西不是本 crate 的暂存，删它才是越界；这种目标本来也续不起来，
-/// #8 往 `.part` 写第一个字节时自然会拿到自己的 I/O 错误）。真要删的那个文件删不动时（杀软或
+/// 作废只删普通文件与符号链接（unlink 删的是链接本身，不碰它的目标；把链接留在自己的暂存名上
+/// 等于给 #8 下一次的 `File::create` 留一个写穿到别处的坑）：那个位置要是被目录或管道占着就
+/// 留着不动 —— 那种东西不是本 crate 的暂存，删它才是越界（这种目标本来也续不起来，#8 往
+/// `.part` 写第一个字节时自然会拿到自己的 I/O 错误）。真要删的那个文件删不动时（杀软或
 /// 索引器正占着，Windows 上是共享冲突）**如实报错**：宁可这次失败，也不能让调用方以为旧数据
 /// 已经没了、转身往一份还在盘上的旧字节后面追加。
 ///
@@ -256,11 +257,22 @@ pub(crate) fn discard_parts(target: &Path) -> Result<()> {
     discard(&staged_paths(target)?)
 }
 
-/// 删掉 `.part`、`.part.meta` 与 `.part.meta.tmp`；不存在或不是普通文件的都不动。
+/// 删掉 `.part`、`.part.meta` 与 `.part.meta.tmp`。
+///
+/// 普通文件当然要删；**符号链接也一并 unlink**（`remove_file` 删的是链接本身，不碰它指向的
+/// 文件）：这条路的终点是「这个目标从头下一遍」，而 #8 下一次建 `.part` 用的是跟随语义的
+/// `File::create`，把链接留在自己的暂存名上等于留给它一个写穿到别处的坑。目录、管道这些
+/// 「名字撞上但不是文件」的位置仍不动 —— 那不是本 crate 的暂存，删它才是越界。
 fn discard(paths: &StagedPaths) -> Result<()> {
     for path in [&paths.part, &paths.record, &paths.record_tmp] {
-        if file_len(path)?.is_some() {
-            remove_existing(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                remove_existing(path)?;
+            }
+            // 已经不在，或者那个位置是目录/管道这类不是我们的东西
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
     }
     Ok(())
@@ -859,6 +871,25 @@ mod part_record_tests {
         write_record(&target, &record(1000, None, 10)).expect("write over residue");
         assert!(paths(&target).1.is_file(), "记录没写出来");
         assert!(!tmp_path(&target).exists(), "残骸留在临时名上");
+        cleanup(&dir);
+    }
+
+    /// 同上：符号链接只在类 Unix 上好造。
+    #[cfg(unix)]
+    #[test]
+    fn discard_unlinks_a_link_at_the_data_name_without_touching_its_target() {
+        // 「从头下」的前提是那个位置真的空出来：`File::create` 是跟随语义的，
+        // 把链接留在 `.part` 上等于让 #8 下一次写穿到别人的文件里
+        let dir = sandbox("discard-link");
+        let target = dir.join("song.m4a");
+        let victim = dir.join("victim.m4a");
+        std::fs::write(&victim, b"precious").expect("write victim");
+        std::os::unix::fs::symlink(&victim, paths(&target).0).expect("symlink at the data name");
+        write_record(&target, &record(1000, None, 10)).expect("write record");
+
+        assert!(load_record(&target).expect("load").is_none());
+        assert!(!paths(&target).0.exists(), "链接没被一起作废掉");
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"precious");
         cleanup(&dir);
     }
 
