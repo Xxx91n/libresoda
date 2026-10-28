@@ -16,6 +16,12 @@
 //! 在这里判，而且必须在把事实交给 `decide_resume_action` **之前**判完（见 `ResumeProbe` 的文档）。
 //! 作废是双向的：记录和数据一起删，不会留下还能让下一次接上的半成品。
 //!
+//! 并发：#2 规定 `{目标}.part` 的所有读写都必须在 `{目标}.part.lock` 那把不等待的独占锁下做，
+//! 不能有绕过的分支。**这把锁由 #8 取**（它才知道取流与写盘的整条顺序），本模块的
+//! [`write_record`] / [`load_record`] / [`discard_parts`] / [`purge_expired_parts`] 都假定调用方
+//! 已经持有它 —— 临时名由目标推导、不是每次唯一，两个写者同时动同一个目标就会互相搅在
+//! 同一个 `.tmp` 里。
+//!
 //! 消费方是下载主路径（#8），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
 // 消费方（#8）尚未落地，先允许 dead_code；它接上后删掉下面的 allow。
@@ -29,7 +35,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// 暂存数据与记录的保留期：更老它们在下次下载时被顺带清掉（#2 的 7 天兜底，
+/// 暂存数据与记录的保留期：超过它的暂存在下次下载时被顺带清掉（#2 的 7 天兜底，
 /// 覆盖「错误能修但用户再也不播」那部分占用）。
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -41,7 +47,7 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const PART_SUFFIX: &str = ".part";
 /// 记录文件相对 `.part` 的后缀。
 const META_SUFFIX: &str = ".meta";
-/// 记录文件的完整后缀（清扫时认门牌用）。
+/// 记录文件的完整后缀（清扫时靠它认出自己的文件）。
 const RECORD_SUFFIX: &str = ".part.meta";
 /// 原子写的临时名后缀：`{目标}.part.meta.tmp`。
 const TMP_SUFFIX: &str = ".tmp";
@@ -66,9 +72,9 @@ pub(crate) struct PartRecord {
 impl PartRecord {
     /// 组一条记录。
     ///
-    /// `key_bytes` 必须是**解出来的 AES 密钥字节**
-    /// （`crypto::hex_decode(&crypto::extract_key(play_auth)?)?`），不能传 `play_auth` 字符串，
-    /// 也不能传它的十六进制文本：#3 实测过同一个密钥可能有大小写与补零两种写法。
+    /// `key_bytes` 必须是**解出来的 AES 密钥字节**：先 `crypto::extract_key(play_auth)` 拿到
+    /// 十六进制文本，再 `crypto::hex_decode(..)` 解成字节，传后者。不能传 `play_auth` 字符串，
+    /// 也不能传那串十六进制文本本身：#3 记下过同一个密钥可能有大小写与补零两种写法。
     pub(crate) fn new(
         total_len: u64,
         etag: Option<&str>,
@@ -99,9 +105,10 @@ pub(crate) fn key_fingerprint(key_bytes: &[u8]) -> String {
     md5_hex_upper(key_bytes)
 }
 
-/// 取出可以写进记录、也可以与服务端比的**强** `ETag`（顺手去掉首尾空白）。
+/// 取出可以写进记录、也可以与服务端比的 `ETag`（顺手去掉首尾空白）。
 /// 空串与 `W/` 开头的弱校验器都归成空串：弱校验器不能用在 `If-Range` 上，记了也没有下游用途
-/// （#2 的「记四样」写的是强 `ETag`）。
+/// （#2 的「记四样」写的是强 `ETag`）。除此之外不校验引号与字符集 —— 反正 ETag 不参与
+/// 「能不能接上」的判断，认不出就当没有。
 fn strong_etag(value: Option<&str>) -> String {
     let raw = value.unwrap_or_default().trim();
     let mut chars = raw.chars();
@@ -126,100 +133,129 @@ fn append_suffix(path: &Path, suffix: &str) -> Option<PathBuf> {
     Some(path.with_file_name(name))
 }
 
-/// 由目标路径推出 `{目标}.part` 与 `{目标}.part.meta`。
+/// 一个目标的三个暂存名字，全部由目标路径推导 —— #2 规定调用方只拿得到最终路径这一个概念。
+pub(crate) struct StagedPaths {
+    /// `{目标}.part`：未下完的加密字节。
+    pub(crate) part: PathBuf,
+    /// `{目标}.part.meta`：记录文件。
+    pub(crate) record: PathBuf,
+    /// `{目标}.part.meta.tmp`：原子写的临时名，只有写失败时才可能留在盘上。
+    pub(crate) record_tmp: PathBuf,
+}
+
 /// 目标必须带文件名（调用方给的是落盘路径，没有文件名就是路径写错了）。
-pub(crate) fn staged_paths(target: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn staged_paths(target: &Path) -> Result<StagedPaths> {
     let part = append_suffix(target, PART_SUFFIX);
     let record = part
         .as_ref()
         .and_then(|part| append_suffix(part, META_SUFFIX));
-    match (part, record) {
-        (Some(part), Some(record)) => Ok((part, record)),
+    let record_tmp = record
+        .as_ref()
+        .and_then(|record| append_suffix(record, TMP_SUFFIX));
+    match (part, record, record_tmp) {
+        (Some(part), Some(record), Some(record_tmp)) => Ok(StagedPaths {
+            part,
+            record,
+            record_tmp,
+        }),
         _ => Err(SodaError::invalid_input("download target has no file name")),
     }
 }
 
 /// 原子写记录文件：先写 `{目标}.part.meta.tmp`，成功后改名到 `{目标}.part.meta`。
 ///
-/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以永远不会读出半个**能读**的记录。
-/// 只 `write`+`flush` 到内核，不做 `fsync`（#2 明确不为掉电一致性付每次几十 MB 的代价）。
+/// 中途失败最多留下 `.tmp`，而读记录的那条路只认 `.part.meta`，所以同一个目标在锁下（#8 的
+/// `.part.lock`）单写者时不会留下半个**能读**的记录：临时名是按目标推导的固定名字，两个进程
+/// 同时写同一个目标会互相搅在同一个 `.tmp` 里，那属于 #8 的锁要挡住的分支。
+/// 只 `write_all` 交给内核，不做 `fsync`（#2 明确不为掉电一致性付每次几十 MB 的代价）。
 pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
-    let (_, record_path) = staged_paths(target)?;
-    let tmp_path = append_suffix(&record_path, TMP_SUFFIX)
-        .ok_or_else(|| SodaError::invalid_input("download target has no file name"))?;
+    let paths = staged_paths(target)?;
     let bytes = serde_json::to_vec(record)?;
     let written = (|| -> Result<()> {
         // `File::create` 会截断上一次崩溃留下的同名临时文件
-        let mut file = std::fs::File::create(&tmp_path)?;
+        let mut file = std::fs::File::create(&paths.record_tmp)?;
         file.write_all(&bytes)?;
-        file.flush()?;
         drop(file);
-        std::fs::rename(&tmp_path, &record_path)?;
+        std::fs::rename(&paths.record_tmp, &paths.record)?;
         Ok(())
     })();
     written.map_err(|err| {
         // 半截的临时文件删不掉也不影响正确性：下一次写会截断重来
-        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_file(&paths.record_tmp);
         err
     })
 }
 
-/// 读回 `.part` 与它的记录，保证返回 `Some` 时**两边都可信**、返回 `None` 时**两边都不在**。
+/// 读回 `.part` 与它的记录：返回 `Some` 时**两边都可信**，返回 `None` 时这次没有可用的暂存。
 ///
-/// 以下情况都算「与数据不匹配」，一律一起作废（#7 验收第 5 条）：
-/// 只有一方存在；记录读不出（半截 / 字段不认识 / 数字不合法）；`.part` 真实长度与
-/// `written_bytes` 不等；记录写的总长比磁盘上已有的还短。
+/// 以下情况都算「与数据不匹配」，一律一起作废（#7 验收第 5 条）：只有一方存在；记录读不出
+/// （半截 / 字段不认识 / 数字不合法）；`.part` 真实长度与 `written_bytes` 不等；记录写的总长
+/// 比磁盘上已有的还短；`.part` 长度是 0（没有可接的字节，接下去等价于从 0 开始，留着只会
+/// 让 `416 bytes */0` 那种回包把空文件判成「已下完」）。
 /// 这些都在调用 `resume::decide_resume_action` **之前**在这里查完，所以 `ResumeProbe`
 /// 只需要回答「能不能接」，不必再防不完整的记录。
 ///
-/// 过期（[`MAX_AGE`]）不在这里判：由 [`purge_expired_parts`] 在每次下载开始时扫一次目录，
-/// 那一条才能覆盖「用户再也不播」的曲目。
+/// 作废只删我们自己那种普通文件：那个位置要是被目录、管道或别人占着，就留着不动它
+/// （那种目标本来也用不了，`write_record` 会在同一个位置上报 I/O 错误）。
+///
+/// 过期（[`MAX_AGE`]）不在这里判：由 [`purge_expired_parts`] 在每次下载开始时扫一次目录 ——
+/// 只有扫目录这一条能覆盖「用户再也不播」的曲目。
 pub(crate) fn load_record(target: &Path) -> Result<Option<StagedPart>> {
-    let (part_path, record_path) = staged_paths(target)?;
-    let local_len = file_len(&part_path)?;
-    let record = read_record(&record_path)?;
-    match (local_len, record) {
-        (None, None) => Ok(None),
-        (Some(_), None) | (None, Some(_)) => discard(&part_path, &record_path).map(|()| None),
-        (Some(local_len), Some(record)) => {
-            if record.written_bytes != local_len || record.total_len < local_len {
-                return discard(&part_path, &record_path).map(|()| None);
-            }
-            Ok(Some(StagedPart { record, local_len }))
+    let paths = staged_paths(target)?;
+    let local_len = file_len(&paths.part)?;
+    let record = read_record(&paths.record)?;
+    let staged = match (local_len, record) {
+        // 什么都没留下：连要删的东西都没有
+        (None, None) => return Ok(None),
+        (Some(local_len), Some(record))
+            if local_len > 0
+                && record.written_bytes == local_len
+                && record.total_len >= local_len =>
+        {
+            StagedPart { record, local_len }
         }
-    }
+        _ => return discard(&paths).map(|()| None),
+    };
+    Ok(Some(staged))
 }
 
 /// 一起作废某个目标的暂存数据与记录（连原子写的临时名一起）。
 ///
 /// 下载主路径用它处理「这段数据以后没用了」的那些失败（下架、数据本身有问题，见 #2 的处置表）。
 pub(crate) fn discard_parts(target: &Path) -> Result<()> {
-    let (part_path, record_path) = staged_paths(target)?;
-    discard(&part_path, &record_path)
+    discard(&staged_paths(target)?)
 }
 
-/// 删掉一个目标的 `.part`、`.part.meta` 与 `.part.meta.tmp`。本来就不在的不算失败。
-fn discard(part_path: &Path, record_path: &Path) -> Result<()> {
-    remove_existing(part_path)?;
-    remove_existing(record_path)?;
-    if let Some(tmp_path) = append_suffix(record_path, TMP_SUFFIX) {
-        remove_existing(&tmp_path)?;
+/// 删掉 `.part`、`.part.meta` 与 `.part.meta.tmp`；不存在或不是普通文件的都不动。
+fn discard(paths: &StagedPaths) -> Result<()> {
+    for path in [&paths.part, &paths.record, &paths.record_tmp] {
+        if file_len(path)?.is_some() {
+            remove_existing(path)?;
+        }
     }
     Ok(())
 }
 
-/// 清掉 `dir` 这一层里超过 [`MAX_AGE`] 的暂存对。
+/// 清掉**这次下载所在目录**里超过 [`MAX_AGE`] 的暂存对（#2：任一次下载开始时顺带清一次）。
+///
+/// 目录由目标路径推导，调用方不传（#2 把「调用方只需要知道最终路径一个概念」当成约定）；
+/// 目标是个裸文件名时扫当前目录。
 ///
 /// * 只认本模块的命名族（`*.part.meta` 与它的临时名 `*.part.meta.tmp`），判龄用文件 mtime。
-/// * 一对里任一边还年轻就两个都不动——正在下的那首不该被这一轮扫掉。
-/// * **只有 `.part` 而没有记录的文件不动**：`.part` 这个后缀不是本 crate 独占的，
-///   别的程序也可能留下同名产物，扫目录时不该替别人删文件；我们自己那份会在下次下载同一
-///   目标时由 [`load_record`] 一起作废。
-/// * 记录文件的临时名是孤立的垃圾，按自己的 mtime 清。
+/// * 一对里任一边还年轻就整对都不动——正在下的那首不该被这一轮扫掉。
+/// * **没有配对记录的 `.part` 不动**：`.part` 这个后缀不是本 crate 独占的（Transmission 这类
+///   下载器的未完成文件就叫 `X.part`），扫目录不该替别人的程序删文件。代价是本 crate 自己在
+///   「记录还没写下就崩溃」时留下的孤立 `.part` 会一直占着，直到同一个目标再次下载才由
+///   [`load_record`] 一起作废 —— 这是拿「不删别人的文件」换来的漏，不是漏写。
+/// * 只动普通文件：名字撞上目录、管道或被别人占着的位置都不碰。
 ///
 /// 清理失败（目录不可读、文件被占用）会原样返回错误：这是一次顺带的回收，不该挡住下载，
 /// 调用方可以只记一行日志。
-pub(crate) fn purge_expired_parts(dir: &Path) -> Result<()> {
+pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     let now = SystemTime::now();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -233,11 +269,14 @@ pub(crate) fn purge_expired_parts(dir: &Path) -> Result<()> {
         let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
             continue;
         };
-        if file_len(&path)?.is_none() {
+        let Some(age) = age_of(&path, now)? else {
+            continue;
+        };
+        if age <= MAX_AGE {
             continue;
         }
         if let Some(record_name) = name.strip_suffix(TMP_SUFFIX) {
-            if record_name.ends_with(RECORD_SUFFIX) && expired(&path, now) {
+            if record_name.ends_with(RECORD_SUFFIX) {
                 remove_existing(&path)?;
             }
             continue;
@@ -249,33 +288,42 @@ pub(crate) fn purge_expired_parts(dir: &Path) -> Result<()> {
             continue;
         }
         let data_path = dir.join(data_name);
-        let data_alive = file_len(&data_path)?.is_some() && !expired(&data_path, now);
-        if data_alive || !expired(&path, now) {
-            continue;
+        match age_of(&data_path, now)? {
+            Some(data_age) if data_age <= MAX_AGE => continue,
+            Some(_) => remove_existing(&data_path)?,
+            // 数据本来就不在，只剩这条过期的孤立记录要清
+            None => {}
         }
-        remove_existing(&data_path)?;
         remove_existing(&path)?;
     }
     Ok(())
 }
 
-/// 文件是否已经老于 [`MAX_AGE`]。拿不到 mtime（文件系统不支持、时钟往回跳过）时**不判过期**：
-/// 删是不可逆动作，宁可让这一轮的垃圾留到下次。
-fn expired(path: &Path, now: SystemTime) -> bool {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .map(|modified| now.duration_since(modified).unwrap_or(Duration::ZERO) > MAX_AGE)
-        .unwrap_or(false)
-}
-
-/// 文件真实长度；不存在、或不是普通文件（目录、管道…）时给 `None`。
-fn file_len(path: &Path) -> Result<Option<u64>> {
+/// 暂存位置上的普通文件元数据；不存在、或那个位置不是普通文件（目录、管道…）时给 `None`。
+fn staged_file_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
     match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
+        Ok(meta) if meta.is_file() => Ok(Some(meta)),
         Ok(_) => Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+/// 文件真实长度；不存在或不是普通文件时给 `None`。
+fn file_len(path: &Path) -> Result<Option<u64>> {
+    Ok(staged_file_meta(path)?.map(|meta| meta.len()))
+}
+
+/// 文件的年龄。拿不到 mtime（文件系统不支持、时钟往回跳过）时给 `None`，调用方一律按「不动」
+/// 处理：删除不可逆，宁可让这一轮的垃圾留到下次。
+fn age_of(path: &Path, now: SystemTime) -> Result<Option<Duration>> {
+    let Some(meta) = staged_file_meta(path)? else {
+        return Ok(None);
+    };
+    let Ok(modified) = meta.modified() else {
+        return Ok(None);
+    };
+    Ok(Some(now.duration_since(modified).unwrap_or(Duration::ZERO)))
 }
 
 /// 读并解析记录文件；读不出（不存在、超大、半截、字段不认识）一律给 `None`，
@@ -291,9 +339,7 @@ fn read_record(path: &Path) -> Result<Option<PartRecord>> {
     }
     // 带上限读：这个路径可能指向别人写的东西，不能照它的大小申请内存
     let mut buf = Vec::new();
-    file.take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut buf)
-        .map_err(|err| SodaError::Io(err.to_string()))?;
+    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_RECORD_BYTES {
         return Ok(None);
     }
@@ -341,8 +387,18 @@ mod part_record_tests {
 
     /// 造一份指定长度的 `.part`（内容无所谓：本模块只比长度，不碰这些数据）。
     fn write_part(target: &Path, len: usize) {
-        let (part_path, _) = staged_paths(target).expect("staged paths");
-        std::fs::write(part_path, vec![0xA5; len]).expect("write part");
+        std::fs::write(paths(target).0, vec![0xA5; len]).expect("write part");
+    }
+
+    /// 测试里取一对路径的简写；实现内部用的是 [`StagedPaths`] 的具名字段。
+    fn paths(target: &Path) -> (PathBuf, PathBuf) {
+        let staged = staged_paths(target).expect("staged paths");
+        (staged.part, staged.record)
+    }
+
+    /// 原子写的临时名：只有写失败时才可能留在盘上。
+    fn tmp_path(target: &Path) -> PathBuf {
+        staged_paths(target).expect("staged paths").record_tmp
     }
 
     fn set_mtime(path: &Path, when: SystemTime) {
@@ -378,12 +434,10 @@ mod part_record_tests {
             .expect("usable staged part");
         assert_eq!(staged.local_len, 400);
         assert_eq!(staged.record, written);
-        let (_, record_path) = staged_paths(&target).expect("staged paths");
+        let (_, record_path) = paths(&target);
         assert!(record_path.is_file());
         // 改名成功后不留临时名
-        assert!(!append_suffix(&record_path, TMP_SUFFIX)
-            .expect("tmp path")
-            .exists());
+        assert!(!tmp_path(&target).exists(), "改名后留下了临时名");
         cleanup(&dir);
     }
 
@@ -392,7 +446,7 @@ mod part_record_tests {
         let dir = sandbox("record-only");
         let target = dir.join("song.m4a");
         write_record(&target, &record(1000, Some("\"a\""), 500)).expect("write record");
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         assert!(record_path.is_file());
         assert!(!part_path.exists());
 
@@ -407,7 +461,7 @@ mod part_record_tests {
         let dir = sandbox("data-only");
         let target = dir.join("song.m4a");
         write_part(&target, 400);
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         assert!(part_path.is_file());
 
         assert!(load_record(&target).expect("load").is_none());
@@ -430,7 +484,7 @@ mod part_record_tests {
             write_part(&target, *data_len);
             write_record(&target, &record(*total_len, Some("\"a\""), *written_bytes))
                 .expect("write record");
-            let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+            let (part_path, record_path) = paths(&target);
 
             assert!(load_record(&target).expect("load").is_none(), "{note}");
             assert!(!part_path.exists(), "{note}：数据没被一起删掉");
@@ -444,7 +498,7 @@ mod part_record_tests {
         let dir = sandbox("unreadable");
         let target = dir.join("song.m4a");
         write_part(&target, 400);
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         // 写一半崩溃留下的那种半个记录
         std::fs::write(&record_path, br#"{"total_len":1000,"etag""#).expect("half record");
 
@@ -460,7 +514,7 @@ mod part_record_tests {
         let dir = sandbox("unknown-field");
         let target = dir.join("song.m4a");
         write_part(&target, 400);
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         std::fs::write(
             &record_path,
             br#"{"total_len":1000,"etag":"","key_fingerprint":"X","written_bytes":400,"extra":1}"#,
@@ -479,7 +533,7 @@ mod part_record_tests {
         let dir = sandbox("oversized");
         let target = dir.join("song.m4a");
         write_part(&target, 400);
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         std::fs::write(&record_path, vec![b' '; MAX_RECORD_BYTES as usize + 1])
             .expect("oversized record");
 
@@ -493,7 +547,7 @@ mod part_record_tests {
     fn failed_write_leaves_no_temp_residue() {
         let dir = sandbox("write-fail");
         let target = dir.join("song.m4a");
-        let (part_path, record_path) = staged_paths(&target).expect("staged paths");
+        let (part_path, record_path) = paths(&target);
         // 让改名这一步必然失败：最终位置上放一个目录（`File::create` 也只会失败在临时名那侧）
         std::fs::create_dir(&record_path).expect("block the final name");
 
@@ -502,12 +556,7 @@ mod part_record_tests {
             matches!(err, Err(SodaError::Io(_))),
             "期望 I/O 错误，实际 {err:?}"
         );
-        assert!(
-            !append_suffix(&record_path, TMP_SUFFIX)
-                .expect("tmp path")
-                .exists(),
-            "失败的写留下了临时名"
-        );
+        assert!(!tmp_path(&target).exists(), "失败的写留下了临时名");
         // 最终位置仍是那个目录：写失败不能动它
         assert!(record_path.is_dir());
         assert!(!part_path.exists());
@@ -515,6 +564,56 @@ mod part_record_tests {
         // 障碍去掉后同一个目标还能正常写进去
         write_record(&target, &record(1000, Some("\"a\""), 10)).expect("retry write");
         assert!(record_path.is_file());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn record_missing_a_field_is_not_trusted() {
+        // 边界「缺字段」：四样少一样就不是我们那份记录，一起作废
+        let dir = sandbox("missing-field");
+        let target = dir.join("song.m4a");
+        write_part(&target, 400);
+        let (part_path, record_path) = paths(&target);
+        std::fs::write(&record_path, br#"{"total_len":1000,"etag":""}"#).expect("short record");
+
+        assert!(load_record(&target).expect("load").is_none());
+        assert!(!part_path.exists());
+        assert!(!record_path.exists());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn empty_part_is_not_staged_data() {
+        // 0 字节的 `.part` 没有可接的字节：留着它，`416 bytes */0` 会把空文件判成「已下完」
+        let dir = sandbox("empty-part");
+        let target = dir.join("song.m4a");
+        write_part(&target, 0);
+        write_record(&target, &record(1000, None, 0)).expect("write record");
+        let (part_path, record_path) = paths(&target);
+        assert_eq!(part_path.metadata().expect("part exists").len(), 0);
+
+        assert!(load_record(&target).expect("load").is_none());
+        assert!(!part_path.exists(), "空的 .part 没被一起作废");
+        assert!(!record_path.exists(), "对应的记录没被一起作废");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn discard_leaves_positions_it_does_not_own() {
+        // 暂存名字的位置被目录占着（别人放的、或文件系统里的怪东西）：不动它，也不报错
+        let dir = sandbox("not-a-file");
+        let target = dir.join("song.m4a");
+        let (part_path, record_path) = paths(&target);
+        std::fs::create_dir(&part_path).expect("directory in the data slot");
+        std::fs::write(
+            &record_path,
+            br#"{"total_len":1000,"etag":"","key_fingerprint":"X","written_bytes":400}"#,
+        )
+        .expect("record");
+
+        assert!(load_record(&target).expect("load").is_none());
+        assert!(part_path.is_dir(), "不是我们写的普通文件却被删了");
+        assert!(!record_path.exists(), "记录没被跟着作废");
         cleanup(&dir);
     }
 
@@ -574,19 +673,16 @@ mod part_record_tests {
             write_record(target, &record(1000, None, 300)).expect("write record");
         }
         let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
-        for path in [
-            staged_paths(&stale).expect("paths").0,
-            staged_paths(&stale).expect("paths").1,
-        ] {
-            set_mtime(&path, long_ago);
-        }
+        let (stale_part, stale_record) = paths(&stale);
+        set_mtime(&stale_part, long_ago);
+        set_mtime(&stale_record, long_ago);
 
-        purge_expired_parts(&dir).expect("purge");
+        purge_expired_parts(&dir.join("purge-trigger.m4a")).expect("purge");
 
-        let (stale_part, stale_record) = staged_paths(&stale).expect("paths");
+        let (stale_part, stale_record) = paths(&stale);
         assert!(!stale_part.exists(), "过期的数据没被清掉");
         assert!(!stale_record.exists(), "过期的记录没被清掉");
-        let (fresh_part, fresh_record) = staged_paths(&fresh).expect("paths");
+        let (fresh_part, fresh_record) = paths(&fresh);
         assert!(fresh_part.is_file(), "还年轻的数据被误删");
         assert!(fresh_record.is_file(), "还年轻的记录被误删");
         cleanup(&dir);
@@ -599,13 +695,13 @@ mod part_record_tests {
         let target = dir.join("song.m4a");
         write_part(&target, 300);
         write_record(&target, &record(1000, None, 300)).expect("write record");
-        let (part_path, record_path) = staged_paths(&target).expect("paths");
+        let (part_path, record_path) = paths(&target);
         set_mtime(
             &record_path,
             SystemTime::now() - MAX_AGE - Duration::from_secs(60),
         );
 
-        purge_expired_parts(&dir).expect("purge");
+        purge_expired_parts(&dir.join("purge-trigger.m4a")).expect("purge");
         assert!(part_path.is_file());
         assert!(record_path.is_file(), "数据还年轻，记录不该被单独清掉");
         cleanup(&dir);
@@ -644,7 +740,7 @@ mod part_record_tests {
             SystemTime::now() - MAX_AGE - Duration::from_secs(60),
         );
 
-        purge_expired_parts(&dir).expect("purge");
+        purge_expired_parts(&dir.join("purge-trigger.m4a")).expect("purge");
 
         assert!(foreign.exists(), "把别人的 .part 删了");
         assert!(orphan_data.exists(), "没有记录的 .part 不该由扫目录删");
@@ -660,37 +756,37 @@ mod part_record_tests {
         let dir = sandbox("absent");
         cleanup(&dir);
         assert!(!dir.exists());
-        purge_expired_parts(&dir).expect("扫不存在的目录不该报错");
+        purge_expired_parts(&dir.join("song.m4a")).expect("扫不存在的目录不该报错");
     }
 
     #[test]
     fn paths_append_to_the_whole_file_name() {
+        let name = |path: &PathBuf| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        };
         // 命名规则是「目标文件名 + 后缀」，不是换掉扩展名：`song.m4a` 的暂存是 `song.m4a.part`
-        let part = staged_paths(Path::new("/d/song.m4a")).expect("paths");
+        let staged = staged_paths(Path::new("/d/song.m4a")).expect("paths");
+        assert_eq!(name(&staged.part), Some("song.m4a.part".to_string()));
+        assert_eq!(name(&staged.record), Some("song.m4a.part.meta".to_string()));
         assert_eq!(
-            part.0.file_name(),
-            Some(std::ffi::OsStr::new("song.m4a.part"))
+            name(&staged.record_tmp),
+            Some("song.m4a.part.meta.tmp".to_string())
         );
+        // 后缀是层层接上去的，所以清扫时能从记录名反推出数据名
         assert_eq!(
-            part.1.file_name(),
-            Some(std::ffi::OsStr::new("song.m4a.part.meta"))
+            staged
+                .record
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|record| record.strip_suffix(META_SUFFIX)),
+            Some("song.m4a.part")
         );
-        // 没有扩展名、名字以点开头也照样拼（所以不用 `with_extension`）
+        // 没有扩展名、名字以点开头也照样拼（所以不能换成 `with_extension`）
         let no_ext = staged_paths(Path::new("/d/song")).expect("paths");
-        assert_eq!(
-            no_ext.0.file_name(),
-            Some(std::ffi::OsStr::new("song.part"))
-        );
+        assert_eq!(name(&no_ext.part), Some("song.part".to_string()));
         let dotted = staged_paths(Path::new("/d/.hidden")).expect("paths");
-        assert_eq!(
-            dotted.0.file_name(),
-            Some(std::ffi::OsStr::new(".hidden.part"))
-        );
-        // 文件名以外的后缀层级要能反推回去：清扫时靠这个把记录对回数据
-        assert_eq!(
-            append_suffix(&no_ext.0, META_SUFFIX).expect("meta of a part"),
-            PathBuf::from("/d/song.part.meta")
-        );
+        assert_eq!(name(&dotted.part), Some(".hidden.part".to_string()));
         // 只有目录就没有暂存路径可言
         assert!(matches!(
             staged_paths(Path::new("/")),
