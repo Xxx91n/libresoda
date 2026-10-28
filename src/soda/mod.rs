@@ -26,6 +26,8 @@ pub mod collection;
 pub mod crypto;
 pub mod download;
 pub mod feed;
+// 续传链上的内部件：交回的范围信息用的就是 resume 里那个不对外可见的类型（docs/PORTING.md）。
+pub(crate) mod fetch;
 pub mod link;
 pub mod lyric;
 pub mod media_ref;
