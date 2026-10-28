@@ -239,7 +239,8 @@ pub(crate) fn get_raw(url: &str, options: &[RequestOption]) -> Result<RawRespons
     };
     let status = response.status();
     // 只收能读成文本的头：读不懂的 `Content-Range` 本来也不能当范围信息用，
-    // 交给上层按「没带这个头」处理。
+    // 交给上层按「没带这个头」处理。`headers_names()` 不去重（同名几行返几个名字），
+    // 而 `Response::header` 只认第一个匹配，所以按名收敛成第一行的值就在这里发生。
     let headers = response
         .headers_names()
         .into_iter()

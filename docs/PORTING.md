@@ -79,7 +79,7 @@
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
-| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 调用方的头透传与 `Range` 覆盖），断言拿到的三个事实；按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
+| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到票面那三个事实与响应体字节数（同名头那条只看范围信息），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
 
 ## 与上游的实现差异
 
@@ -129,7 +129,9 @@
     ureq 每一跳重定向都剥掉 `Cookie`，`get_raw` 又不像 `get_full` 那样回 `final_url`，
     所以这层看不出「被重定向去了别处」—— 剥 `Cookie` 是 ureq 的既有行为（`get_reader`
     走的是同一套），但今天 `download_with_info` 发流只带 UA 不带 Cookie，
-    「带 Cookie 穿重定向」这条路是续传链才走到的。
+    「带 Cookie 穿重定向」这条路是续传链才走到的。这条同时也是**这层交不回的事实**
+    （没有 `final_url`，其余响应头也不外传）：#8 真要在意重定向，就该给 `RangeResponse`
+    加字段并在这里记下原因，而不是在 #8 里猜。
   - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。真机结论（尤其 `416` 到底带不带
     `bytes */N`）要等 #8 的联网用例，届时按仓库规矩进 `CLIENT-API.md` 的实测状态总表。
   - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
