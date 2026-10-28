@@ -1,5 +1,7 @@
 //! 续传决策（上游无对应；[`sodahub-org/libresoda#5`](https://github.com/sodahub-org/libresoda/issues/5)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
 //!
+//! 下面裸写的 `#N` 都是 `sodahub-org/libresoda` 的 issue：`https://github.com/sodahub-org/libresoda/issues/N`。
+//!
 //! 只回答一个问题：「本地这段没下完的字节，这次还能不能接着用」。
 //! 输入全部是已经拿在手上的事实（本地字节数、记录里的总长与密钥指纹、这次响应的
 //! 状态码与 `Content-Range`），所以这里不碰网络也不碰磁盘，每个协议分支都能单测。
@@ -54,7 +56,7 @@ pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
 /// 续传判断的动作。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResumeAction {
-    /// 旧数据是同一文件的前缀：从 `offset` 起继续追加本次响应。
+    /// 这次响应能接在本地那段后面：从 `offset` 起继续追加。
     /// 「追加完有没有到文件末尾」（`offset + 本次字节数 == total`）是调用方的收尾判定，
     /// 这里只回答能不能接。
     Append { offset: u64 },
@@ -63,16 +65,19 @@ pub(crate) enum ResumeAction {
     /// 这次响应不能用来续传：本地这段接不上，只能从 0 重新发一次整份请求。
     /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
-    /// `416` 报的总长等于本地字节数、且密钥指纹与记录相符：按 #2 的 416 判据算已经下完。
+    /// `416` 报的总长等于本地字节数：按 #2 的 416 判据算已经下完。
     ///
-    /// 这一格没有证明「本地这段就是这个文件的前缀」——指纹只证明同一把密钥，不证明同一个
-    /// 文件。若平台在两次取流之间把文件重新编码成恰好等于本地的长度，交出去的就是旧文件前缀，
-    /// 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要再比
-    /// `recorded_total`」列为待决口径（见 #2 的评论），定稿前按票面字面实现：只比 `local_len`。
+    /// 残余风险：文件若在两次取流之间被平台重新编码成**恰好**等于本地的长度，交出去的是旧
+    /// 文件的前缀 —— 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要
+    /// 再比 `recorded_total`」列为待决口径（[`#2` 的 10-28 评论](https://github.com/sodahub-org/libresoda/issues/2)），
+    /// 定稿前按票面字面实现：只比 `local_len`。
     Complete,
 }
 
 /// 判断所需的全部事实：本地有什么、记录里写了什么、这次服务器回了什么。
+///
+/// 密钥指纹只证明「同一把密钥」，不证明「同一个文件」；两条「能接上」的结论（`Append` /
+/// `Complete`）都建立在这个前提上，残余风险见 `Complete`。
 ///
 /// ETag 不在其中：#2 让这次响应的起点与总长去对记录、密钥指纹去对本地数据，
 /// ETag 只写进记录文件、供 `If-Range` 这个优化使用，不参与「能不能接上」的判断。
@@ -81,7 +86,7 @@ pub(crate) enum ResumeAction {
 /// 字节数与实际不符，属于 #7，必须在调用本函数**之前**查完并直接作废重下。本函数只拿
 /// 已经信得过的记录事实回答「能不能接」。
 pub(crate) struct ResumeProbe<'a> {
-    /// 本地 `.part` 的实际字节数（记录写的字节数与实际不符属于 #7 的前置检查，不传进来）。
+    /// 本地 `.part` 的实际字节数。
     pub(crate) local_len: u64,
     /// 记录文件里的文件总长。
     pub(crate) recorded_total: u64,
@@ -150,7 +155,7 @@ mod resume_tests {
         let file_grew = parse_content_range("bytes 400-1499/1500").expect("bytes 400-1499/1500");
         let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
         let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
-        // 顺序对应 issue #5 验收里的九个分支。
+        // 前九行就是 issue #5 验收列出的九个分支（同序）；后面是补充的边界与守卫优先级用例。
         let cases = [
             (
                 "206 起点吻合",
@@ -223,7 +228,9 @@ mod resume_tests {
                 ResumeAction::Complete,
             ),
             (
-                "本地比记录总长还长",
+                // #2 的 416 判据只比本地长度：总长等于记录、却小于本地 → 不认「已完整」。
+                // 反向那格（记录 1200、本地与服务端都 1000）判 Complete，就在上一格。
+                "416 总长等于记录但不等于本地",
                 probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::RestartFromZero,
             ),
