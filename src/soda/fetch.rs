@@ -4,7 +4,8 @@
 //! `Content-Range` 解析结果、`ETag`，外加一个还没读的响应体。
 //! **这里不含任何判断**：本地那段字节能不能接上，是 [`super::resume`] 的纯函数的事。
 
-// 消费方（#8 的可续传下载主路径）尚未落地，先允许 dead_code；它接上后删掉下面的 allow。
+// 整个模块都还没有非测试的调用方（消费方是 #8 的可续传下载主路径），所以按模块放行，
+// #8 接上后删掉这一行。`resume` 那边是「一部分已经活了、一部分还没」，才逐项标注。
 #![allow(dead_code)]
 
 use super::resume::{parse_content_range, ContentRange};
@@ -22,7 +23,14 @@ pub(crate) struct RangeResponse {
     /// 强/弱怎么取舍、比较时是否忽略大小写属于记录文件（#7）与调用方；
     /// 发 `If-Range` 时要按这个原值回发。
     pub(crate) etag: Option<String>,
-    /// 响应体读取器，尚未解密。不预分配、不设长度上限，由调用方边读边写盘。
+    /// 响应体读取器，尚未解密。不预分配、也不按响应里的任何长度开内存，由调用方边读边写盘。
+    ///
+    /// 状态码是 4xx/5xx 时这里读出的是**错误页**，不是音频片段，别往 `.part` 里写。
+    /// 另有一条要知的边界：范围请求一定不带 `Accept-Encoding`（ureq 见请求里有 `Range`
+    /// 就不加），服务器仍硬回 `Content-Encoding` 时，交回的字节已经被它解压过、与
+    /// `Content-Range` 说的区间不符。这层不做检测，靠调用方的「写入字节数 + 总长」
+    /// 校验拦住（见 [`sodahub-org/libresoda#2`](https://github.com/sodahub-org/libresoda/issues/2)
+    /// 的记录文件判据）。
     pub(crate) reader: Box<dyn Read>,
 }
 
@@ -136,12 +144,14 @@ mod fetch_tests {
     #[test]
     fn reports_a_200_that_ignored_the_range() {
         // 服务器不理范围请求、直接回整份：这次响应本身就是整份文件，取数层只报事实。
-        let (url, server) = fake_server(http_response("200 OK", &[], &body_of(1000)));
+        // 三个事实照样都要拿到 —— 整份回包的 `ETag` 也得进记录文件（#7）。
+        let (url, server) = fake_server(http_response("200 OK", &["ETag: \"v7\""], &body_of(1000)));
         let fetched = fetch_range(&url, 400, &[]).expect("200");
         let request = server.join().expect("server");
 
         assert_eq!(fetched.status, 200);
         assert_eq!(fetched.range, None);
+        assert_eq!(fetched.etag.as_deref(), Some("\"v7\""));
         assert_eq!(drain(fetched.reader).len(), 1000);
         assert!(request.contains("Range: bytes=400-"), "{request}");
     }
@@ -190,7 +200,7 @@ mod fetch_tests {
         // 而且它带的响应头还是读得到（这里用 `ETag` 证明，范围头本来就不该有）。
         let (url, server) = fake_server(http_response(
             "503 Service Unavailable",
-            &["Retry-After: 5", "ETag: \"v2\""],
+            &["ETag: \"v2\""],
             b"try later",
         ));
         let fetched = fetch_range(&url, 400, &[]).expect("503");
@@ -220,6 +230,7 @@ mod fetch_tests {
     #[test]
     fn passes_caller_headers_through_and_owns_the_range_header() {
         // 调用方的头（UA / Cookie / If-Range）照常透传；只有 `Range` 由这一层说了算。
+        // 失败信息只说缺哪一行，不整块打印请求头：这里出现过 Cookie（测试规范）。
         let (url, server) = fake_server(http_response("200 OK", &[], &body_of(10)));
         let options = [RequestOption::new()
             .header("Cookie", "sessionid=...")
@@ -229,11 +240,65 @@ mod fetch_tests {
         let request = server.join().expect("server");
 
         assert_eq!(fetched.status, 200);
-        assert!(request.contains("Cookie: sessionid=..."), "{request}");
-        assert!(request.contains("If-Range: \"abc123\""), "{request}");
-        assert!(request.contains("Range: bytes=7-"), "{request}");
-        assert!(!request.contains("bytes=0-0"), "{request}");
+        assert!(
+            request.contains("Cookie: sessionid=..."),
+            "没把调用方的 Cookie 透传上去"
+        );
+        assert!(
+            request.contains("If-Range: \"abc123\""),
+            "没把调用方的 If-Range 透传上去"
+        );
+        assert!(
+            request.contains("Range: bytes=7-"),
+            "Range 没按这次的起偏移拼出来"
+        );
+        assert!(
+            !request.contains("bytes=0-0"),
+            "调用方自带的同名 Range 没被覆盖"
+        );
         assert_eq!(drain(fetched.reader).len(), 10);
+    }
+
+    #[test]
+    fn an_impossibly_large_offset_just_goes_on_the_wire() {
+        // 边界（超长）：偏移大到任何文件都装不下。这层不拿它开内存、不折算、也不判断，
+        // 原样上线让服务器去回话 —— 服务器怎么答是上面几条用例的事。
+        let (url, server) = fake_server(http_response("416 Range Not Satisfiable", &[], &[]));
+        let fetched = fetch_range(&url, u64::MAX, &[]).expect("huge offset");
+        let request = server.join().expect("server");
+
+        assert!(
+            request.contains("Range: bytes=18446744073709551615-"),
+            "{request}"
+        );
+        assert_eq!(fetched.status, 416);
+        assert_eq!(fetched.range, None);
+        assert_eq!(drain(fetched.reader), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn the_first_of_two_same_named_headers_is_the_one_we_hand_back() {
+        // `RawResponse::headers` 写着「同名多个值只保留第一个」，这里把这条承诺钉住：
+        // 一个 CDN 真会把同一个头写两行，范围信息不该因此变成「没带这个头」。
+        let (url, server) = fake_server(http_response(
+            "206 Partial Content",
+            &[
+                "Content-Range: bytes 400-999/1000",
+                "Content-Range: bytes 0-99/200",
+            ],
+            &body_of(600),
+        ));
+        let fetched = fetch_range(&url, 400, &[]).expect("duplicated header");
+        server.join().expect("server");
+
+        assert_eq!(
+            fetched.range,
+            Some(ContentRange {
+                first: Some(400),
+                last: Some(999),
+                total: 1000
+            })
+        );
     }
 
     #[test]
