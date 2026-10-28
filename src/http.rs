@@ -204,7 +204,8 @@ fn get_reader_with_agent(
 /// 一次 GET 拿回来的原始事实：状态码、响应头、还没读的响应体。
 pub(crate) struct RawResponse {
     pub(crate) status: u16,
-    /// 响应头，名字统一小写；同名多个值只保留第一个（`Set-Cookie` 不走这里）。
+    /// 响应头：名字统一小写。`ureq` 不去重 —— 同名写几行就有几项，但每项的值都是第一行的；
+    /// 读不成文本的头值整条不收（见 [`get_raw`]）。要拿全部 `Set-Cookie` 走 [`get_full`]。
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) reader: Box<dyn Read>,
 }

@@ -43,6 +43,11 @@ pub(crate) struct RangeResponse {
 /// 其余头原样透传：整曲下载要带的 UA / Cookie，以及 `If-Range` 这个「省一次白下载」
 /// 的优化都从 `options` 传进来（[`#2`](https://github.com/sodahub-org/libresoda/issues/2)
 /// 定了它只作优化，不参与「能不能接上」的判断）。
+///
+/// 透传有个前提：ureq 每跟一跳重定向就剥掉 `Cookie`，而这层不回 `final_url`，所以
+/// 「被重定向去了别的源站、Cookie 没跟上」在这里看不出来（既有的 [`crate::http::get_reader`]
+/// 走的是同一套机制；只是今天 `download_with_info` 发流只带 UA 不带 Cookie，「带 Cookie
+/// 穿重定向」这条路是续传链才走到的）。要靠这两个头保住的场景，判断落在 #8。
 pub(crate) fn fetch_range(
     url: &str,
     offset: u64,
@@ -302,6 +307,32 @@ mod fetch_tests {
                 total: 1000
             })
         );
+    }
+
+    #[test]
+    fn a_header_that_is_not_text_is_dropped_without_losing_the_response() {
+        // CDN 偶尔拿非 UTF-8 编码写响应头。ureq 存的是原始字节：读不成文本的头值取出来是
+        // `None`，`get_raw` 就把那一条整条不收。要点是这不该让**这次取数**失败 —— 状态码与
+        // 其余头照常交回，范围信息落到「没带这个头」那一档，绝不拿半截字节去猜区间。
+        let mut raw = http_response("206 Partial Content", &["ETag: \"ok\""], &body_of(600));
+        let head_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("head terminator");
+        raw.splice(
+            head_end..head_end,
+            b"Content-Range: bytes \xff\xfe400-999/1000\r\n"
+                .iter()
+                .copied(),
+        );
+        let (url, server) = fake_server(raw);
+        let fetched = fetch_range(&url, 400, &[]).expect("binary header value");
+        server.join().expect("server");
+
+        assert_eq!(fetched.status, 206, "一个读不懂的头不该让整次取数失败");
+        assert_eq!(fetched.range, None);
+        assert_eq!(fetched.etag.as_deref(), Some("\"ok\""));
+        assert_eq!(drain(fetched.reader).len(), 600);
     }
 
     #[test]
