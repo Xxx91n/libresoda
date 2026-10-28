@@ -119,6 +119,12 @@
     出现外部调用方时再评估，并在这里记原因。实现票
     [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级
     [`#2`](https://github.com/sodahub-org/libresoda/issues/2)。
+  - **交给 #8 的三条边界**（都写进 `RangeResponse` 的字段注释，这里汇总以免重新发现）：
+    状态码是 4xx/5xx 时 `reader` 读出的是**错误页**而不是音频片段；范围请求不带
+    `Accept-Encoding`（ureq 见请求里有 `Range` 就不加），服务器仍硬回 `Content-Encoding`
+    时字节已被它解压过、与 `Content-Range` 不符，这层不检测，靠「写入字节数 + 总长」的
+    校验拦；ureq 在每一跳重定向时剥掉 `Cookie`（既有 `get_reader` 行为，非本次引入），
+    且 `get_raw` 不像 `get_full` 那样回 `final_url`，所以这层看不出「被重定向去了别处」。
 
 ## 未移植项
 
