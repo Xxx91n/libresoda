@@ -65,7 +65,8 @@ pub(crate) enum ResumeAction {
     /// 这次响应不能用来续传：本地这段接不上，只能从 0 重新发一次整份请求。
     /// 旧数据这次是删掉还是留着，由调用方按「能不能修」那张表决定（issue #2/#8）。
     RestartFromZero,
-    /// `416` 报的总长等于本地字节数：按 #2 的 416 判据算已经下完。
+    /// `416` 以 `bytes */N` 报的总长等于本地字节数：按 #2 的 416 判据算已经下完。
+    /// 只认 `*/N` 形态；416 带闭区间属于违规响应，按「没带我们要读的头」那档作废重下。
     ///
     /// 残余风险：文件若在两次取流之间被平台重新编码成**恰好**等于本地的长度，交出去的是旧
     /// 文件的前缀 —— 正是 #2 用户故事 8 要排除的「长度对、内容全是噪声」。#2 已把「416 要不要
@@ -110,7 +111,15 @@ pub(crate) fn decide_resume_action(probe: &ResumeProbe<'_>) -> ResumeAction {
         (200, _) => ResumeAction::FullResponse,
         // 另两个「能接上」的结论都靠旧数据：密钥换了，那段字节的身份就没人能证明。
         _ if key_changed => ResumeAction::RestartFromZero,
-        (416, Some(range)) if range.total == probe.local_len => ResumeAction::Complete,
+        // #2 要读的只有 `bytes */N`；416 带闭区间是违规响应，不是那个头，
+        // 所以按票面「没带这个头」那一档处理：删旧重下，不从它推断「已完整」。
+        // 两个 `is_none` 都写上是必要的：解析器虽然只会产出「都有」或「都无」两种形态，
+        // 但 `ContentRange` 的字段可自由构造，不该让这格判断依赖另一个模块的不变量。
+        (416, Some(range))
+            if range.first.is_none() && range.last.is_none() && range.total == probe.local_len =>
+        {
+            ResumeAction::Complete
+        }
         (206, Some(range))
             if range.first == Some(probe.local_len) && range.total == probe.recorded_total =>
         {
@@ -155,6 +164,7 @@ mod resume_tests {
         let file_grew = parse_content_range("bytes 400-1499/1500").expect("bytes 400-1499/1500");
         let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
         let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
+        let closed_on_416 = parse_content_range("bytes 0-999/1000").expect("bytes 0-999/1000");
         // 前九行 = issue #5 验收列出的九个分支，同序；后面补的是边界与守卫优先级用例。
         let cases = [
             (
@@ -232,6 +242,11 @@ mod resume_tests {
                 // 反向那格（记录 1200、本地与服务端都 1000）判 Complete，就在上一格。
                 "416 总长等于记录但不等于本地",
                 probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
+                ResumeAction::RestartFromZero,
+            ),
+            (
+                "416 带闭区间而不是 `*/N`",
+                probe(1000, 1000, KEY, KEY, 416, Some(&closed_on_416)),
                 ResumeAction::RestartFromZero,
             ),
             (
