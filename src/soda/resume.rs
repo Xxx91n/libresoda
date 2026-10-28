@@ -167,8 +167,9 @@ mod resume_tests {
         let only_total = parse_content_range("bytes */1000").expect("bytes */1000");
         let shorter_total = parse_content_range("bytes */900").expect("bytes */900");
         let closed_on_416 = parse_content_range("bytes 0-999/1000").expect("bytes 0-999/1000");
-        // 票面九个分支按序落在前 10 行：#5 把「416 总长与本地或记录不等」列为一条分支，
-        // 它有两判据腿，第 6、7 行各单独断一条。后面补的是边界与守卫优先级用例。
+        // 票面九个分支按序落在前 11 行：#5 的「416 总长与本地或记录不等」是一条分支、两个判据
+        // 腿，第 6–8 行用三个形态分别覆盖（都不等 / 只不等记录 / 只不等本地）。
+        // 后面补的是边界与守卫优先级用例。
         let cases = [
             (
                 "206 起点吻合",
@@ -196,13 +197,21 @@ mod resume_tests {
                 ResumeAction::Complete,
             ),
             (
-                "416 总长与本地不等",
+                // 票面把「与本地或记录不等」列为一条分支，这里三行分别断：两腿都不等、
+                // 只不等记录、只不等本地。
+                "416 总长与本地和记录都不等",
                 probe(1000, 1000, KEY, KEY, 416, Some(&shorter_total)),
                 ResumeAction::RestartFromZero,
             ),
             (
                 "416 总长与记录不等",
                 probe(1000, 1200, KEY, KEY, 416, Some(&only_total)),
+                ResumeAction::RestartFromZero,
+            ),
+            (
+                // `.part` 比记录还长本属 #7 的前置检查范围，这里只确认它不会被误判成 Complete。
+                "416 总长与本地不等（本地比记录长）",
+                probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
                 ResumeAction::RestartFromZero,
             ),
             (
@@ -239,13 +248,6 @@ mod resume_tests {
                 "200 且密钥指纹不符",
                 probe(400, 1000, KEY, OTHER_KEY, 200, None),
                 ResumeAction::FullResponse,
-            ),
-            (
-                // 三处一致才算完成。这一格只失败在本地侧（总长 = 记录 1000，但小于本地 1200），
-                // 记录侧那格在前面；顺带覆盖 `.part` 比记录还长这个不一致态：它永远成不了 Complete。
-                "416 总长与本地不等（本地比记录长）",
-                probe(1200, 1000, KEY, KEY, 416, Some(&only_total)),
-                ResumeAction::RestartFromZero,
             ),
             (
                 "416 带闭区间而不是 `*/N`",
@@ -287,7 +289,6 @@ mod resume_tests {
 
     #[test]
     fn parses_open_ended_total() {
-        // `416` 响应只带总长、不带区间
         assert_eq!(
             parse_content_range("bytes */1000"),
             Some(ContentRange {
