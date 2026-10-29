@@ -201,10 +201,9 @@ pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
         std::fs::rename(&paths.record_tmp, &paths.record)?;
         Ok(())
     })();
-    written.map_err(|err| {
+    written.inspect_err(|_| {
         // 半截的临时文件删不掉也不影响正确性：下一次写会把它当残骸换掉
         let _ = std::fs::remove_file(&paths.record_tmp);
-        err
     })
 }
 
