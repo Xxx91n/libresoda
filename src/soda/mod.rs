@@ -43,10 +43,18 @@ pub(crate) mod resume;
 pub mod search;
 pub mod signature;
 pub mod song;
+// 暂存下载主路径：对外的入口属于 #9，所以这里也只是 `pub(crate)`（docs/PORTING.md）。
+pub(crate) mod staged;
 pub mod stream;
 pub mod track;
 pub mod types;
 pub mod user_playlist;
+
+// 端到端用例声明在 `soda` 这一层而不是 `staged` 里面：它是 `staged` 的兄弟模块，只看得见
+// `pub(crate)` 的入口，够不到那条路径的私有件 —— 断言因此只能落在外部可见的行为上
+// （落盘的字节、记录在不在、返回的事实），这是 #2「只断言外部可见行为」的机械保证。
+#[cfg(test)]
+mod staged_tests;
 
 use crate::model::{Playlist, PlaylistCategory, QRLoginResult, Song};
 use crate::util::Params;
