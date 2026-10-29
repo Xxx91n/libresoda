@@ -39,6 +39,7 @@
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
 | （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
 | （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由是它对外承诺的是**落盘格式**（四样字段），不是 `resume` 那种判断规则；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
+| （上游无对应）| `staged::{download_staged, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下。`pub(crate)`：对外的入口（一次调用 + `#[non_exhaustive]` 详细结果）是 #9 的事，这里交回的 `StagedDownload` 是它的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -80,7 +81,8 @@
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
-| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
+| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
+| （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库），按 `#2` 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），断言只落在外部可见的四件事上：`.part` 的字节（与另起一个 `200` 整份服务器、走 `http::get_reader` 的一次性下载**逐字节**对比）、`.part` 与 `.part.meta` 这对暂存在六种失败下的去留、交回的五个事实、线上真的发了几次什么请求。**这一条不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口按 #2 的「公开接口」一节属于 #9 —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以用例放在 `soda` 这一层的兄弟模块里，让它只能看见 `pub(crate)`。等 #9 给出公开入口，`tests/` 那份按同一批形态补 |
 
 ## 与上游的实现差异
 
@@ -133,11 +135,18 @@
     「带 Cookie 穿重定向」这条路是续传链才走到的。这条同时也是**这层交不回的事实**
     （没有 `final_url`，其余响应头也不外传）：#8 真要在意重定向，就该给 `RangeResponse`
     加字段并在这里记下原因，而不是在 #8 里猜。
-  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。真机结论（尤其 `416` 到底带不带
-    `bytes */N`）要等 #8 的联网用例，届时按仓库规矩进 `CLIENT-API.md` 的实测状态总表。
+  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。**真机结论仍然悬着**：#8 没有加联网
+    用例 —— 它的入口是 `pub(crate)`，`tests/network_tests.rs` 够不到，而这张票的验收标准全部由
+    离线假服务器覆盖（三种状态码 + 逐字节对比 + 去留表 + 并发）。可行的落点是 #9 给出对外下载函数
+    之后按 `scripts/run-network-tests.sh` 那套护栏跑，或照 #3 的做法写一条只读 example；在那之前
+    「`416` 到底带不带 `bytes */N`、边缘节点认不认 `If-Range`」没有证据，别把它当已验证的事实写进
+    文档。
   - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
     `http::{get, get_full, post_json}`，既漏了既有的 `get_reader`，也没含本层新加的 `get_raw`。
     改那行规则正文要单独取授权，先在这里记着，别把它当成「`get_raw` 是绕过 http 封装的私拉 HTTP」。
+    同一份规则文件还欠着另一处：「目录与对照关系」那张表没有 `fetch.rs` / `part_record.rs` /
+    `staged.rs` 三行（#6、#7 都没动规则文件，#8 沿用这个先例，只把三张模块登记在本文档的
+    函数级对照里）—— 要补同样得单独取授权。
 
 * **断点续传的记录文件（`soda::part_record`，上游无对应）**：实现票
   [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径来自
@@ -201,15 +210,21 @@
     **`purge_expired_parts` 是唯一的例外**：它动的是别的目标的暂存，当前目标的锁管不到，所以它靠
     「只删两边都超过 7 天没被写过、且记录认得出是我们格式的一对」自证安全 —— 真在下的文件不会
     7 天没被写过。
-  - 票面第 6 条「**在下次下载时**被清掉」的那个调用点是 #8 的下载主路径（顺序：取锁 →
-    `purge_expired_parts` → `load_record` → 判断 → 写盘），本票只提供并测试机制；#8 落地前它在库里
-    还没有调用方 —— 所以这张票单独合入时，第 6 条只能算「机制到位」，不该按行为已验收关票。
-    `etag_matches` 同理：它回答的是「服务端这次的 validator 还是不是记录里那一个」，而 `If-Range`
-    要发的是 `record.etag` 原值 —— #2 已把 ETag 排除在续传判据之外，#8 可以不调它，它存在是因为
-    票面第 2 条规定了比较的口径。
-  - 给 #8 的四条义务：锁名从 `StagedPaths::lock` 拿、锁自己取；清扫排在 `load_record` **之前**；
-    `purge_expired_parts` 除 `invalid_input` 外不会失败，可以直接 `?`；**别拿 `record.total_len`
-    预分配**（AGENTS.md 内存安全铁律 1）。
+  - 票面第 6 条「**在下次下载时**被清掉」的那个调用点**已经在 #8 的下载主路径上**（`staged.rs`
+    的顺序：取锁 → `purge_expired_parts` → `load_record` → 判断 → 写盘），并由两条端到端用例钉住：
+    别的目标留下的过期一对会在这次下载开始时被回收，**本次目标自己**那对过期暂存要在读记录**之前**
+    被清掉（判据是线上真发出的 `Range: bytes=0-` 而不是 `bytes=200-`，见 `staged_tests.rs` 的
+    `expired_staging_of_this_target_is_purged_before_the_record_is_read`）。到 #8 落地的这次合入，
+    #7 的第 6 条才算按行为验收，而不只是「机制到位」。
+    `etag_matches` 则相反：#8 **没有**调它 —— #2 把 ETag 排除在「能不能接上」的判据之外，而发
+    `If-Range` 要的是 `record.etag` 原值，不是比较结果。票面第 2 条要的是「比较忽略大小写」这件事
+    有实现、有用例，所以函数与用例都留着，代价是它没有消费方，靠一处 `#[allow(dead_code)]` 挂住
+    （挂在哪一处的理由写在那个函数上面）。
+  - 给 #8 的四条义务，以及 #8 落地后的去处：锁名从 `StagedPaths::lock` 拿、锁自己取（`staged.rs` 的
+    `acquire_lock`）；清扫排在 `load_record` **之前**（顺序有端到端用例钉住，见上面那条）；
+    `purge_expired_parts` 除 `invalid_input` 外不会失败，可以直接 `?`（#8 就是 `?` 串在写盘之前的）；
+    **别拿 `record.total_len` 预分配**（AGENTS.md 内存安全铁律 1）—— #8 全程按固定的 64KB 块读写，
+    没有任何按响应或记录里的长度开出来的容器。
   - 已知限制：本模块**判类型**用 lstat（不跟随链接），但**改名**与**打开**仍按平台语义处理链接位置：
     `rename` 会把链接本身替换掉、`remove_file` 删的是链接而不是它的目标。缓存目录本身不可信时，
     续传可能作废重下而不是接上 —— 与 #2 已写明的「网络文件系统上的锁不可靠」同类：后果限于这份
@@ -218,10 +233,69 @@
     判断，而是**一个落盘格式** —— 四样字段名一旦公开就冻结，而 #7→#9 期间这套判据还在被审查改
     （这条 PR 里就改了记录可信度的判据与作废的范围）。#2 说的「以后加字段不破坏调用方」是给结果
     结构（`#[non_exhaustive]`）讲的，没给落盘格式这种保证。出口同 `resume`：出现外部调用方时再评估。
-    #8 落地前 `resume.rs` 里 `ResumeAction` / `ResumeProbe` / `decide_resume_action` 三处的逐项
-    `#[allow(dead_code)]` 与本模块顶部的 `#![allow(dead_code)]` 都不能删 —— #6 的取数层已经用上了
-    `parse_content_range`，但 #7 不调 `decide_resume_action`（它的检查在那之前），#8 之前这三处
-    仍无消费方（2026-10-28 实测）。
+    #8 落地时删掉了 `resume.rs` 里 `ResumeAction` / `ResumeProbe` / `decide_resume_action` 三处的
+    逐项 `#[allow(dead_code)]`，以及 `fetch.rs`、`part_record.rs` 顶部的模块级放行 —— 这三样现在
+    有 `staged.rs` 这个非测试的消费方。还剩两处放行，都等 **#9**：`staged.rs` 顶部一条模块级（它
+    自己的入口要 #9 给出对外下载函数才算有消费方），`part_record::etag_matches` 上一条逐项（谁都
+    没调它，理由见上面那条）。判据是「被死码用到仍算被用到」：#6 落地时把 `parse_content_range`
+    的放行删掉过，而它只被当时还没人调的 `fetch_range` 用到，clippy 不报 —— 所以 #8 用掉的那些
+    放行现在确实可以删，`staged.rs` 自己那一格则要留到 #9。
+
+* **断点续传的暂存下载主路径（`soda::staged`，上游无对应）**：实现票
+  [`#8`](https://github.com/sodahub-org/libresoda/issues/8)，口径全部来自
+  [`#2`](https://github.com/sodahub-org/libresoda/issues/2)（文件怎么落、请求次数与重试边界、
+  「没下完的文件留不留」那张表、并发四句）。这一层只把**加密**字节落到 `{目标}.part` 并写好
+  `{目标}.part.meta`；解密输出、对外的详细结果结构属于
+  [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，旧下载函数改转调属于
+  [`#10`](https://github.com/sodahub-org/libresoda/issues/10)。
+  - **可见性**：`download_staged` 与 `StagedDownload` 都是 `pub(crate)`，模块也不 `pub`。#2 的
+    「公开接口」一节定的是「一次调用 + 详细结果 + 策略枚举」那一层（#9/#10），这里交回的五个事实是
+    那层的内部件；铁律 2 的例外按同一口径走（出口是出现外部调用方），并在本票挂上口径票 #2。
+  - **锁的实现选了 std，代价是 MSRV**：`{目标}.part.lock` 用
+    [`std::fs::File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
+    （Unix 是 `flock` 的 `LOCK_EX|LOCK_NB`，Windows 是 `LockFileEx` 的
+    `LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`），正好是 #2 要的那三件事：不等待、独占、
+    句柄关闭即由内核释放。它 1.89 才稳定，而本 crate 原先声明 `rust-version = "1.75"` —— 于是
+    `Cargo.toml` 提到 **1.89**（2026-10-29 与维护者当面谈定）。选它而不是 `libc::flock` +
+    `windows-sys::LockFileEx` 手写两条分支，是因为本仓库的验证只有 Linux（fork 的 CI 只跑
+    `ubuntu-24.04`），手写 FFI 的那半条路径将完全没有被编译过；用 std 就没有「这段代码只在某个
+    平台成立」这回事。MSRV 从 1.75 提到 1.89 是对外的承诺变化：`1.75 ~ 1.88` 之间的调用方会编不过，
+    CI 也不测 MSRV（钉的是 1.99 工具链）—— 知道这一点再决定要不要在下一个版本里往里写别的 1.8x API。
+  - **打开锁文件的方式**：`read + write + create`，不是 `append`。std 的文档写明 Windows 上只以
+    append 打开的文件锁不住，而 `try_lock` 要求句柄有写权限；锁文件建出来就**不删**，也不检测陈旧锁
+    （#2 定了「进程结束时由内核释放」），代价是每个下过的目标在目录里留一个空的 `{目标}.part.lock`。
+    这个后缀不在 #7 那套清扫认的名字族里，所以它不会被顺带回收 —— 它不影响正确性，但属于
+    「清理缓存的人要知道有哪些名字」那一档（#2 用户故事 20），命名规则已经写在 `part_record` 的模块头表格里。
+  - **撞锁**：返回 `SodaError::Io("download target is being staged by another download")`，
+    在**发出请求之前**就返回（用例断的是假服务器一条请求都没收到）。不改公开的错误类型（#2 的
+    「明确不动」），文案里没有 Cookie 也没有 URL。
+  - **第 2 次请求的判据是这张票定的口径**（#2 只说了「退回整份时最多多发一次」，没说哪些响应算退回）：
+    只有服务器**答了话**却接不上时才重发 —— `206` 的起点或总长对不上、`416` 的总长对不上（含只认
+    `*/N` 那条）。`4xx`/`5xx` 走 `RestartFromZero` 也**不重发**：那是一次失败，#2 要求第一次就返回，
+    留着旧数据等调用方决定要不要再试。`200` 更是直接用手上这一份正文重写，本来就不需要第二次请求。
+  - **没有旧数据时不调用判断函数**：`ResumeProbe` 要的是「记录里写了什么」，空手上路没有记录，
+    所以那条分支只看这次响应能不能当「从 0 开始的整份」（`200`，或 `206` 且起点真是 0）。
+    这样第一次调用也只发一次 `Range: bytes=0-`，不浪费请求，而且顺带拿到了 `Content-Range` 的总长。
+  - **总长的来源分两档**（#2 没写这条，是实现时不得不定的）：`206` 用这次 `Content-Range` 的总长写进
+    记录；`200` 没有范围事实，只能用「交付的字节数」当总长。后果是**不理范围请求的服务器下不存在
+    续传**：一次 `200` 断在半路，记录里的总长就是那个半截长度，下一次服务器照样答 `200`，于是整份
+    重下 —— 与 #2「服务器不认范围就安全退回整份」同构，只是省不了。这不产出坏文件：所有「接上」的
+    结论都要求总长与服务器这次说的一致。
+  - **记录一次调用只写一次**（写完正文之后），不在传输中途重写。崩溃（进程被杀）留下的「`.part` 比
+    记录长」由 `load_record` 一起作废，所以这条路径保证的是**断网接得上**，不保证**被杀也接得上**。
+    出错的分支反过来要把记录**对齐**到 `.part` 的真实长度（`keep_record`），对齐不上（stat 读不到、
+    记录写不进去）就什么都不做，交给下一次的「一起作废」—— 宁可重下，不能接上一段没人能对上的字节。
+  - **交付字节与这次承诺的区间不符 → 一起作废**：多给（#6 记的那条兜底，服务器违规压
+    `Content-Encoding` 把字节解压过）与「读得完但比区间短」（服务器自己的两个数对不上）同档。
+    而**中途断**（ureq 对没读满的 `Content-Length` 报 `UnexpectedEof`）与写盘失败（含磁盘满）是
+    「留着下次接」那一档 —— 这两种情形在错误上分不清，判据只能是「字节数与这次承诺的对不对得上」。
+  - **处置表按状态码落地**：`404`/`410` 删（下架/不存在），其余状态码与所有 I/O 失败保留
+    （鉴权失败、`5xx`、认不出的、磁盘满、断流）。#2 用户故事 11 里的「无权益」不在这一层判 —— 本层
+    只看得到流地址回的状态码，无权益是 `resolve_download_info` 那一步的结论（归 #9）。
+    删不动时（Windows 的共享冲突）不改这次错误的文本，那对文件留给下一次同目标的下载再判一遍。
+  - **不做的事**：库内不重试、不等待、不睡眠、不加进程内锁表、不做磁盘压力淘汰（#2 的「明确不动」）。
+    `fsync` 也不做（同上，几十 MB 的同步代价换「重下即可」的失败模式）。
+  - 已知限制照 #2 那条：网络文件系统上的锁不可靠，此时续传可能失效并退回重下，但不会产出坏文件。
 
 ## 未移植项
 
