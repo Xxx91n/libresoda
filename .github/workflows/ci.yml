@@ -1,0 +1,45 @@
+# 最小检查：格式、静态检查（警告视为失败）、全部测试。票 sodahub-org/libresoda#4。
+#
+# 版本都钉在这个文件里，不写 `rust-toolchain.toml`：后者会改掉每个人本地构建用的工具链，
+# 而这里只该固定 CI 自己的环境。镜像与 action 按提交钉住，同一个运行结果可复现、可追溯。
+# 联网测试全部带 `#[ignore]`，`cargo test` 不会碰网络。
+#
+# 注意 `clippy`/`test` 都带 `--locked`，而 AGENTS.md 与 README 的「提交前必须」那三条没写
+# —— 这处三边不一致是已知欠账，改规则文件要单独取授权。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-24.04
+    env:
+      RUST: 1.99.0
+    steps:
+      # actions/checkout v7.0.1，按提交固定。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install "$RUST" -c rustfmt -c clippy --profile minimal
+          rustup default "$RUST"
+
+      - name: Verify pinned toolchain
+        run: |
+          rustc -V && cargo -V && cargo clippy --version
+          test "$(rustc -V | awk '{print $2}')" = "$RUST"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Static check
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
