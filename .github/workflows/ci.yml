@@ -22,8 +22,13 @@ jobs:
     env:
       RUST: 1.99.0
     steps:
-      # actions/checkout v7.0.1，按提交固定。
+      # actions/checkout v7.0.1，按提交固定。`persist-credentials: false`：`pull_request` 触发的
+      # 这一轮跑的是贡献者的代码（`cargo` 会执行 build script），而 checkout 默认把 token 写进
+      # 本地 git 配置 —— 权限只有 `contents: read` 也不该让它被读出来。本仓库没有 git 依赖，
+      # 去掉不影响拉取。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Install pinned toolchain
         run: |
