@@ -38,6 +38,7 @@
 | （上游无对应）| `http::get_raw`：一次 GET 把状态码、响应头、流式读取器一并交回，**4xx/5xx 不当错误**（ureq 2.x 没有这种开关，靠匹配它的 `Error::Status` 变体，响应头就随那个变体回来）。`pub(crate)`，只给下面的取数层用 |
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
 | （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
+| （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由是它对外承诺的是**落盘格式**（四样字段），不是 `resume` 那种判断规则；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -78,7 +79,7 @@
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
-| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+| 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
 
 ## 与上游的实现差异
@@ -137,6 +138,90 @@
   - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
     `http::{get, get_full, post_json}`，既漏了既有的 `get_reader`，也没含本层新加的 `get_raw`。
     改那行规则正文要单独取授权，先在这里记着，别把它当成「`get_raw` 是绕过 http 封装的私拉 HTTP」。
+
+* **断点续传的记录文件（`soda::part_record`，上游无对应）**：实现票
+  [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径来自
+  [`#2`](https://github.com/sodahub-org/libresoda/issues/2)「记录文件与「还能不能接上」的判据」一节。
+  三个落盘名字都由目标路径推导（规则也写在 `part_record` 的模块头 —— #2 的用户故事 20 要求
+  「命名规则固定并写进文档」）：`{目标}.part` 装未下完的**加密**字节、`{目标}.part.meta` 是记录、
+  `{目标}.part.meta.tmp` 只是原子写的临时名（改名成功后不残留，读记录那条路永远不认它）。
+  7 天清扫要扫的目录同样由目标路径推导（`purge_expired_parts(target)` 取推导出的 `.part` 的
+  `parent()`，不在 `target` 上另算一次），调用方只拿着最终路径这一个概念。`{目标}.part.lock` 的名字**也**在这里推导（`StagedPaths::lock`），
+  但取锁、撞锁报错与那条纪律属于 #8。
+
+  - 记录只有票面那四样：总长、强 `ETag`、密钥指纹、写入时的字节数。JSON + `deny_unknown_fields`，
+    认不出的字段（多一个、少一个都算）不当「半可信的记录」用。
+  - 判龄用文件 mtime，**不记时间戳**：票面把记录限定成四样，加第五个字段要先改票。两种判不出
+    年龄的情况都不删：拿不到 mtime（文件系统不支持）→ 整对不动；mtime 在未来（有人把时钟往回
+    拨过）→ 按 0 龄算，这份暂存要等时钟追回去才会被扫掉。删除不可逆，宁可留到下次。
+  - 指纹是**密钥字节**的 MD5，复用 `qr_login::md5_hex_upper`（只为「两次是不是同一把」的等值判断，
+    不承诺安全强度，也不为此新增依赖）。输入取 `crypto::hex_decode(crypto::extract_key(..))` 的
+    字节，不是 `play_auth` 串、也不是它的十六进制文本：#3 记下过同一个密钥可能有大小写两种写法。
+  - `ETag` 只滤掉 `W/` 这个弱标记（弱校验器用不了 `If-Range`，记了没有下游用途），比较忽略大小写
+    （票面第 2 条的依据是厂商会改写大小写）。除此之外不校验引号与字符集，也不参与
+    「能不能接上」的判断（同 `ResumeProbe` 的口径）。
+  - 「记录与数据只有一方在、或记录写的字节数与磁盘真实长度不符 → 两边一起删」发生在调用
+    `decide_resume_action` **之前**：这条边界写在 `ResumeProbe` 的文档里，#7 票面没写。
+    一起作废删的是**普通文件与符号链接**（`remove_file` unlink 的是链接本身，不碰它指向的文件）：
+    把链接留在自己的暂存名上，#8 下一次用跟随语义的 `File::create` 建 `.part` 就会写穿到别处。
+    目录与管道这类「名字撞上但不是文件」的位置仍不动 —— 那不是本 crate 的暂存，删它才是越界
+    （`write_record` 只碰记录那一侧，数据位置上的障碍由 #8 写第一个字节时拿到自己的 I/O 错误）。
+    真要删的那个文件**删不动时如实报错**：Windows 上杀软或索引器的
+    共享冲突会让 `remove_file` 失败，Linux 的 `unlink` 却几乎总能成功 —— 这里不能假装「已作废」，
+    否则调用方会往一份还在盘上的旧字节后面追加。`.part` 是 0 字节时也一并作废：没有可接的字节，
+    而「总长 0 + `416 bytes */0`」会被判成「已下完」，交出去的是个空文件 —— 正是用户故事 8 排除
+    的那种。记录位置被目录占着时也不能先 `File::open`：同一个调用在 Linux 上成功、在 Windows 上是
+    ACCESS_DENIED，类型判断必须排在打开前面，否则两个平台的分支不一样。`record.total_len` 交给
+    调用方时只保证「不小于本地长度」，**不保证是真的**：#8 不能拿它预分配（内存安全铁律 1）。
+  - 类型判断一律用 `symlink_metadata`（lstat）而不是 `metadata`：跟着链接去 stat 会把
+    `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，于是扫目录删掉它配对的记录、链接却留在
+    原地。判不成 `File` 的位置在扫目录时一律「不动」。临时名的写入用 `create_new`（O_EXCL）而不是 `File::create`：既不静默截断另一个写者
+    正在用的同名临时文件，也不写穿被人放在那个位置上的链接。判类型与打开之间还剩一个理论上的替换
+    窗口 —— 能把暂存目录变成攻击面的人本来就能直接改暂存内容，那条路归 #2 已有的「锁不可靠时退回
+    重下、不产出坏文件」。
+  - 7 天清扫只动**认得出是我们的**的暂存对：记录必须按那四样读得出来，光名字撞上不算 ——
+    一对同样叫 `X.part` / `X.part.meta` 的别人家文件不该由我们按名字删（`.part` 这个后缀不是
+    本 crate 独占的 —— Transmission 之类的未完成文件就叫 `X.part`）。临时名是唯一靠名字认的：
+    它的定义就是「可能只写了一半」，内容判不了。反过来 `load_record` 敢删没配对的 `.part`，
+    是因为它只动**调用方正要写的那个目标**。换来的漏是「记录还没写下就崩溃」留下的孤立 `.part`：
+    扫目录不碰没配对的 `.part`，它要等同一目标再次下载时由 `load_record` 清掉。名字撞上但记录
+    读不出来的那一对走同一条路 —— 扫目录认不出它，但 `load_record` 的口径是「凑不成可信的一对就
+    一起作废」，所以它不会永久留着。四样字段将来若改了名，旧记录一律读不出来，扫目录这条路就再也
+    碰不到那些过期的一对：**改格式时必须同时留一条清旧格式的路**，或先清一遍缓存。两边都过期时
+    **先删数据再删记录** —— 反过来一旦只有第一步成功，就正好造出前面说的那种孤儿。
+  - 清扫是**尽力而为**：先按名字认出记录族再 stat（下载目录里成千上万个无关文件不该被逐个问一遍），
+    单个条目 stat 失败或删不掉（OneDrive 占位符、杀软占用）就跳过它留给下一轮，连目录都打不开
+    （没建、是文件、ACL）也照样返回成功 —— 一次顺带回收不该挡住下载，所以 #8 可以放心地 `?` 串它。
+    唯一的错误来源是目标推不出暂存名（`/` 这种报 `invalid_input`），那是调用方的用法错误。
+    目录取自推导出来的 `.part` 的 `parent()`，裸文件名退到当前目录；「7 天」这条判据只写在
+    `expired` 一处，扫目录两侧都读它。
+  - **锁**：#2 规定 `.part` 的所有读写都在 `{目标}.part.lock` 下、不能有绕过分支。那把锁由 #8 取，
+    `write_record` / `load_record` / `discard_parts` 都假定调用方已持有；同目标的并发只能靠那把锁
+    （`create_new` 挡不住两个真写者，取舍写在 `open_record_tmp` 的文档里）。
+    **`purge_expired_parts` 是唯一的例外**：它动的是别的目标的暂存，当前目标的锁管不到，所以它靠
+    「只删两边都超过 7 天没被写过、且记录认得出是我们格式的一对」自证安全 —— 真在下的文件不会
+    7 天没被写过。
+  - 票面第 6 条「**在下次下载时**被清掉」的那个调用点是 #8 的下载主路径（顺序：取锁 →
+    `purge_expired_parts` → `load_record` → 判断 → 写盘），本票只提供并测试机制；#8 落地前它在库里
+    还没有调用方 —— 所以这张票单独合入时，第 6 条只能算「机制到位」，不该按行为已验收关票。
+    `etag_matches` 同理：它回答的是「服务端这次的 validator 还是不是记录里那一个」，而 `If-Range`
+    要发的是 `record.etag` 原值 —— #2 已把 ETag 排除在续传判据之外，#8 可以不调它，它存在是因为
+    票面第 2 条规定了比较的口径。
+  - 给 #8 的四条义务：锁名从 `StagedPaths::lock` 拿、锁自己取；清扫排在 `load_record` **之前**；
+    `purge_expired_parts` 除 `invalid_input` 外不会失败，可以直接 `?`；**别拿 `record.total_len`
+    预分配**（AGENTS.md 内存安全铁律 1）。
+  - 已知限制：本模块**判类型**用 lstat（不跟随链接），但**改名**与**打开**仍按平台语义处理链接位置：
+    `rename` 会把链接本身替换掉、`remove_file` 删的是链接而不是它的目标。缓存目录本身不可信时，
+    续传可能作废重下而不是接上 —— 与 #2 已写明的「网络文件系统上的锁不可靠」同类：后果限于这份
+    暂存自己，不会产出坏的目标文件。
+  - **可见性**：整模块 `pub(crate)`。理由不是照抄 `resume`：`part_record` 公开出去承诺的不只是一段
+    判断，而是**一个落盘格式** —— 四样字段名一旦公开就冻结，而 #7→#9 期间这套判据还在被审查改
+    （这条 PR 里就改了记录可信度的判据与作废的范围）。#2 说的「以后加字段不破坏调用方」是给结果
+    结构（`#[non_exhaustive]`）讲的，没给落盘格式这种保证。出口同 `resume`：出现外部调用方时再评估。
+    #8 落地前 `resume.rs` 里 `ResumeAction` / `ResumeProbe` / `decide_resume_action` 三处的逐项
+    `#[allow(dead_code)]` 与本模块顶部的 `#![allow(dead_code)]` 都不能删 —— #6 的取数层已经用上了
+    `parse_content_range`，但 #7 不调 `decide_resume_action`（它的检查在那之前），#8 之前这三处
+    仍无消费方（2026-10-28 实测）。
 
 ## 未移植项
 
