@@ -28,14 +28,15 @@
 //! 这一层只看流地址回的状态码：「无权益」是取流阶段（`resolve_download_info`）的结论，不在这里
 //! 判，所以 #2 用户故事 11 里那一档归 #9。
 
-// 公开入口属于 #9：在那之前这条路径在库里还没有非测试的调用方。消费链是 #9 调这里、这里调
-// `resume`/`fetch`/`part_record`，所以那几个模块的 `dead_code` 放行也一起等 #9。
+// 公开入口属于 #9：在那之前这条路径在库里还没有非测试的调用方，所以按模块放行。它消费的
+// `resume`/`fetch`/`part_record` 三处放行已经由本票删掉（被这里用到就算活了），只剩
+// `part_record::etag_matches` 那一格 —— 它留着的理由不是「等 #9」，写在那个函数上面。
 #![allow(dead_code)]
 
 use super::fetch::{fetch_range, RangeResponse};
 use super::part_record::{
-    discard_parts, key_fingerprint, load_record, purge_expired_parts, staged_paths, write_record,
-    PartRecord, StagedPaths,
+    discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts, staged_paths,
+    write_record, PartRecord, StagedPaths,
 };
 use super::resume::{decide_resume_action, ResumeAction, ResumeProbe};
 use crate::error::{Result, SodaError};
@@ -58,7 +59,8 @@ pub(crate) struct StagedDownload {
     pub(crate) on_disk: u64,
     /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
     pub(crate) total_len: u64,
-    /// 落盘那一次请求的状态码（退回整份时是第 2 次的，不是第 1 次的）。
+    /// 真正落盘那一次请求的状态码：追加与「`200` 用手上这一份重写」都是第 1 次，
+    /// 只有作废旧数据后再发一次（`Refetch`）才是第 2 次的。
     pub(crate) status: u16,
 }
 
@@ -149,12 +151,12 @@ pub(crate) fn download_staged(
             total_len: offset,
             status: first.status,
         }),
-        Plan::Append { offset } => write_leg(first, target, &paths, offset, key_bytes),
+        Plan::Append { offset } => stage_response(first, target, &paths, offset, key_bytes),
         Plan::Rewrite => {
             // 这里的删除失败要传出去：下一句就要建 `.part`，旧数据还在原地的话写出来的就是
             // 「接在没人认领的字节后面」。`fail_on_status` 那一档反过来吞掉，理由记在那函数上。
             discard_parts(target)?;
-            write_leg(first, target, &paths, 0, key_bytes)
+            stage_response(first, target, &paths, 0, key_bytes)
         }
         Plan::Refetch => {
             discard_parts(target)?;
@@ -163,7 +165,7 @@ pub(crate) fn download_staged(
             if !starts_at_zero(&again) {
                 return Err(fail_on_status(target, again.status));
             }
-            write_leg(again, target, &paths, 0, key_bytes)
+            stage_response(again, target, &paths, 0, key_bytes)
         }
     }
 }
@@ -182,7 +184,7 @@ fn starts_at_zero(response: &RangeResponse) -> bool {
 /// 这次的 `Content-Range` 闭区间是**承诺**：交付比它多就作废（#6 记的「服务器违规压
 /// `Content-Encoding`，交回的字节被解压过」那条兜底），比它短且读完了也作废（服务器自己
 /// 前后不一致）；中途断（`Err`）不在此列，那是「断网接着补」的正常形态。
-fn write_leg(
+fn stage_response(
     response: RangeResponse,
     target: &Path,
     paths: &StagedPaths,
@@ -287,9 +289,10 @@ fn pump_into_part(
 
 /// 出错的分支也要把记录对齐到 `.part` 的真实长度：对上了下一次才接得上。
 ///
-/// 只在 stat 得到长度时重写记录 —— 长度都不知道（文件没建成）或记录写不进去（磁盘满就是两边
-/// 一起失败）时什么都不做，那份对不上的旧记录交给 `load_record` 的「一起作废」：宁可重下，
-/// 也不能接上一段没人能对上的字节。记录里的总长不小于磁盘长度，同一条理由。
+/// 只在 `file_len` 认得出那是一个**普通文件**时重写记录 —— 判型只用 #7 那一处 lstat：跟着链接
+/// 去问长度会把别人放在这个名字上的文件长度当成「我们已经写了这么多」。文件没建成、或记录写不
+/// 进去（磁盘满就是两边一起失败）时什么都不做，那份对不上的旧记录交给 `load_record` 的「一起
+/// 作废」：宁可重下，也不能接上一段没人能对上的字节。记录里的总长不小于磁盘长度，同一条理由。
 fn keep_record(
     target: &Path,
     paths: &StagedPaths,
@@ -297,10 +300,9 @@ fn keep_record(
     etag: Option<&str>,
     key_bytes: &[u8],
 ) {
-    let Ok(meta) = std::fs::metadata(&paths.part) else {
+    let Ok(Some(on_disk)) = file_len(&paths.part) else {
         return;
     };
-    let on_disk = meta.len();
     let total_len = total_hint.unwrap_or(on_disk).max(on_disk);
     let _ = write_record(
         target,

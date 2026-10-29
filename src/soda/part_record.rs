@@ -403,7 +403,8 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
 /// 用 `symlink_metadata`（lstat）而不是 `metadata`：跟着链接去 stat 会把
 /// `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，于是扫目录删掉它配对的记录、链接却留下。
 ///
-/// 全模块只有这一处分类：`discard`、`load_record` 与扫目录都读它，不再各自发明一遍判型。
+/// 判型只有这一处：`discard`、`load_record` 与扫目录都读它，下载主路径（#8）要对齐记录时读的
+/// 也是同一个 `file_len` —— 不再各自发明一遍。
 enum Slot {
     /// 普通文件。`modified` 为 `None` 表示这个文件系统给不出 mtime。
     File {
@@ -443,7 +444,10 @@ fn slot_of(path: &Path) -> Result<Slot> {
 }
 
 /// 文件真实长度；不存在、或不是我们那种普通文件（链接、目录、管道）时给 `None`。
-fn file_len(path: &Path) -> Result<Option<u64>> {
+///
+/// 给 #8 的下载主路径也用（它出错时要把记录对齐到磁盘真实长度）：判型口径必须和这里读回的
+/// 那套一致，不能再开一处 `fs::metadata`。
+pub(crate) fn file_len(path: &Path) -> Result<Option<u64>> {
     Ok(match slot_of(path)? {
         Slot::File { len, .. } => Some(len),
         Slot::Link | Slot::Absent | Slot::Occupied => None,
