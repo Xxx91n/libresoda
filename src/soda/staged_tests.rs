@@ -7,11 +7,12 @@
 //! 假服务器按 #2 的「测试决定」用本地 `TcpListener` 手写，不引 mock 库；三种形态（`206` /
 //! 忽略范围的 `200` / `416`）都各有用例，产出与一次性整份下载逐字节对比。
 
-use super::part_record::{load_record, staged_paths, write_record, PartRecord};
+use super::part_record::{load_record, staged_paths, write_record, PartRecord, StagedPaths};
 use super::staged::download_staged;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -108,6 +109,61 @@ fn gated_server(reply: Vec<u8>, hit: mpsc::Sender<()>, gate: mpsc::Receiver<()>)
     format!("http://{addr}/stream")
 }
 
+/// 只接受连接、不答话的假服务器：每接受一个就计数一次然后把它丢掉 —— 客户端还没拿到响应头
+/// 就断了，ureq 报的是传输错误。计数就是「这次调用真的试了几回」，用来看库内有没有自己重试。
+fn refusing_server(attempts: Arc<AtomicUsize>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        for accepted in listener.incoming() {
+            if accepted.is_ok() {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    format!("http://{addr}/stream")
+}
+
+/// 正文分两段发的假服务器：先回头部加一截正文，通知 `hit`，等 `gate` 放行再补齐剩下的正文。
+/// 用来把「`.part` 正开在下载那一侧手里」这段时间稳定留住。
+fn body_split_server(
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    hit: mpsc::Sender<()>,
+    gate: mpsc::Receiver<()>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let Ok(mut stream) = listener.accept().map(|(stream, _)| stream) else {
+            return;
+        };
+        let Some(_request) = read_request(&mut stream) else {
+            return;
+        };
+        if stream.write_all(&head).is_err() || stream.flush().is_err() {
+            return;
+        }
+        let _ = hit.send(());
+        let _ = gate.recv();
+        let _ = stream.write_all(&tail);
+        let _ = stream.flush();
+    });
+    format!("http://{addr}/stream")
+}
+
+/// 等到 `.part` 真的被建出来 —— `hit` 只说明服务器发了正文的头一截，不说明下载那一侧已经
+/// 走到写盘。这里的等待只属于用例（等一个并发事实成形），库里不等待是另一回事。
+fn wait_until_part_created(paths: &StagedPaths) {
+    for _ in 0..2_000 {
+        if paths.part.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("`.part` 一直没被建出来：下载那一侧没进到写盘这一步");
+}
+
 /// 读到请求头结束（GET 没有正文）；连接先断了就没有。
 fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut request: Vec<u8> = Vec::new();
@@ -147,6 +203,18 @@ fn seed_staged(target: &Path, len: usize, total: usize, etag: Option<&str>, key:
     write_record(target, &record).expect("seed record");
 }
 
+/// 把一对暂存的 mtime 都摆到 8 天前（#7 的清扫要两边都过期才动它）。
+fn age_out_pair(paths: &StagedPaths) {
+    let eight_days_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    for path in [&paths.part, &paths.record] {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(eight_days_ago).expect("set_modified");
+    }
+}
+
 /// `.part` 现在的内容；不在了就是 `None`。
 fn part_bytes(target: &Path) -> Option<Vec<u8>> {
     let paths = staged_paths(target).expect("staged paths");
@@ -157,8 +225,11 @@ fn record_exists(target: &Path) -> bool {
     staged_paths(target).expect("staged paths").record.exists()
 }
 
-/// 盘上那对暂存现在还能不能被视为「一起可信」—— 能接上下一次下载就是这个 `Some`。
-fn resumable(target: &Path) -> Option<(u64, u64, String)> {
+/// 盘上那对暂存是不是「一起可信」的一对（本地长度、记录总长、密钥指纹）。
+///
+/// 名字如实写了它的副作用：走的是 `load_record`，而那条路在判不成可信对时**会把两边一起删掉**。
+/// 所以断言「该留着/该删掉」的用例别用它，用 `part_bytes` / `record_exists` 那种不动盘的读法。
+fn trusted_pair(target: &Path) -> Option<(u64, u64, String)> {
     let staged = load_record(target).expect("load_record").map(|part| {
         (
             part.local_len,
@@ -200,7 +271,7 @@ fn fresh_download_matches_a_one_shot_fetch() {
         "产出与一次性整份下载该逐字节相同"
     );
     // 记录与数据一起可信，且指纹就是这次这把密钥。
-    let (local_len, total_len, fingerprint) = resumable(&target).expect("暂存对可续传");
+    let (local_len, total_len, fingerprint) = trusted_pair(&target).expect("暂存对可续传");
     assert_eq!((local_len, total_len), (TOTAL as u64, TOTAL as u64));
     assert_eq!(
         fingerprint,
@@ -251,7 +322,7 @@ fn resumes_from_the_staged_prefix_after_the_stream_drops() {
         "{error}"
     );
     assert_eq!(part_bytes(&target).expect("半截文件要留着"), whole()[..200]);
-    let (local_len, total_len, _) = resumable(&target).expect("断在半路也得能接上下一次");
+    let (local_len, total_len, _) = trusted_pair(&target).expect("断在半路也得能接上下一次");
     assert_eq!((local_len, total_len), (200, TOTAL as u64));
 
     // 第二趟：服务器按 `bytes=200-` 补剩下的 800 字节。
@@ -391,7 +462,7 @@ fn a_416_with_a_matching_total_is_not_a_failure() {
     assert_eq!(outcome.resumed_from, None);
     // 已下完的这对原样留着：解密（#9）要用的就是它。
     assert_eq!(part_bytes(&target).expect("part"), whole());
-    assert!(resumable(&target).is_some());
+    assert!(trusted_pair(&target).is_some());
     cleanup(&dir);
 }
 
@@ -429,6 +500,65 @@ fn a_416_with_a_different_total_redoes_the_file() {
 }
 
 // ---------------------------------------------------------------------------
+// 退回整份的其余形态：#2 点名「不能用来续传」的那几种响应
+// ---------------------------------------------------------------------------
+
+/// `206` 却没带 `Content-Range`（#2：这个响应不能用来续传）：丢掉它、作废旧数据，再发一次
+/// 从 0 的请求 —— 这一次调用里唯一允许的第二次请求。
+#[test]
+fn a_206_without_a_range_header_redoes_the_file() {
+    let dir = sandbox("206-no-range-header");
+    let target = target_in(&dir);
+    seed_staged(&target, 200, TOTAL, Some("\"v1\""), KEY);
+    let (url, server) = stream_server(vec![
+        answered("206 Partial Content", &["ETag: \"v1\""], &whole()[200..]),
+        answered("200 OK", &["ETag: \"v2\""], &whole()),
+    ]);
+
+    let outcome = download_staged(&url, KEY, &target, &[]).expect("退回整份");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 2, "丢掉带不上的 206 之后才补一次整份");
+    assert_eq!(outcome.status, 200);
+    assert_eq!(outcome.resumed_from, None);
+    assert_eq!(
+        part_bytes(&target).expect("重下的文件"),
+        one_shot_bytes(),
+        "这一档的产出也要与一次性整份逐字节相同"
+    );
+    cleanup(&dir);
+}
+
+/// `416` 的两种「读不到我们要的那个总长」形态：没带范围头，以及带的是闭区间（#2 只认
+/// `*/N`）。两种都按删旧重下处理 —— 不凭一个不推荐的头宣布文件已经完整。
+#[test]
+fn a_416_that_does_not_carry_the_total_redoes_the_file() {
+    const NO_HEADER: [&str; 0] = [];
+    const CLOSED_RANGE: [&str; 1] = ["Content-Range: bytes 0-999/1000"];
+    for (label, headers) in [
+        ("416 没带范围头", &NO_HEADER[..]),
+        ("416 带的是闭区间", &CLOSED_RANGE[..]),
+    ] {
+        let dir = sandbox("416-no-total");
+        let target = target_in(&dir);
+        seed_staged(&target, TOTAL, TOTAL, Some("\"v1\""), KEY);
+        let (url, server) = stream_server(vec![
+            response("416 Range Not Satisfiable", headers, Some(0), b""),
+            answered("200 OK", &[], &whole()),
+        ]);
+
+        let outcome = download_staged(&url, KEY, &target, &[]).expect("退回整份");
+        let requests = seen(&server);
+
+        assert_eq!(requests.len(), 2, "{label}");
+        assert_eq!(outcome.status, 200, "{label}");
+        assert_eq!(outcome.transferred, TOTAL as u64, "{label}");
+        assert_eq!(part_bytes(&target).expect("重下的文件"), whole(), "{label}");
+        cleanup(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 「能不能修」那张表：没下完的文件与记录的去留
 // ---------------------------------------------------------------------------
 
@@ -449,7 +579,7 @@ fn an_auth_failure_keeps_the_staged_bytes() {
     let requests = seen(&server);
     assert_eq!(requests.len(), 1, "网络类失败第一次就返回，库内不重试");
     assert_eq!(part_bytes(&target).expect("留着"), whole()[..200]);
-    assert!(resumable(&target).is_some(), "留着的那对还得接得上");
+    assert!(trusted_pair(&target).is_some(), "留着的那对还得接得上");
     cleanup(&dir);
 }
 
@@ -465,7 +595,33 @@ fn an_unknown_failure_keeps_the_staged_bytes() {
     assert!(error.to_string().contains("status 503"), "{error}");
     assert_eq!(seen(&server).len(), 1, "状态码本身不是「再试一次」的理由");
     assert_eq!(part_bytes(&target).expect("留着"), whole()[..200]);
-    assert!(resumable(&target).is_some());
+    assert!(trusted_pair(&target).is_some());
+    cleanup(&dir);
+}
+
+/// 连不上（一次响应都没拿到）：第一次就返回，旧的那对一个字节都不动，库内也不自己重试。
+/// 「不重试」这条是靠计数断的 —— 假服务器每接受一个连接就记一次，答话之前先把连接丢掉。
+#[test]
+fn a_transport_failure_returns_at_once_and_keeps_the_pair() {
+    let dir = sandbox("transport-fail");
+    let target = target_in(&dir);
+    seed_staged(&target, 200, TOTAL, Some("\"v1\""), KEY);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let url = refusing_server(Arc::clone(&attempts));
+
+    download_staged(&url, KEY, &target, &[]).expect_err("连不上就是失败");
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "网络类失败第一次就返回给调用方，库内不数次数也不重试"
+    );
+    assert_eq!(
+        part_bytes(&target).expect("旧字节一个都不动"),
+        whole()[..200]
+    );
+    let (local_len, total_len, _) = trusted_pair(&target).expect("断在这儿得能接上下一次");
+    assert_eq!((local_len, total_len), (200, TOTAL as u64));
     cleanup(&dir);
 }
 
@@ -550,8 +706,31 @@ fn a_capped_range_is_kept_for_the_next_attempt() {
     assert!(error.to_string().contains("did not complete"), "{error}");
     assert_eq!(seen(&server).len(), 1);
     assert_eq!(part_bytes(&target).expect("留着"), whole()[..400]);
-    let (local_len, total_len, _) = resumable(&target).expect("留着的那对要接得上");
+    let (local_len, total_len, _) = trusted_pair(&target).expect("留着的那对要接得上");
     assert_eq!((local_len, total_len), (400, TOTAL as u64));
+    cleanup(&dir);
+}
+
+/// 整份那一档断在半路（`200` 只给了一半）：留下的字节仍是文件的前缀，记录按磁盘的真实长度
+/// 对齐。代价是总长只能按已交付的算（`200` 没有范围事实）—— 服务器既然不理范围请求，下一次
+/// 照样是整份重写；这条用例钉的是「半截不被冒充成完整的一份」。
+#[test]
+fn a_half_delivered_full_response_keeps_the_prefix() {
+    let dir = sandbox("200-half");
+    let target = target_in(&dir);
+    let (url, server) = stream_server(vec![response(
+        "200 OK",
+        &["ETag: \"v1\""],
+        Some(TOTAL),
+        &whole()[..400],
+    )]);
+
+    let error = download_staged(&url, KEY, &target, &[]).expect_err("半份不是成功");
+    assert!(error.to_string().contains("interrupted"), "{error}");
+    assert_eq!(seen(&server).len(), 1, "断流不自己重试");
+    assert_eq!(part_bytes(&target).expect("留着"), whole()[..400]);
+    let (local_len, total_len, _) = trusted_pair(&target).expect("记录要对得上磁盘上的真实长度");
+    assert_eq!((local_len, total_len), (400, 400));
     cleanup(&dir);
 }
 
@@ -565,6 +744,11 @@ fn a_held_lock_is_reported_without_waiting() {
     let dir = sandbox("lock-busy");
     let target = target_in(&dir);
     let paths = staged_paths(&target).expect("staged paths");
+    // 目录里再留一对别人的过期暂存：清扫排在取锁之后，所以撞锁的这一次不该动它。
+    let stale = dir.join("old.m4a");
+    seed_staged(&stale, 200, TOTAL, Some("\"v1\""), KEY);
+    let stale_paths = staged_paths(&stale).expect("staged paths");
+    age_out_pair(&stale_paths);
     // 用同一个名字另开一个句柄占住锁：这就是「另一个进程」在本机上的等价物。打开方式与
     // `acquire_lock` 一致（有写权限才锁得住，且不截断）。
     let held = std::fs::OpenOptions::new()
@@ -584,11 +768,17 @@ fn a_held_lock_is_reported_without_waiting() {
         "等不到锁就不该把请求发出去（不等待）"
     );
     assert_eq!(part_bytes(&target), None, "撞锁时一个字节都不该写");
+    assert!(
+        part_bytes(&stale).is_some() && stale_paths.record.exists(),
+        "顺带的清扫排在取锁之后：没拿到锁就不该动别的目标"
+    );
 
     drop(held);
     let outcome = download_staged(&url, KEY, &target, &[]).expect("放锁后就该下得动");
     assert_eq!(outcome.on_disk, TOTAL as u64);
     assert_eq!(part_bytes(&target).expect("part"), whole());
+    // 同一对过期的暂存，拿到锁之后就被清掉了 —— 顺序（取锁 → 清扫）两头都钉住。
+    assert_eq!(part_bytes(&stale), None);
     cleanup(&dir);
 }
 
@@ -624,6 +814,68 @@ fn two_concurrent_downloads_of_one_target_leave_a_correct_file() {
     cleanup(&dir);
 }
 
+/// 正在写 `.part` 的那段时间：锁文件在下载手里（AC5「所有读写都在锁下」），而**数据文件本身
+/// 没有被锁** —— 另一个句柄读得动它，也能为它取到独占锁。#2 特意规定不锁 `.part`：Windows 的
+/// 锁是强制锁，锁住数据文件会把别的进程连读都挡掉。
+#[test]
+fn a_data_file_stays_readable_and_lockable_while_the_lock_is_held() {
+    let dir = sandbox("part-not-locked");
+    let target = target_in(&dir);
+    let paths = staged_paths(&target).expect("staged paths");
+    let (hit_tx, hit_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    // 正文分两段发：头一截之后卡住，此时 `.part` 正开在下载那一侧手里。
+    let head = response(
+        "206 Partial Content",
+        &["Content-Range: bytes 0-999/1000", "ETag: \"v1\""],
+        Some(TOTAL),
+        &whole()[..200],
+    );
+    let url = body_split_server(head, whole()[200..].to_vec(), hit_tx, go_rx);
+
+    let worker_target = target.clone();
+    let worker_url = url.clone();
+    let worker = thread::spawn(move || download_staged(&worker_url, KEY, &worker_target, &[]));
+    hit_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("正文头一截已经发出");
+    wait_until_part_created(&paths);
+
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&paths.lock)
+        .expect("open lock probe");
+    match probe.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        // 拿到锁或报了别的错都算失败：这条断的是「锁确实在这一次下载手里」。
+        other => panic!("写 .part 期间 .part.lock 应在下载手里，实际是 {other:?}"),
+    }
+    drop(probe);
+
+    // 数据文件：读得动，也锁得上 —— 后一条才是「没被谁锁住」的证据（Linux 的 flock 是建议锁，
+    // 只靠「读得动」在这一档没有牙）。开成读写句柄：只读句柄去 try_lock 在 Windows 上不算数。
+    let mut data = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.part)
+        .expect("打开 .part 不该被挡");
+    let mut peek = Vec::new();
+    data.read_to_end(&mut peek).expect("读 .part 不该被挡");
+    if let Err(err) = data.try_lock() {
+        panic!("#2 规定不锁 .part 本身，可它现在锁不上：{err:?}");
+    }
+    drop(data);
+
+    let _ = go_tx.send(());
+    let outcome = worker.join().expect("工作线程").expect("补齐剩下的正文");
+    assert_eq!(outcome.transferred, TOTAL as u64);
+    assert_eq!(part_bytes(&target).expect("产出"), whole());
+    cleanup(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // #7 交给 #8 的义务：清扫排在取记录之前
 // ---------------------------------------------------------------------------
@@ -635,15 +887,7 @@ fn expired_staging_of_this_target_is_purged_before_the_record_is_read() {
     let dir = sandbox("purge-own");
     let target = target_in(&dir);
     seed_staged(&target, 200, TOTAL, Some("\"v1\""), KEY);
-    let paths = staged_paths(&target).expect("staged paths");
-    let eight_days_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
-    for path in [&paths.part, &paths.record] {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("open for mtime");
-        file.set_modified(eight_days_ago).expect("set_modified");
-    }
+    age_out_pair(&staged_paths(&target).expect("staged paths"));
     let (url, server) = stream_server(vec![answered("200 OK", &[], &whole())]);
 
     let outcome = download_staged(&url, KEY, &target, &[]).expect("过期暂存被清掉后照样能下");
@@ -671,14 +915,7 @@ fn expired_staging_of_another_target_is_purged_on_the_way() {
     let stale = dir.join("old.m4a");
     seed_staged(&stale, 200, TOTAL, Some("\"v1\""), KEY);
     let stale_paths = staged_paths(&stale).expect("staged paths");
-    let eight_days_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
-    for path in [&stale_paths.part, &stale_paths.record] {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("open for mtime");
-        file.set_modified(eight_days_ago).expect("set_modified");
-    }
+    age_out_pair(&stale_paths);
     let target = target_in(&dir);
     let (url, _) = stream_server(vec![answered("200 OK", &[], &whole())]);
 
