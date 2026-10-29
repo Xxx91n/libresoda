@@ -35,7 +35,9 @@
 | `DecryptAudio` / `extractKey` / `decryptSpadeInner` | `crypto::{decrypt_audio, extract_key, decrypt_spade_inner}` |
 | （上游无对应）| `crypto::{decrypt_stream, decrypt_stream_with_auth}`：边读边解边写，输出与 `decrypt_audio*` 逐字节一致，峰值内存从「2×整曲」降到「单样本」 |
 | （上游无对应）| `http::get_reader`：返回流式读取器，供整曲下载使用（上游 `utils.Get` 总是整块读入） |
+| （上游无对应）| `http::get_raw`：一次 GET 把状态码、响应头、流式读取器一并交回，**4xx/5xx 不当错误**（ureq 2.x 没有这种开关，靠匹配它的 `Error::Status` 变体，响应头就随那个变体回来）。`pub(crate)`，只给下面的取数层用 |
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
+| （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -77,6 +79,7 @@
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
 | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+| （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内，#2 说的「新的集成测试文件」由 #8 的端到端下载用例承担 |
 
 ## 与上游的实现差异
 
@@ -101,6 +104,39 @@
   - **可见性（2026-10-28 定）**：`resume` 保持 `pub(crate)`。铁律 2 例外的出口是「出现外部
     调用方」而不是「口径定稿」——A 定稿只说明规则不再变，不代表该对外承诺；`resume` 是下载
     路径的内部件，将来若真有消费方要公开，公开前在这里记原因。
+
+* **断点续传的取数层（`soda::fetch` 加 `http::get_raw`，上游无对应）**：续传要按这次响应的状态码
+  分支，而 `416` 的判断依据就在它的响应头里，所以这一层必须能在 4xx/5xx 时拿到状态码与响应头，
+  不能折成一句错误文本。上游 `utils/request.go` 是「非 2xx 即错」的写法，给不了这个；ureq 2.x
+  也没有把状态码当正常响应的开关，于是 `http::get_raw` 自己匹配 `Error::Status`，把随它带回来的
+  `Response` 当正常响应用（状态码、响应头、流式 body 一个不丢），`fetch::fetch_range` 在它之上
+  拼 `Range: bytes={offset}-` 并交回三个事实。
+  - **只取数不判断**：范围头交回的就是 `resume::ContentRange`，「能不能接上」仍然只在 `resume`
+    那一处；`If-Range` 不由这层拼，走 `options` 透传（#2 定它只作「省一次白下载」的优化）。
+  - **可见性（沿用上面 #5 的口径）**：`soda::fetch` 与 `http::get_raw` 都保持 `pub(crate)`。
+    这不是把铁律 2 的例外再扩一格：取数层交回的类型就是那个不外见的 `ContentRange`，公开它等于
+    绕过 #5 把范围头规则端出去，而且它也没有外部调用方（消费方是 #8 的下载主路径）。出口同一条：
+    出现外部调用方时再评估，并在这里记原因。实现票
+    [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级
+    [`#2`](https://github.com/sodahub-org/libresoda/issues/2)。
+  - **交给 #8 的三条边界**（都写在取数层的注释里：前两条在 `RangeResponse` 的字段上，
+    重定向那条在 `fetch_range` 的函数注释上；这里汇总以免重新发现）：
+    状态码是 4xx/5xx 时 `reader` 读出的是**错误页**而不是音频片段；范围请求不带
+    `Accept-Encoding`（ureq 见请求里有 `Range` 就不加），服务器仍硬回 `Content-Encoding`
+    时字节已被它解压过、与 `Content-Range` 不符，而 ureq 会把 `Content-Encoding` 与
+    `Content-Length` 一并抹掉，这层检测不到 —— 兜底是 `Append` 那档比「实际写入字节数 vs
+    `末-首+1`」（`200` 那档没有范围事实可比，但它本来就走整份重写，接不上错前缀）；
+    ureq 每一跳重定向都剥掉 `Cookie`，`get_raw` 又不像 `get_full` 那样回 `final_url`，
+    所以这层看不出「被重定向去了别处」—— 剥 `Cookie` 是 ureq 的既有行为（`get_reader`
+    走的是同一套），但今天 `download_with_info` 发流只带 UA 不带 Cookie，
+    「带 Cookie 穿重定向」这条路是续传链才走到的。这条同时也是**这层交不回的事实**
+    （没有 `final_url`，其余响应头也不外传）：#8 真要在意重定向，就该给 `RangeResponse`
+    加字段并在这里记下原因，而不是在 #8 里猜。
+  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。真机结论（尤其 `416` 到底带不带
+    `bytes */N`）要等 #8 的联网用例，届时按仓库规矩进 `CLIENT-API.md` 的实测状态总表。
+  - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
+    `http::{get, get_full, post_json}`，既漏了既有的 `get_reader`，也没含本层新加的 `get_raw`。
+    改那行规则正文要单独取授权，先在这里记着，别把它当成「`get_raw` 是绕过 http 封装的私拉 HTTP」。
 
 ## 未移植项
 

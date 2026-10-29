@@ -168,11 +168,8 @@ fn audio_agent_with_timeouts(connect: Duration, read: Duration) -> ureq::Agent {
         .build()
 }
 
-fn get_reader_with_agent(
-    url: &str,
-    options: &[RequestOption],
-    agent: &ureq::Agent,
-) -> Result<Box<dyn Read>> {
+/// 用音频流那套超时发出一次 GET，并把公共头与调用方选项装上。
+fn build_audio_get(url: &str, options: &[RequestOption], agent: &ureq::Agent) -> ureq::Request {
     let merged = merge_options(options);
     let mut request = agent.get(url).set("User-Agent", DEFAULT_USER_AGENT);
     for (key, value) in merged.headers() {
@@ -182,8 +179,15 @@ fn get_reader_with_agent(
     if let Some(timeout) = merged.timeout {
         request = request.timeout(timeout);
     }
+    request
+}
 
-    let response = match request.call() {
+fn get_reader_with_agent(
+    url: &str,
+    options: &[RequestOption],
+    agent: &ureq::Agent,
+) -> Result<Box<dyn Read>> {
+    let response = match build_audio_get(url, options, agent).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(status, response)) => {
             let final_url = response.get_url().to_string();
@@ -195,6 +199,62 @@ fn get_reader_with_agent(
     };
 
     Ok(Box::new(response.into_reader()))
+}
+
+/// 一次 GET 拿回来的原始事实：状态码、响应头、还没读的响应体。
+pub(crate) struct RawResponse {
+    pub(crate) status: u16,
+    /// 响应头：名字统一小写。`ureq` 不去重 —— 同名写几行就有几项，但每项的值都是第一行的；
+    /// 读不成文本的头值整条不收（见 [`get_raw`]）。要拿全部 `Set-Cookie` 走 [`get_full`]。
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) reader: Box<dyn Read>,
+}
+
+impl RawResponse {
+    /// 按名字取响应头，大小写不敏感。
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// GET 请求，**4xx/5xx 也当正常响应返回**：状态码、响应头、响应体一个都不丢。
+///
+/// 断点续传要按状态码分支，`416` 的判断依据就在它的响应头里
+/// （[`sodahub-org/libresoda#6`](https://github.com/sodahub-org/libresoda/issues/6)）。
+/// ureq 2.x 没有 `or_any_status()` 那样的开关，把非 2xx 一律包成
+/// `Error::Status(code, response)`，所以这里匹配那个变体、把随它带回来的
+/// `Response` 当正常响应用。
+///
+/// 与 [`get_reader`] 共用音频流超时，但**不**像它那样把状态码折成错误文本。
+pub(crate) fn get_raw(url: &str, options: &[RequestOption]) -> Result<RawResponse> {
+    let agent = audio_agent();
+    let response = match build_audio_get(url, options, &agent).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(err) => return Err(SodaError::http(err.to_string())),
+    };
+    let status = response.status();
+    // 只收能读成文本的头：读不懂的 `Content-Range` 本来也不能当范围信息用，
+    // 交给上层按「没带这个头」处理。`headers_names()` 不去重（同名几行返几个名字），
+    // 而 `Response::header` 只认第一个匹配，所以按名收敛成第一行的值就在这里发生。
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name, value.to_string()))
+        })
+        .collect();
+    Ok(RawResponse {
+        status,
+        headers,
+        reader: response.into_reader(),
+    })
 }
 
 /// POST 请求，返回响应体（对应上游 `utils.Post`）。
