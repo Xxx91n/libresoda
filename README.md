@@ -212,6 +212,10 @@ src/
     browser.rs       外部请求器（可选：交给 Chromium 签名页发请求）
     signature.rs     应用级签名（HttpSignature / CommandSignature / 抓包回填）
     stream.rs        整曲取流诊断（整曲/试听/签名链）
+    resume.rs        续传判断纯函数（本地字节 + 记录 + 这次响应 → 动作；不对外）
+    fetch.rs         续传取数层（一次范围请求交回状态码 / 范围头 / ETag；不对外）
+    part_record.rs   {目标}.part.meta 记录文件（原子写、一起作废、7 天清扫；不对外）
+    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；#9 才对外）
     feed.rs          推荐流 / 听歌模式（类型化模型 + 原始 JSON）
     playlist_edit.rs 歌单写操作（创建/改名/删除/加删歌/排序/敏感词）
     collection.rs    收藏（单曲/歌单/专辑/艺人）与「我收藏的」列表
