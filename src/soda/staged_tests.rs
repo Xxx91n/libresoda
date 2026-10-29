@@ -1,14 +1,15 @@
 //! 暂存下载主路径（`staged`）的端到端用例（票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)）。
 //!
 //! 这里是 `staged` 的**兄弟**模块（声明在 `soda/mod.rs`），所以只看得见 `pub(crate)` 的入口，
-//! 够不到那条路径的私有件：断言只能落在外部可见的行为上（落盘的字节、记录在不在、交回的事实、
-//! 线上真的发了什么请求），这正是 #2「只断言外部可见行为」的机械保证。
+//! 够不到那条路径的私有件：断言只能落在外部可见的东西上 —— 落盘的字节与这对记录的去留、交回的
+//! 五个事实、错误文本、线上真的发了几次什么请求。这正是 #2「只断言外部可见行为」的机械保证。
 //!
 //! 假服务器按 #2 的「测试决定」用本地 `TcpListener` 手写，不引 mock 库；三种形态（`206` /
 //! 忽略范围的 `200` / `416`）都各有用例，产出与一次性整份下载逐字节对比。
 
 use super::part_record::{load_record, staged_paths, write_record, PartRecord, StagedPaths};
-use super::staged::download_staged;
+use crate::error::Result;
+use crate::soda::staged::{download_staged, StagedDownload};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -184,6 +185,23 @@ fn seen(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     seen.lock().expect("seen").clone()
 }
 
+/// 在另一条线程里跑一次暂存下载，并给这次调用一个时限。
+///
+/// 为什么要包一层：库里一旦改成「等锁」或「自己重试」，直接调用的用例是**永远卡住**而不是失败，
+/// CI 只会跑到超时。「不等待」（#2 的请求次数与重试边界、#8 验收第 3/4 条）这条得能被测出来。
+fn call_with_deadline(url: &str, target: &Path, within: Duration) -> Result<StagedDownload> {
+    let (tx, rx) = mpsc::channel();
+    let url = url.to_string();
+    let target = target.to_path_buf();
+    thread::spawn(move || {
+        let _ = tx.send(download_staged(&url, KEY, &target, &[]));
+    });
+    match rx.recv_timeout(within) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("这次调用没在时限里返回：库里不该等锁、也不该自己重试"),
+    }
+}
+
 /// 一次性整份下载的基准字节：另起一个只会回 `200` 整份的服务器，走今天发流用的那条路
 /// （`http::get_reader`），拿它当「产出该等于什么」。
 fn one_shot_bytes() -> Vec<u8> {
@@ -294,9 +312,41 @@ fn fresh_download_survives_a_server_that_ignores_the_range() {
 
     assert_eq!(requests.len(), 1);
     assert_eq!(outcome.status, 200);
-    // 200 没有范围事实：总长就是交付的字节数。
-    assert_eq!(outcome.total_len, outcome.on_disk);
+    // 200 没有范围事实：总长就是交付的字节数（另一半形状 —— 只给一半的 200 —— 由
+    // `a_half_delivered_full_response_keeps_the_prefix` 钉住）。
+    assert_eq!(outcome.transferred, TOTAL as u64);
+    assert_eq!(outcome.on_disk, TOTAL as u64);
+    assert_eq!(outcome.total_len, TOTAL as u64);
     assert_eq!(part_bytes(&target).expect("part"), whole());
+    cleanup(&dir);
+}
+
+/// 一个既不声明 `Content-Length` 也不是 chunked 的 `200`：HTTP/1.0 口径的「读到 EOF 就是读完」，
+/// 这一层拿不到任何能判「它其实被截短了」的事实，只能按读完算 —— 与今天的一次性整份下载
+/// （`http::get_reader` + `io::copy`）同一个口径，不是这条路径新开的口子。
+///
+/// 这条用例钉的是**已知限制的形状**：给了多少就记多少，不会凭空多出长度。限制本身记在
+/// `docs/PORTING.md`；它不会拼出「长度自洽、内容错」的文件（#2 用户故事 8），因为这种服务器
+/// 本来就不理范围请求，下一次仍是整份重下。
+#[test]
+fn a_length_less_full_response_is_counted_as_complete_at_eof() {
+    let dir = sandbox("200-no-length");
+    let target = target_in(&dir);
+    // `declared = None`：头部既没有 Content-Length 也不分块，正文 600 字节之后连接关闭。
+    let (url, server) = stream_server(vec![response(
+        "200 OK",
+        &["ETag: \"v1\""],
+        None,
+        &whole()[..600],
+    )]);
+
+    let outcome = download_staged(&url, KEY, &target, &[]).expect("EOF 在这一口径下就是读完");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(outcome.transferred, 600);
+    assert_eq!(outcome.total_len, 600, "没有范围事实时总长按交付的字节记");
+    assert_eq!(part_bytes(&target).expect("part"), whole()[..600]);
     cleanup(&dir);
 }
 
@@ -583,20 +633,34 @@ fn an_auth_failure_keeps_the_staged_bytes() {
     cleanup(&dir);
 }
 
-/// 认不出的失败（`5xx` 与不在表里的状态码）：按 #2 一律保留。
+/// 认不出的失败按 #2 一律保留：`5xx`（临时，修得了）与表里没点名的 `4xx`（429 限流、418
+/// 这种根本不在表上的）走的是同一格。`403` 那一档另有一条用例（鉴权失败也是保留）。
 #[test]
 fn an_unknown_failure_keeps_the_staged_bytes() {
-    let dir = sandbox("unknown-keeps");
-    let target = target_in(&dir);
-    seed_staged(&target, 200, TOTAL, Some("\"v1\""), KEY);
-    let (url, server) = stream_server(vec![answered("503 Service Unavailable", &[], b"later")]);
+    for (status_line, code) in [
+        ("503 Service Unavailable", "503"),
+        ("429 Too Many Requests", "429"),
+        ("418 I'm a teapot", "418"),
+    ] {
+        let dir = sandbox("unknown-keeps");
+        let target = target_in(&dir);
+        seed_staged(&target, 200, TOTAL, Some("\"v1\""), KEY);
+        let (url, server) = stream_server(vec![answered(status_line, &[], b"not the stream")]);
 
-    let error = download_staged(&url, KEY, &target, &[]).expect_err("503 是失败");
-    assert!(error.to_string().contains("status 503"), "{error}");
-    assert_eq!(seen(&server).len(), 1, "状态码本身不是「再试一次」的理由");
-    assert_eq!(part_bytes(&target).expect("留着"), whole()[..200]);
-    assert!(trusted_pair(&target).is_some());
-    cleanup(&dir);
+        let error = download_staged(&url, KEY, &target, &[]).expect_err("认不出的状态码也是失败");
+        assert!(error.to_string().contains(code), "{error}");
+        assert_eq!(seen(&server).len(), 1, "状态码本身不是「再试一次」的理由");
+        assert_eq!(
+            part_bytes(&target).expect("留着"),
+            whole()[..200],
+            "{status_line}"
+        );
+        assert!(
+            trusted_pair(&target).is_some(),
+            "{status_line} 之后还得接得上"
+        );
+        cleanup(&dir);
+    }
 }
 
 /// 连不上（一次响应都没拿到）：第一次就返回，旧的那对一个字节都不动，库内也不自己重试。
@@ -711,9 +775,11 @@ fn a_capped_range_is_kept_for_the_next_attempt() {
     cleanup(&dir);
 }
 
-/// 整份那一档断在半路（`200` 只给了一半）：留下的字节仍是文件的前缀，记录按磁盘的真实长度
-/// 对齐。代价是总长只能按已交付的算（`200` 没有范围事实）—— 服务器既然不理范围请求，下一次
-/// 照样是整份重写；这条用例钉的是「半截不被冒充成完整的一份」。
+/// 整份那一档断在半路（`200` 声明了 1000 个字节却只给 400）：ureq 对没读满的 `Content-Length`
+/// 报错，所以这半截被当失败交回，留下的字节仍是文件的前缀，记录按磁盘的真实长度对齐。
+/// 代价是总长只能按已交付的算（`200` 没有范围事实）—— 服务器既然不理范围请求，下一次照样整份
+/// 重写。这条钉的是「**声明了长度**的半截不会被当成完整的一份」；没声明长度那一档只能按 EOF
+/// 算，形状与理由见 `a_length_less_full_response_is_counted_as_complete_at_eof`。
 #[test]
 fn a_half_delivered_full_response_keeps_the_prefix() {
     let dir = sandbox("200-half");
@@ -761,7 +827,7 @@ fn a_held_lock_is_reported_without_waiting() {
     held.try_lock().expect("try_lock");
 
     let (url, server) = stream_server(vec![answered("200 OK", &[], &whole())]);
-    let error = download_staged(&url, KEY, &target, &[]).expect_err("撞锁要报错");
+    let error = call_with_deadline(&url, &target, Duration::from_secs(10)).expect_err("撞锁要报错");
     assert!(error.to_string().contains("another download"), "{error}");
     assert!(
         seen(&server).is_empty(),
@@ -799,7 +865,7 @@ fn two_concurrent_downloads_of_one_target_leave_a_correct_file() {
         .recv_timeout(Duration::from_secs(10))
         .expect("第一路已经发出了请求");
 
-    let second = download_staged(&url, KEY, &target, &[]);
+    let second = call_with_deadline(&url, &target, Duration::from_secs(10));
     let _ = go_tx.send(());
     let outcome = first.join().expect("第一路的线程").expect("第一路下完");
 
@@ -814,9 +880,9 @@ fn two_concurrent_downloads_of_one_target_leave_a_correct_file() {
     cleanup(&dir);
 }
 
-/// 正在写 `.part` 的那段时间：锁文件在下载手里（AC5「所有读写都在锁下」），而**数据文件本身
-/// 没有被锁** —— 另一个句柄读得动它，也能为它取到独占锁。#2 特意规定不锁 `.part`：Windows 的
-/// 锁是强制锁，锁住数据文件会把别的进程连读都挡掉。
+/// `.part` 已经开在下载那一侧手里、还没写完的这段时间：锁文件被这次下载占着（验收第 5 条
+/// 「数据文件的所有读写都在锁下」），而**数据文件本身没有被锁** —— 另一个句柄读得动它，也能为
+/// 它取到独占锁。#2 特意规定不锁 `.part`：Windows 的锁是强制锁，锁住数据文件会把别的进程连读都挡掉。
 #[test]
 fn a_data_file_stays_readable_and_lockable_while_the_lock_is_held() {
     let dir = sandbox("part-not-locked");
@@ -824,7 +890,8 @@ fn a_data_file_stays_readable_and_lockable_while_the_lock_is_held() {
     let paths = staged_paths(&target).expect("staged paths");
     let (hit_tx, hit_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel();
-    // 正文分两段发：头一截之后卡住，此时 `.part` 正开在下载那一侧手里。
+    // 正文分两段发：头一截之后卡住。头一截只有 200 字节，比 `STAGE_CHUNK` 小，所以卡住的那段
+    // 时间下载那一侧一个写系统调用都没发出 —— 下面的探针去读、去锁 `.part` 都不与它抢。
     let head = response(
         "206 Partial Content",
         &["Content-Range: bytes 0-999/1000", "ETag: \"v1\""],
