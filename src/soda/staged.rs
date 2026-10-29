@@ -149,10 +149,12 @@ pub(crate) fn download_staged(
             total_len: offset,
             status: first.status,
         }),
-        Plan::Append { offset } => write_leg(first, target, &paths, offset, true, key_bytes),
+        Plan::Append { offset } => write_leg(first, target, &paths, offset, key_bytes),
         Plan::Rewrite => {
+            // 这里的删除失败要传出去：下一句就要建 `.part`，旧数据还在原地的话写出来的就是
+            // 「接在没人认领的字节后面」。`fail_on_status` 那一档反过来吞掉，理由记在那函数上。
             discard_parts(target)?;
-            write_leg(first, target, &paths, 0, false, key_bytes)
+            write_leg(first, target, &paths, 0, key_bytes)
         }
         Plan::Refetch => {
             discard_parts(target)?;
@@ -161,7 +163,7 @@ pub(crate) fn download_staged(
             if !starts_at_zero(&again) {
                 return Err(fail_on_status(target, again.status));
             }
-            write_leg(again, target, &paths, 0, false, key_bytes)
+            write_leg(again, target, &paths, 0, key_bytes)
         }
     }
 }
@@ -175,7 +177,8 @@ fn starts_at_zero(response: &RangeResponse) -> bool {
 
 /// 把一次响应的正文写进 `.part`，并让记录与磁盘的真实长度对上。
 ///
-/// `base` 是写之前 `.part` 已有的字节数（追加那档），`append` 决定是接着写还是清空重写。
+/// `base` 是写之前 `.part` 已有的字节数：非零就是接在它后面追加，为零就是清空重写（没有旧数据
+/// 时那个名字本来也不该被谁占着）。`resumed_from` 也由它决定，所以这两个数不能各说各话。
 /// 这次的 `Content-Range` 闭区间是**承诺**：交付比它多就作废（#6 记的「服务器违规压
 /// `Content-Encoding`，交回的字节被解压过」那条兜底），比它短且读完了也作废（服务器自己
 /// 前后不一致）；中途断（`Err`）不在此列，那是「断网接着补」的正常形态。
@@ -184,7 +187,6 @@ fn write_leg(
     target: &Path,
     paths: &StagedPaths,
     base: u64,
-    append: bool,
     key_bytes: &[u8],
 ) -> Result<StagedDownload> {
     let promised = response
@@ -195,7 +197,7 @@ fn write_leg(
     let total_hint = response.range.as_ref().map(|range| range.total);
     let etag = response.etag.as_deref();
 
-    let delivered = match pump_into_part(response.reader, &paths.part, append, promised) {
+    let delivered = match pump_into_part(response.reader, &paths.part, base > 0, promised) {
         Ok(delivered) => delivered,
         Err(PumpFail::Interrupted(error)) => {
             let text = error.to_string();
