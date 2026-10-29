@@ -4,10 +4,6 @@
 //! `Content-Range` 解析结果、`ETag`，外加一个还没读的响应体。
 //! **这里不含任何判断**：本地那段字节能不能接上，是 [`super::resume`] 的纯函数的事。
 
-// 整个模块都还没有非测试的调用方（消费方是 #8 的可续传下载主路径），所以按模块放行，
-// #8 接上后删掉这一行。`resume` 那边是「一部分已经活了、一部分还没」，才逐项标注。
-#![allow(dead_code)]
-
 use super::resume::{parse_content_range, ContentRange};
 use crate::error::{Result, SodaError};
 use crate::http::{get_raw, merge_options, RequestOption};

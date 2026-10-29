@@ -26,9 +26,6 @@
 //!
 //! 消费方是下载主路径（#8），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
-// 消费方（#8）尚未落地，先允许 dead_code；它接上后删掉下面的 allow。
-#![allow(dead_code)]
-
 use super::qr_login::md5_hex_upper;
 use crate::error::{Result, SodaError};
 use serde::{Deserialize, Serialize};
@@ -131,6 +128,11 @@ fn strong_etag(value: Option<&str>) -> String {
 /// 它回答的是「服务端这次的 validator 还是不是记录里那一个」，**不是** `If-Range` 的内容：
 /// 发 `If-Range` 要的是 `record.etag` 原值。#2 已经把 ETag 排除在「能不能接上」的判据之外，
 /// 所以 #8 完全可以不调这个函数；它存在是因为票面第 2 条规定了比较的口径。
+// #8 确实没调它，理由就是上面那条口径。票面第 2 条要的是「比较忽略大小写」这件事有实现、
+// 有用例，不是要下载路径拿它当判据；删掉它等于把那条验收改成「没实现」。
+// 留着的是一个人没用到的判据 —— 取舍记在 `docs/PORTING.md`，出现消费方（或决定改用 `If-Range`
+// 校验响应）时再评估。
+#[allow(dead_code)]
 pub(crate) fn etag_matches(recorded: &str, current: Option<&str>) -> bool {
     let recorded = strong_etag(Some(recorded));
     let current = strong_etag(current);
