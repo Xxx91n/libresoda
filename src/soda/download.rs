@@ -4,7 +4,7 @@
 //! 加密流（带 `play_auth`）在下载时本地解密。
 
 use super::quality::{is_lossless, is_preview, quality_rank, track_duration_seconds};
-use super::staged::DownloadStrategy;
+use super::staged::{DownloadStrategy, StagedDownload};
 use super::track::{
     best_from_video_model_with_preference, fetch_pc_track_v2, fetch_player_info, fetch_web_track_v2,
 };
@@ -272,7 +272,7 @@ fn download_with_strategy(
     song: &Song,
     output_path: &Path,
     strategy: DownloadStrategy,
-) -> Result<(DownloadInfo, DownloadReport)> {
+) -> Result<(DownloadInfo, StagedDownload)> {
     let info = get_download_info(soda, song)?;
     let url = info.url.trim();
     if url.is_empty() {
@@ -294,14 +294,7 @@ fn download_with_strategy(
         &options,
         strategy,
     )?;
-    let report = DownloadReport {
-        resumed_from: staged.resumed_from,
-        transferred: staged.transferred,
-        on_disk: staged.on_disk,
-        total_len: staged.total_len,
-        status: staged.status,
-    };
-    Ok((info, report))
+    Ok((info, staged))
 }
 
 /// 一次可续传下载交回的传输事实（[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的
@@ -344,8 +337,15 @@ pub struct DownloadReport {
 /// [`get_download_info`] 另取 —— 这份报告不携带「这次是不是试听片段」的标记（与
 /// [`download_with_info`] 的分工）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
-    download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)
-        .map(|(_, report)| report)
+    let (_, staged) =
+        download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
+    Ok(DownloadReport {
+        resumed_from: staged.resumed_from,
+        transferred: staged.transferred,
+        on_disk: staged.on_disk,
+        total_len: staged.total_len,
+        status: staged.status,
+    })
 }
 
 impl Soda {

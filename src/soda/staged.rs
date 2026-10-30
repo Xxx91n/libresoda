@@ -82,9 +82,9 @@ pub(crate) enum DownloadStrategy {
     Resumable,
 }
 
-/// 一次暂存下载交回的事实，全是外部可见的：磁盘上有什么、这次传了多少、服务器怎么答的。
-/// 对外的详细结果结构是 [`crate::soda::download::DownloadReport`]（`#[non_exhaustive]`），
-/// 这五个字段就是它的内部件。
+/// 一次暂存下载交回的事实，供 `DownloadReport`（`#[non_exhaustive]`）与两种策略使用。
+/// 旧策略不交报告，也不观察状态码（`status` 固定填 `200`，不会进入任何公开结果）；其余字段
+/// 照样按这次实际写入填写。
 #[derive(Debug)]
 pub(crate) struct StagedDownload {
     /// 从第几个字节接上的；没接上（整份重写、本来就完整、或本来就没旧数据）则为空。
@@ -97,7 +97,8 @@ pub(crate) struct StagedDownload {
     pub(crate) total_len: u64,
     /// 把字节交给调用方的那一次请求的状态码：追加与「`200` 用手上这一份重写」都是第 1 次，
     /// 只有作废旧数据后再发一次（`Refetch`）才是第 2 次的。`416` 判成已下完时一个字节都没写，
-    /// 交回的就是那次 `416`。
+    /// 交回的就是那次 `416`。旧策略用 `http::get_reader` 取流、不观察状态码，固定填 `200`
+    /// （它不交报告，这个值不对外）。
     pub(crate) status: u16,
 }
 
@@ -163,8 +164,9 @@ pub(crate) fn download_staged_to_file(
             if strategy == DownloadStrategy::Legacy {
                 // 取锁成功之后，旧策略「失败即删没下完的文件」：不管失败出在哪一段，都把本次
                 // 写下的 `.part`、记录与 `.dec.tmp` 清掉。删不掉也不改这次失败的性质（调用方拿到
-                // 的仍是原始错误），下一次同目标下载（旧策略开始前作废、可续传策略读记录时作废）
-                // 会把它收尾。取锁本身失败时什么暂存都没碰，不在这里处理。
+                // 的仍是原始错误），下一次同目标下载会重新处置它（旧策略开始前一律作废；可续传
+                // 策略只在记录与数据凑不成可信的一对时作废）。取锁本身失败时什么暂存都没碰，
+                // 不在这里处理。
                 let _ = discard_parts(target);
             }
             Err(error)

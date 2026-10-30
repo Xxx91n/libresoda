@@ -658,3 +658,63 @@ fn the_legacy_wrapper_removes_staging_after_a_delivery_failure() {
     assert!(!target.exists(), "交付失败后不该产出目标文件");
     cleanup(&dir);
 }
+
+/// 明文流（SEO 免费曲目，无 `play_auth`）也走旧策略：没有密钥时暂存的字节就是成品，
+/// 成功后暂存对不残留，仍然只有一次整份请求。
+#[test]
+fn the_legacy_wrapper_delivers_plaintext_streams() {
+    let dir = sandbox("legacy-plaintext");
+    let target = target_in(&dir);
+    let body = b"plain m4a bytes, no play_auth".to_vec();
+    let (url, server) = stream_server(vec![answered("200 OK", &[], &body)]);
+    let song = Song {
+        url: format!("{url}#auth="),
+        ..Default::default()
+    };
+
+    let info = Soda::new("")
+        .download_with_info(&song, &target)
+        .expect("明文流照样一次调用");
+
+    assert_eq!(info.play_auth, "");
+    assert_eq!(seen(&server).len(), 1);
+    assert_eq!(std::fs::read(&target).expect("输出文件"), body);
+    assert!(!part(&target).exists());
+    assert!(!record(&target).exists());
+    assert!(!dec_tmp(&target).exists());
+    cleanup(&dir);
+}
+
+/// 旧策略失败时保留调用方预存的旧目标。这是 #10 的有意差异（改动前会先截断再删，见
+/// `docs/PORTING.md`）：目标只在最后改名时被碰，失败的调用不再殃及它。钉住这条，免得以后
+/// 被当成「漏删」改回去。
+#[test]
+fn the_legacy_wrapper_keeps_a_pre_existing_target_on_failure() {
+    let dir = sandbox("legacy-keeps-target");
+    let target = target_in(&dir);
+    std::fs::write(&target, b"old target bytes").expect("plant old target");
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let (url, _) = stream_server(vec![response(
+        "200 OK",
+        &[],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("断流该报错");
+
+    assert!(
+        error.to_string().contains("staged download interrupted"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("旧目标还在"),
+        b"old target bytes"
+    );
+    assert!(!part(&target).exists() && !record(&target).exists() && !dec_tmp(&target).exists());
+    cleanup(&dir);
+}

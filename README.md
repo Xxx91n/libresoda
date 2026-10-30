@@ -36,7 +36,7 @@
 | 我收藏的歌单 / 专辑（列表） | ✅ **已打通** | `collection::collected_items`（`/luna/me/collection/mixed` + 重复 key `item_types`，参数与客户端一致：`count=500, item_types=[album, playlist]`）；实测 收藏前 0 条 → 收藏后 1 条且命中 → 取消后 0 条。注意：**空列表时服务端不返回 `mixed_collections` 字段**，`parse_mixed_collections` 会把这种情况当空数组 |
 | 歌单分类（编辑分类） | ⛔ 上游即未实现 | `playlist.go` |
 
-测试现状：**207 个离线用例**（库内单测 123 + 集成测试 84：合成 MP4 加解密往返、二维码
+测试现状：**209 个离线用例**（库内单测 123 + 集成测试 86：合成 MP4 加解密往返、二维码
 URL/摘要、签名提供者形状与鉴权头、抓包凭证解析、新接口的请求体/回包解析、续传链的判据与
 端到端下载）+ 4 个 doctest + **11 个 `#[ignore]` 联网用例**（VIP 无损下载/解密、缓存刷新、
 我的歌单、搜索、歌词、整曲取流诊断、QR 调试）+ 1 个库内真机范围探针（`fetch::range_probe`，
@@ -99,7 +99,7 @@ soda.download(&song, Path::new("/tmp/soda.m4a"))?;
 # Ok::<(), libresoda::SodaError>(())
 ```
 
-`soda.download` / `soda.download_with_info` 保留旧行为（不续传、失败即删），底下与
+`soda.download` / `soda.download_with_info` 保留旧策略（不续传、失败即删本次暂存），底下与
 `soda.download_resumable` 共用同一套实现；需要断点续传时用后者，它交回 `DownloadReport`
 （接上偏移 / 本次传输 / 磁盘累计 / 总长 / 状态码）。
 
