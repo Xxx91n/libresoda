@@ -19,6 +19,8 @@ pub(crate) struct RangeResponse {
     /// 要不要拿它记录、比较时是否忽略大小写、要不要拿它发 `If-Range`，都是记录文件（#7）
     /// 与调用方的事。一条相关的规矩：RFC 9110 §13.1.5 规定弱标记的 entity-tag **不能**进
     /// `If-Range`，服务端按强比较判定，弱的一律不成立 —— 那时服务器会回整份，旧数据白扔。
+    /// 2026-10-30 的一次真机测量里，这个边缘会校验 `If-Range`（拿过期值试，回 `200` 整份），
+    /// 而且这次响应根本没带 `ETag`；样本只有一个边缘，仍只把它当「省一次白下载」的优化。
     pub(crate) etag: Option<String>,
     /// 响应体读取器，尚未解密。不预分配、也不按响应里的任何长度开内存，由调用方边读边写盘。
     ///
@@ -423,21 +425,44 @@ mod range_probe {
                         kw
                     }
                 };
-                let song = soda
-                    .search(&keyword)
-                    .expect("search")
-                    .into_iter()
-                    .next()
-                    .expect("search returned no song");
-                song_track_id(&song)
+                let songs = match soda.search(&keyword) {
+                    Ok(songs) => songs,
+                    // 不印错误原文：取流层的错误可能带着签名 URL（AGENTS.md「安全与合规」）
+                    Err(_) => {
+                        eprintln!("search_failed");
+                        return;
+                    }
+                };
+                match songs.into_iter().next() {
+                    Some(song) => song_track_id(&song),
+                    None => {
+                        eprintln!("search_empty");
+                        return;
+                    }
+                }
             }
         };
-        let info = resolve_download_info(&soda, &track_id, None).expect("resolve download info");
-        assert!(!info.url.trim().is_empty(), "stream url is empty");
+        let info = match resolve_download_info(&soda, &track_id, None) {
+            Ok(info) => info,
+            Err(_) => {
+                eprintln!("resolve_failed");
+                return;
+            }
+        };
+        if info.url.trim().is_empty() {
+            eprintln!("resolve_empty_url");
+            return;
+        }
         let options = [RequestOption::new().header("User-Agent", USER_AGENT)];
 
         // 1) 从 0 起的范围请求：条件支持、范围头形状、强 ETag 是否在
-        let first = super::fetch_range(&info.url, 0, &options).expect("range 0");
+        let first = match super::fetch_range(&info.url, 0, &options) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("range0_fetch_error");
+                return;
+            }
+        };
         let first_total = first.range.as_ref().map(|range| range.total).unwrap_or(0);
         let etag = first.etag.clone();
         eprintln!(
@@ -464,7 +489,13 @@ mod range_probe {
         };
 
         // 2) 偏移等于总长：`416` 的范围头是 `bytes */N` 还是别的形态
-        let past_end = super::fetch_range(&info.url, expected_total, &options).expect("past end");
+        let past_end = match super::fetch_range(&info.url, expected_total, &options) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("past_end_fetch_error");
+                return;
+            }
+        };
         let total_only = past_end
             .range
             .as_ref()
@@ -488,7 +519,13 @@ mod range_probe {
             RequestOption::new().header("User-Agent", USER_AGENT),
             RequestOption::new().header("If-Range", "\"qishui-probe-stale\""),
         ];
-        let stale_range = super::fetch_range(&info.url, 0, &stale).expect("stale if-range");
+        let stale_range = match super::fetch_range(&info.url, 0, &stale) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("stale_if_range_fetch_error");
+                return;
+            }
+        };
         eprintln!(
             "if_range_stale: status={} honored={}",
             stale_range.status,
@@ -504,8 +541,13 @@ mod range_probe {
                     RequestOption::new().header("User-Agent", USER_AGENT),
                     RequestOption::new().header("If-Range", etag),
                 ];
-                let current_range =
-                    super::fetch_range(&info.url, 0, &current).expect("current if-range");
+                let current_range = match super::fetch_range(&info.url, 0, &current) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!("current_if_range_fetch_error");
+                        return;
+                    }
+                };
                 eprintln!(
                     "if_range_current: status={} served_range={}",
                     current_range.status,
@@ -518,8 +560,13 @@ mod range_probe {
                     RequestOption::new().header("User-Agent", USER_AGENT),
                     RequestOption::new().header("If-Range", etag),
                 ];
-                let retry_range =
-                    super::fetch_range(&info.url, expected_total, &retry).expect("retry 416");
+                let retry_range = match super::fetch_range(&info.url, expected_total, &retry) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!("retry_fetch_error");
+                        return;
+                    }
+                };
                 eprintln!(
                     "past_end_with_if_range: status={} total_only={}",
                     retry_range.status,
