@@ -2,7 +2,9 @@
 name = "libresoda"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.89 是 `std::fs::File::try_lock` 的稳定版本：续传的 `{目标}.part.lock` 用它的非阻塞独占内核锁
+# （#2 定了「进程结束时由内核释放」，自己用 create_new 造锁文件做不到）。理由记在 docs/PORTING.md。
+rust-version = "1.89"
 description = "Rust port of music-lib's soda (汽水音乐 / Soda Music) implementation: search, playlists, albums, lyrics, VIP-aware stream resolution and CENC/MP4 audio decryption."
 license = "AGPL-3.0-or-later"
 readme = "README.md"

@@ -654,7 +654,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// 十六进制解码（避免额外依赖）。
 pub fn hex_decode(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

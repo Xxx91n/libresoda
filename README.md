@@ -35,10 +35,11 @@
 | 我收藏的歌单 / 专辑（列表） | ✅ **已打通** | `collection::collected_items`（`/luna/me/collection/mixed` + 重复 key `item_types`，参数与客户端一致：`count=500, item_types=[album, playlist]`）；实测 收藏前 0 条 → 收藏后 1 条且命中 → 取消后 0 条。注意：**空列表时服务端不返回 `mixed_collections` 字段**，`parse_mixed_collections` 会把这种情况当空数组 |
 | 歌单分类（编辑分类） | ⛔ 上游即未实现 | `playlist.go` |
 
-测试现状：**82 个离线用例**（库内单测 29 + 集成测试 53：合成 MP4 加解密往返、二维码
-URL/摘要、签名提供者形状与鉴权头、抓包凭证解析、新接口的请求体/回包解析）+ 4 个 doctest
-+ **10 个 `#[ignore]` 联网用例**（VIP 无损下载/解密、缓存刷新、我的歌单、搜索、歌词、
-整曲取流诊断、QR 调试）。
+测试现状：**193 个离线用例**（库内单测 121 + 集成测试 72：合成 MP4 加解密往返、二维码
+URL/摘要、签名提供者形状与鉴权头、抓包凭证解析、新接口的请求体/回包解析、续传链的判据与
+端到端下载）+ 4 个 doctest + **11 个 `#[ignore]` 联网用例**（VIP 无损下载/解密、缓存刷新、
+我的歌单、搜索、歌词、整曲取流诊断、QR 调试）。这两个数会随用例增减而失真 —— 按模块的覆盖
+范围看 [`docs/PORTING.md`](docs/PORTING.md) 的测试对照表，那份是按形状写的，不按个数。
 
 ## 自写客户端接入
 
@@ -212,6 +213,10 @@ src/
     browser.rs       外部请求器（可选：交给 Chromium 签名页发请求）
     signature.rs     应用级签名（HttpSignature / CommandSignature / 抓包回填）
     stream.rs        整曲取流诊断（整曲/试听/签名链）
+    resume.rs        续传判断纯函数（本地字节 + 记录 + 这次响应 → 动作；不对外）
+    fetch.rs         续传取数层（一次范围请求交回状态码 / 范围头 / ETag；不对外）
+    part_record.rs   {目标}.part.meta 记录文件（原子写、一起作废、7 天清扫；不对外）
+    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；#9 才对外）
     feed.rs          推荐流 / 听歌模式（类型化模型 + 原始 JSON）
     playlist_edit.rs 歌单写操作（创建/改名/删除/加删歌/排序/敏感词）
     collection.rs    收藏（单曲/歌单/专辑/艺人）与「我收藏的」列表

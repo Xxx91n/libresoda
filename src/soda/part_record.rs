@@ -26,9 +26,6 @@
 //!
 //! 消费方是下载主路径（#8），所以整模块 `pub(crate)`，理由见 `docs/PORTING.md`。
 
-// 消费方（#8）尚未落地，先允许 dead_code；它接上后删掉下面的 allow。
-#![allow(dead_code)]
-
 use super::qr_login::md5_hex_upper;
 use crate::error::{Result, SodaError};
 use serde::{Deserialize, Serialize};
@@ -131,6 +128,11 @@ fn strong_etag(value: Option<&str>) -> String {
 /// 它回答的是「服务端这次的 validator 还是不是记录里那一个」，**不是** `If-Range` 的内容：
 /// 发 `If-Range` 要的是 `record.etag` 原值。#2 已经把 ETag 排除在「能不能接上」的判据之外，
 /// 所以 #8 完全可以不调这个函数；它存在是因为票面第 2 条规定了比较的口径。
+// #8 确实没调它，理由就是上面那条口径。票面第 2 条要的是「比较忽略大小写」这件事有实现、
+// 有用例，不是要下载路径拿它当判据；删掉它等于把那条验收改成「没实现」。
+// 留着的是一个人没用到的判据 —— 取舍记在 `docs/PORTING.md`，出现消费方（或决定改用 `If-Range`
+// 校验响应）时再评估。
+#[allow(dead_code)]
 pub(crate) fn etag_matches(recorded: &str, current: Option<&str>) -> bool {
     let recorded = strong_etag(Some(recorded));
     let current = strong_etag(current);
@@ -199,10 +201,9 @@ pub(crate) fn write_record(target: &Path, record: &PartRecord) -> Result<()> {
         std::fs::rename(&paths.record_tmp, &paths.record)?;
         Ok(())
     })();
-    written.map_err(|err| {
+    written.inspect_err(|_| {
         // 半截的临时文件删不掉也不影响正确性：下一次写会把它当残骸换掉
         let _ = std::fs::remove_file(&paths.record_tmp);
-        err
     })
 }
 
@@ -401,7 +402,8 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
 /// 用 `symlink_metadata`（lstat）而不是 `metadata`：跟着链接去 stat 会把
 /// `X.part -> /nowhere` 这种悬空链接读成「什么都没有」，于是扫目录删掉它配对的记录、链接却留下。
 ///
-/// 全模块只有这一处分类：`discard`、`load_record` 与扫目录都读它，不再各自发明一遍判型。
+/// 判型只有这一处：`discard`、`load_record` 与扫目录都读它，下载主路径（#8）要对齐记录时读的
+/// 也是同一个 `file_len` —— 不再各自发明一遍。
 enum Slot {
     /// 普通文件。`modified` 为 `None` 表示这个文件系统给不出 mtime。
     File {
@@ -441,7 +443,10 @@ fn slot_of(path: &Path) -> Result<Slot> {
 }
 
 /// 文件真实长度；不存在、或不是我们那种普通文件（链接、目录、管道）时给 `None`。
-fn file_len(path: &Path) -> Result<Option<u64>> {
+///
+/// 给 #8 的下载主路径也用（它出错时要把记录对齐到磁盘真实长度）：判型口径必须和这里读回的
+/// 那套一致，不能再开一处 `fs::metadata`。
+pub(crate) fn file_len(path: &Path) -> Result<Option<u64>> {
     Ok(match slot_of(path)? {
         Slot::File { len, .. } => Some(len),
         Slot::Link | Slot::Absent | Slot::Occupied => None,
