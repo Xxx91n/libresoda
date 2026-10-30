@@ -1164,7 +1164,6 @@ mod part_record_tests {
         std::fs::write(&paths.decrypted_tmp, b"half decrypted").expect("write dec temp");
         let orphan = dir.join("stranger.m4a.dec.tmp");
         std::fs::write(&orphan, b"not ours").expect("write orphan");
-        let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
         // 还年轻的一对、以及记录读不出来（认不出是我们的）的一对：旁边的 dec 残骸都不能动
         let young = dir.join("young.m4a");
         write_part(&young, 300);
