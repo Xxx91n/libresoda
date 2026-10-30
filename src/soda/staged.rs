@@ -1,11 +1,15 @@
-//! 可续传的暂存下载主路径（上游无对应；[`sodahub-org/libresoda#8`](https://github.com/sodahub-org/libresoda/issues/8)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
+//! 可续传的暂存下载主路径（上游无对应；票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、
+//! [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，上级
+//! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
 //!
 //! 下面裸写的 `#N` 都是 `sodahub-org/libresoda` 的 issue：`https://github.com/sodahub-org/libresoda/issues/N`。
 //!
-//! 这条路径只把**加密**字节落到 `{目标}.part`，并在旁边写好 `{目标}.part.meta`：断网后重来就
-//! 接着补，服务器不认范围请求就安全退回整份。解密输出与对外的详细结果结构属于 #9，旧下载函数
-//! 改成转调属于 #10。三个已落地的内部件在这里接上：[`super::part_record`] 管暂存名字与记录文件，
-//! [`super::fetch`] 管一次范围请求交回的事实，[`super::resume`] 管「这次响应能不能接上」的判断。
+//! 这条路径先把**加密**字节落到 `{目标}.part`，并在旁边写好 `{目标}.part.meta`：断网后重来就
+//! 接着补，服务器不认范围请求就安全退回整份。下完之后**在同一把锁下**单独走一遍解密，写到同目录
+//! 的 `{目标}.dec.tmp`，成功后改名到目标、再作废暂存对。对外的详细结果结构是
+//! [`crate::soda::download::DownloadReport`]；旧下载函数改成转调属于 #10。三个内部件在这里接上：
+//! [`super::part_record`] 管暂存名字与记录文件，[`super::fetch`] 管一次范围请求交回的事实，
+//! [`super::resume`] 管「这次响应能不能接上」的判断。
 //!
 //! 请求次数：一次调用最多 2 次，第 2 次只发生在协议退回整份时（#2 的请求次数边界）。库内**不
 //! 重试、不等待、不睡眠** —— 网络类失败第一次就返回给调用方，重试预算留在调用方。
@@ -26,29 +30,35 @@
 //! | 传输中断、磁盘满、写盘失败 | 保留 |
 //!
 //! 这一层只看流地址回的状态码：「无权益」是取流阶段（`resolve_download_info`）的结论，不在这里
-//! 判，所以 #2 用户故事 11 里那一档归 #9。
+//! 判。它在实现里兑现成**试听回退**（`Ok` + `is_preview`，见 `download::download_resumable`），
+//! 不是一次失败，所以处置表里没有「无权益就删」的格子；取流以错误形式失败时一律按「认不出的失败」
+//! 保留。
+//!
+//! 解密失败**不删** `.part`（#2 用户故事 12 / 实施决定）：加密数据完整就能只重跑解密。这与处置表
+//! 里「数据本身有问题 → 删除」不冲突 —— 那一格讲的是**交付的字节**与这次 `Content-Range` 不符，
+//! 不是本地解密这一步。成功改名到位之后才作废暂存对；作废失败只留下缓存垃圾，不影响交付。
 
-// 公开入口属于 #9：在那之前这条路径在库里还没有非测试的调用方，所以按模块放行。它消费的
-// `resume`/`fetch`/`part_record` 三处放行已经由本票删掉（被这里用到就算活了），只剩
-// `part_record::etag_matches` 那一格 —— 它留着的理由不是「等 #9」，写在那个函数上面。
-#![allow(dead_code)]
-
+use super::crypto::decrypt_stream;
 use super::fetch::{fetch_range, RangeResponse};
 use super::part_record::{
-    discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts, staged_paths,
-    write_record, PartRecord, StagedPaths,
+    append_suffix, discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts,
+    staged_paths, write_record, PartRecord, StagedPaths,
 };
 use super::resume::{decide_resume_action, ResumeAction, ResumeProbe};
 use crate::error::{Result, SodaError};
 use crate::http::RequestOption;
-use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// 一次读写的块大小：响应体不进内存（同 `download_with_info` 的流式做法）。
 const STAGE_CHUNK: usize = 64 * 1024;
 
+/// 解密输出的临时名后缀：`{目标}.dec.tmp`，与目标同目录（跨文件系统改名会退化成拷贝、失去原子性）。
+const DECRYPTED_SUFFIX: &str = ".dec.tmp";
+
 /// 一次暂存下载交回的事实，全是外部可见的：磁盘上有什么、这次传了多少、服务器怎么答的。
-/// 对外的详细结果结构（`#[non_exhaustive]`）属于 #9，这里先做内部件。
+/// 对外的详细结果结构是 [`crate::soda::download::DownloadReport`]（`#[non_exhaustive]`），
+/// 这五个字段就是它的内部件。
 #[derive(Debug)]
 pub(crate) struct StagedDownload {
     /// 从第几个字节接上的；没接上（整份重写、本来就完整、或本来就没旧数据）则为空。
@@ -85,16 +95,36 @@ enum PumpFail {
     Mismatch,
 }
 
-/// 对 `target` 旁边的 `{目标}.part` 发起一次可续传的暂存下载。
+/// 对 `target` 旁边的 `{目标}.part` 发起一次可续传的暂存下载，下完解密并改名到 `target`。
 ///
 /// `key_bytes` 必须是**解出来的 AES 密钥字节**（`crypto::extract_key(play_auth)` 再 `hex_decode`），
 /// 它的指纹写进记录，下次同目标同密钥才接得上；不能传 `play_auth` 串本身（#7 的
-/// [`PartRecord::new`] 同一条口径）。`options` 是调用方要上的头（UA / Cookie）；`If-Range` 由这里
-/// 按记录里的强 `ETag` 加上，调用方自己传的同名头优先。
+/// [`PartRecord::new`] 同一条口径）。`None` 表示这次是明文流：暂存的字节就是成品，`finish`
+/// 只把它照抄到临时名再改名。`options` 是调用方要上的头（UA / Cookie）；`If-Range` 由这里按记录
+/// 里的强 `ETag` 加上，调用方自己传的同名头优先。
 ///
-/// 落盘顺序（#7 交给 #8 的四条义务）：取锁 → `purge_expired_parts` → `load_record` → 判断 → 写盘。
-/// 记录只在 `.part` 写完（或写坏）之后写一次：崩溃留下的「`.part` 比记录长」由 `load_record` 一起
-/// 作废，所以这里不中途重写记录 —— 保证的是「断网后接得上」，不保证「进程被杀也接得上」。
+/// 落盘顺序（#7 交给 #8 的四条义务）：取锁 → `purge_expired_parts` → `load_record` → 判断 → 写盘
+/// → 解密到 `{目标}.dec.tmp` → 改名 → 作废暂存对。锁一直罩到交付完成：解密的输入就是 `.part`，
+/// 而 #2 要求 `.part` 的**所有**读写都在锁下，没有绕过的分支。记录只在 `.part` 写完（或写坏）
+/// 之后写一次：崩溃留下的「`.part` 比记录长」由 `load_record` 一起作废，所以这里不中途重写记录
+/// —— 保证的是「断网后接得上」，不保证「进程被杀也接得上」。
+pub(crate) fn download_staged_to_file(
+    url: &str,
+    key_bytes: Option<&[u8]>,
+    target: &Path,
+    options: &[RequestOption],
+) -> Result<StagedDownload> {
+    let paths = staged_paths(target)?;
+    create_parent_dir(&paths)?;
+    let _lock = acquire_lock(&paths)?;
+    let facts = download_staged_locked(url, key_bytes.unwrap_or(&[]), target, options, &paths)?;
+    finish(&paths, target, key_bytes)?;
+    Ok(facts)
+}
+
+/// 只下载、不解密：端到端用例用它把 #8 的下载路径与解密分开钉住。生产入口是
+/// [`download_staged_to_file`]，锁在那边一直罩到交付完成；这里取锁只为让用例能单独调用。
+#[cfg(test)]
 pub(crate) fn download_staged(
     url: &str,
     key_bytes: &[u8],
@@ -103,9 +133,18 @@ pub(crate) fn download_staged(
 ) -> Result<StagedDownload> {
     let paths = staged_paths(target)?;
     create_parent_dir(&paths)?;
-    // 锁在任何一次 `.part` 读写之前取到，到返回时才放：这条路径没有绕过它的分支。
     let _lock = acquire_lock(&paths)?;
+    download_staged_locked(url, key_bytes, target, options, &paths)
+}
 
+/// 下载段：**假定调用方已经持有** `{目标}.part.lock`，到返回 `.part` 写完（或写坏）为止。
+fn download_staged_locked(
+    url: &str,
+    key_bytes: &[u8],
+    target: &Path,
+    options: &[RequestOption],
+    paths: &StagedPaths,
+) -> Result<StagedDownload> {
     purge_expired_parts(target)?;
     let staged = load_record(target)?;
     let offset = staged.as_ref().map_or(0, |part| part.local_len);
@@ -152,12 +191,12 @@ pub(crate) fn download_staged(
             total_len: offset,
             status: first.status,
         }),
-        Plan::Append { offset } => stage_response(first, target, &paths, offset, key_bytes),
+        Plan::Append { offset } => stage_response(first, target, paths, offset, key_bytes),
         Plan::Rewrite => {
             // 这里的删除失败要传出去：下一句就要建 `.part`，旧数据还在原地的话写出来的就是
             // 「接在没人认领的字节后面」。`fail_on_status` 那一档反过来吞掉，理由记在那函数上。
             discard_parts(target)?;
-            stage_response(first, target, &paths, 0, key_bytes)
+            stage_response(first, target, paths, 0, key_bytes)
         }
         Plan::Refetch => {
             discard_parts(target)?;
@@ -166,7 +205,7 @@ pub(crate) fn download_staged(
             if !starts_at_zero(&again) {
                 return Err(fail_on_status(target, again.status));
             }
-            stage_response(again, target, &paths, 0, key_bytes)
+            stage_response(again, target, paths, 0, key_bytes)
         }
     }
 }
@@ -238,6 +277,54 @@ fn stage_response(
         total_len,
         status: response.status,
     })
+}
+
+/// 把 `.part` 里的字节交付到 `target`：解密（明文流则照抄）到 `{目标}.dec.tmp`，成功后改名到位，
+/// 再作废暂存对。调用方必须持有 `{目标}.part.lock` —— 它读 `.part`，而 #2 要求 `.part` 的所有
+/// 读写都在锁下。
+///
+/// 失败时目标文件**一个字节都没被碰过**：内容只经由最后那次原子改名到达 `target`。解密失败与
+/// 改名失败都保留加密数据（可以只重跑解密），临时名在两条失败路径上都会被清掉。
+fn finish(paths: &StagedPaths, target: &Path, key_bytes: Option<&[u8]>) -> Result<()> {
+    let tmp = decrypted_tmp_path(target)?;
+    if let Err(error) = write_decrypted(&paths.part, &tmp, key_bytes) {
+        // 解密失败不删 `.part`（#2 用户故事 12）：加密数据完整就能只重跑解密
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, target) {
+        // 改名要么整个发生、要么没发生：目标没被碰过，半截也不留在盘上
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    // 交付已经完成：清不掉暂存只留下缓存垃圾，不能让调用方以为这次下载失败
+    let _ = discard_parts(target);
+    Ok(())
+}
+
+/// `{目标}.dec.tmp`：解密输出的临时名，与目标同一个目录（#2 的实施决定 —— 跨文件系统的改名
+/// 会退化成拷贝，失去原子性）。
+fn decrypted_tmp_path(target: &Path) -> Result<PathBuf> {
+    append_suffix(target, DECRYPTED_SUFFIX)
+        .ok_or_else(|| SodaError::invalid_input("download target has no file name"))
+}
+
+/// 解密一遍到 `out`；`key_bytes` 为 `None` 时是明文流，原样照抄。
+///
+/// 明文流也走「临时名 + 改名」同一条路：交付的原子性只该有一个来源。`flush` 必须显式做 ——
+/// `BufWriter` 在 drop 时把 flush 的错误吞掉（同 `pump_into_part` 的理由），那样「磁盘满了」
+/// 会被当成写完了。
+fn write_decrypted(part: &Path, out: &Path, key_bytes: Option<&[u8]>) -> Result<()> {
+    let mut input = BufReader::with_capacity(STAGE_CHUNK, std::fs::File::open(part)?);
+    let mut writer = BufWriter::with_capacity(STAGE_CHUNK, std::fs::File::create(out)?);
+    match key_bytes {
+        Some(key) => decrypt_stream(&mut input, key, &mut writer)?,
+        None => {
+            std::io::copy(&mut input, &mut writer)?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 /// 一次读一块地写进 `.part`，返回写入的字节数。

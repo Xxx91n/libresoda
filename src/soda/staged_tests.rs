@@ -510,7 +510,7 @@ fn a_416_with_a_matching_total_is_not_a_failure() {
     assert_eq!(outcome.on_disk, TOTAL as u64);
     assert_eq!(outcome.total_len, TOTAL as u64);
     assert_eq!(outcome.resumed_from, None);
-    // 已下完的这对原样留着：解密（#9）要用的就是它。
+    // 已下完的这对原样留着：交付那一步（`download_staged_to_file`）要用的就是它。
     assert_eq!(part_bytes(&target).expect("part"), whole());
     assert!(trusted_pair(&target).is_some());
     cleanup(&dir);

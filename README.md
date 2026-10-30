@@ -17,6 +17,7 @@
 | 歌词（逐字 → LRC） | ✅ 已移植 | `lyric.go` |
 | 音质/时长择优（无损、Hi-Res、杜比） | ✅ 已移植 | `sodaQualityRank` 等 |
 | 下载 + 加密流解密（spade + CENC） | ✅ 已移植 | `download.go`、`crypto.go` |
+| 可续传下载（范围续传 + 可验证的传输字节） | ✅ **新增** | `download::download_resumable`（上游无对应；暂存/记录/锁与详细结果见 [`docs/PORTING.md`](docs/PORTING.md)） |
 | VIP 账号探测 / VIP 曲目识别 | ✅ 已移植 | `account.go`、`LabelInfo` |
 | 我的歌单 | ✅ 已移植 | `user_playlist.go` |
 | 链接解析（短链 / 分享页 / 各种 id） | ✅ 已移植 | `sodaExtract*` |
@@ -203,7 +204,7 @@ src/
     playlist.rs      歌单（分页 + web 兜底）
     lyric.rs         歌词
     track.rs         单曲详情、播放地址、video_model 解析
-    download.rs      下载信息解析与落盘（含解密）
+    download.rs      下载信息解析与落盘（含解密；可续传入口 download_resumable）
     account.rs       VIP 账号探测
     user_playlist.rs 我的歌单
     crypto.rs        spade 密钥 + MP4/CENC 解密
@@ -216,7 +217,7 @@ src/
     resume.rs        续传判断纯函数（本地字节 + 记录 + 这次响应 → 动作；不对外）
     fetch.rs         续传取数层（一次范围请求交回状态码 / 范围头 / ETag；不对外）
     part_record.rs   {目标}.part.meta 记录文件（原子写、一起作废、7 天清扫；不对外）
-    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；#9 才对外）
+    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；对外入口在 download.rs）
     feed.rs          推荐流 / 听歌模式（类型化模型 + 原始 JSON）
     playlist_edit.rs 歌单写操作（创建/改名/删除/加删歌/排序/敏感词）
     collection.rs    收藏（单曲/歌单/专辑/艺人）与「我收藏的」列表

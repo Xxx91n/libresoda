@@ -140,7 +140,10 @@ pub(crate) fn etag_matches(recorded: &str, current: Option<&str>) -> bool {
 }
 
 /// 在路径的最后一段后面追加后缀；文件名不是 UTF-8 时也照样能拼。
-fn append_suffix(path: &Path, suffix: &str) -> Option<PathBuf> {
+///
+/// 暂存族的四个名字都用它拼；`staged` 的解密临时名 `{目标}.dec.tmp`（#9）也走这一处 ——
+/// 「后缀接在整个文件名后面」这条规则只有一个实现。
+pub(crate) fn append_suffix(path: &Path, suffix: &str) -> Option<PathBuf> {
     let mut name = path.file_name()?.to_os_string();
     name.write_str(suffix).ok()?;
     Some(path.with_file_name(name))

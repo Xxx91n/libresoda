@@ -295,6 +295,71 @@ pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Resul
     Ok(info)
 }
 
+/// 一次可续传下载交回的传输事实（[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的
+/// 「详细结果」）。
+///
+/// 只描述这次调用在**网络与磁盘上发生了什么**：`resumed_from` / `transferred` / `on_disk` 三个数
+/// 让调用方证明「重试补的是缺口，不是整份」（#2 用户故事 2~4），`total_len` 与 `status` 是这次
+/// 响应的两个事实。流本身的音质/格式不在这里，仍由 [`DownloadInfo`] 给出。
+///
+/// 标为不可穷尽匹配：以后加字段不破坏调用方（#2 用户故事 17）。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadReport {
+    /// 从第几个字节接上的；没接上（整份重下、本来就完整、或本来就没旧数据）为 `None`。
+    pub resumed_from: Option<u64>,
+    /// 本次实际从网络写入的字节数（`416` 判成已下完时为 0）。与 `on_disk` 是两个独立字段，
+    /// 不让调用方相减（#2 验收）。
+    pub transferred: u64,
+    /// 磁盘上累计的字节数：交付前 `{目标}.part` 的长度，完整时等于 `total_len`。
+    pub on_disk: u64,
+    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
+    pub total_len: u64,
+    /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
+    pub status: u16,
+}
+
+/// 以可续传路径下载 `song` 的整曲：先把**加密**字节暂存到 `{目标}.part`，下完再单独走一遍解密，
+/// 写到同目录的 `{目标}.dec.tmp`，成功后改名到 `output_path`。
+///
+/// 一次调用完成全部工作（#2 的公开接口）：协议退回整份时库内最多多发一次请求，不重试、不等待、
+/// 不睡眠。落盘的名字全部由 `output_path` 推导 —— `{目标}.part` / `.part.meta` / `.part.lock`
+/// （见 `part_record`）与解密输出的临时名 `{目标}.dec.tmp`。
+///
+/// 失败时的两条：解密失败**不删**加密数据，调用方可以只重跑解密（#2 用户故事 12）；目标文件只在
+/// 最后那次改名时才被碰，失败不留半截产物。
+///
+/// 返回的 [`DownloadReport`] 描述这次传输本身；流信息（音质/格式/是否试听）用
+/// [`get_download_info`] 另取（与 [`download_with_info`] 的分工）。
+pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
+    let info = get_download_info(soda, song)?;
+    let url = info.url.trim();
+    if url.is_empty() {
+        return Err(SodaError::invalid_input("invalid download url"));
+    }
+    // 记录里存的是密钥字节的指纹（#7），所以这里解到字节为止；明文流（无 play_auth）没有密钥。
+    let key_bytes = if info.play_auth.trim().is_empty() {
+        None
+    } else {
+        let hex_key = super::crypto::extract_key(&info.play_auth)?;
+        Some(
+            super::crypto::hex_decode(&hex_key)
+                .ok_or_else(|| SodaError::crypto("invalid hex key"))?,
+        )
+    };
+    let options =
+        [crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)];
+    let staged =
+        super::staged::download_staged_to_file(url, key_bytes.as_deref(), output_path, &options)?;
+    Ok(DownloadReport {
+        resumed_from: staged.resumed_from,
+        transferred: staged.transferred,
+        on_disk: staged.on_disk,
+        total_len: staged.total_len,
+        status: staged.status,
+    })
+}
+
 impl Soda {
     /// 等价 `(*Soda).GetDownloadInfo`。
     pub fn get_download_info(&self, song: &Song) -> Result<DownloadInfo> {
@@ -314,5 +379,10 @@ impl Soda {
     /// 同 [`Soda::download`]，额外返回实际拉取的流信息（音质/格式/码率）。
     pub fn download_with_info(&self, song: &Song, output_path: &Path) -> Result<DownloadInfo> {
         download_with_info(self, song, output_path)
+    }
+
+    /// 以可续传路径下载整曲，并交回这次传输的五个事实（见 [`DownloadReport`]）。
+    pub fn download_resumable(&self, song: &Song, output_path: &Path) -> Result<DownloadReport> {
+        download_resumable(self, song, output_path)
     }
 }
