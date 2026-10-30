@@ -1,6 +1,8 @@
 //! 可续传下载（`download::download_resumable`）的端到端用例（票
 //! [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，上级
-//! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
+//! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。票
+//! [`#10`](https://github.com/sodahub-org/libresoda/issues/10) 的旧包装转调用例也在这里，
+//! 复用同一套假服务器与合成素材。
 //!
 //! #2 的「测试决定」要求这一层放在**新的集成测试文件**里：用例只看得见公开 API，所以断言只能落在
 //! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误类别与
@@ -520,5 +522,199 @@ fn a_malformed_play_auth_is_rejected_before_the_request() {
     );
     assert!(seen(&server).is_empty(), "坏密钥不该先发流请求");
     assert!(!part(&target).exists() && !target.exists());
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 票 #10：旧下载函数只做参数转调，共用同一套暂存实现
+// ---------------------------------------------------------------------------
+
+/// 旧函数仍然「一次调用 = 一次整份请求」，不带 `Range`；交回的流信息就是这次真正下载的那
+/// 一份（不二次解析）；成功交付之后暂存对与解密临时名都不留。
+#[test]
+fn the_legacy_wrapper_downloads_once_without_ranges() {
+    let dir = sandbox("legacy-one-shot");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let (url, server) = stream_server(vec![answered("200 OK", &[], &ciphertext)]);
+
+    let info = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect("旧下载函数");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1, "旧策略只发一次请求");
+    assert!(
+        !requests[0].to_ascii_lowercase().contains("\r\nrange:"),
+        "旧策略不带范围头：{}",
+        requests[0]
+    );
+    assert_eq!(info.url, url, "返回的是这次真正取流的那一份");
+    assert_eq!(info.play_auth, play_auth);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    assert!(!part(&target).exists(), "成功交付后还留着 .part");
+    assert!(!record(&target).exists(), "成功交付后还留着记录");
+    assert!(!dec_tmp(&target).exists(), "成功交付后还留着解密临时名");
+    cleanup(&dir);
+}
+
+/// 旧函数不认可续传留下的暂存：它从头整份取，绝不接在 `.part` 后面（#10「不续传」）。
+#[test]
+fn the_legacy_wrapper_ignores_resumable_staging() {
+    let dir = sandbox("legacy-ignores-staging");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 先用可续传路径留下一段能接的暂存。
+    let range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (dropped_url, _) = stream_server(vec![response(
+        "206 Partial Content",
+        &[range.as_str(), "ETag: \"v1\""],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+    soda.download_resumable(&song_for(&dropped_url, &play_auth), &target)
+        .expect_err("断流不是成功");
+    assert_eq!(part_bytes(&target).expect("留下的暂存"), ciphertext[..CUT]);
+
+    // 旧函数从头下：一次整份请求，且不带上一次留下的偏移。
+    let (url, server) = stream_server(vec![answered("200 OK", &["ETag: \"v1\""], &ciphertext)]);
+    soda.download(&song_for(&url, &play_auth), &target)
+        .expect("旧策略从头下");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].to_ascii_lowercase().contains("\r\nrange:"),
+        "旧策略不该带范围头：{}",
+        requests[0]
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    assert!(!part(&target).exists() && !record(&target).exists());
+    cleanup(&dir);
+}
+
+/// 旧策略「失败即删没下完的文件」：下载段断流后 `.part`、记录、解密临时名与目标都不留，
+/// 不像可续传策略那样把半截密文留给下一次。
+#[test]
+fn the_legacy_wrapper_removes_staging_after_a_failure() {
+    let dir = sandbox("legacy-failure-cleanup");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    // 声明整份长度，却只给 100 个字节就断。
+    let (url, _) = stream_server(vec![response(
+        "200 OK",
+        &[],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("断流该报错");
+
+    assert!(
+        error.to_string().contains("staged download interrupted"),
+        "{error}"
+    );
+    assert!(!part(&target).exists(), "旧策略失败要删掉 .part");
+    assert!(!record(&target).exists(), "旧策略失败要删掉记录");
+    assert!(!dec_tmp(&target).exists(), "旧策略失败不该留下解密临时名");
+    assert!(!target.exists(), "旧策略失败不该产出目标文件");
+    cleanup(&dir);
+}
+
+/// 下载成功但**交付段**（解密）失败：旧策略同样删掉暂存，不像可续传策略那样留着密文等
+/// 只重跑解密。
+#[test]
+fn the_legacy_wrapper_removes_staging_after_a_delivery_failure() {
+    let dir = sandbox("legacy-delivery-failure");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    // 下载这一步成功（`200` 整份），但这串字节不是 MP4：解密必然失败。
+    let corrupt = b"this is not an mp4".to_vec();
+    let (url, _) = stream_server(vec![answered("200 OK", &[], &corrupt)]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("解不开的东西该报错");
+
+    assert!(matches!(error, SodaError::Crypto(_)), "{error:?}");
+    assert!(!part(&target).exists(), "交付失败后旧策略要删掉 .part");
+    assert!(!record(&target).exists(), "交付失败后旧策略要删掉记录");
+    assert!(!dec_tmp(&target).exists(), "交付失败后不该留下解密临时名");
+    assert!(!target.exists(), "交付失败后不该产出目标文件");
+    cleanup(&dir);
+}
+
+/// 明文流（SEO 免费曲目，无 `play_auth`）也走旧策略：没有密钥时暂存的字节就是成品，
+/// 成功后暂存对不残留，仍然只有一次整份请求。
+#[test]
+fn the_legacy_wrapper_delivers_plaintext_streams() {
+    let dir = sandbox("legacy-plaintext");
+    let target = target_in(&dir);
+    let body = b"plain m4a bytes, no play_auth".to_vec();
+    let (url, server) = stream_server(vec![answered("200 OK", &[], &body)]);
+    let song = Song {
+        url: format!("{url}#auth="),
+        ..Default::default()
+    };
+
+    let info = Soda::new("")
+        .download_with_info(&song, &target)
+        .expect("明文流照样一次调用");
+
+    assert_eq!(info.play_auth, "");
+    assert_eq!(seen(&server).len(), 1);
+    assert_eq!(std::fs::read(&target).expect("输出文件"), body);
+    assert!(!part(&target).exists());
+    assert!(!record(&target).exists());
+    assert!(!dec_tmp(&target).exists());
+    cleanup(&dir);
+}
+
+/// 旧策略失败时保留调用方预存的旧目标。这是 #10 的有意差异（改动前会先截断再删，见
+/// `docs/PORTING.md`）：目标只在最后改名时被碰，失败的调用不再殃及它。钉住这条，免得以后
+/// 被当成「漏删」改回去。
+#[test]
+fn the_legacy_wrapper_keeps_a_pre_existing_target_on_failure() {
+    let dir = sandbox("legacy-keeps-target");
+    let target = target_in(&dir);
+    std::fs::write(&target, b"old target bytes").expect("plant old target");
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let (url, _) = stream_server(vec![response(
+        "200 OK",
+        &[],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("断流该报错");
+
+    assert!(
+        error.to_string().contains("staged download interrupted"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("旧目标还在"),
+        b"old target bytes"
+    );
+    assert!(!part(&target).exists() && !record(&target).exists() && !dec_tmp(&target).exists());
     cleanup(&dir);
 }

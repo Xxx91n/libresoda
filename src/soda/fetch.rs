@@ -44,8 +44,8 @@ pub(crate) struct RangeResponse {
 ///
 /// 透传有个前提：ureq 每跟一跳重定向就剥掉 `Cookie`，而这层不回 `final_url`，所以
 /// 「被重定向去了别的源站、Cookie 没跟上」在这里看不出来（既有的 [`crate::http::get_reader`]
-/// 走的是同一套机制；只是今天 `download_with_info` 发流只带 UA 不带 Cookie，「带 Cookie
-/// 穿重定向」这条路是续传链才走到的）。这层交不回**能判这件事的事实**（没有 `final_url`，
+/// 走的是同一套机制；今天两个下载入口发流都只带 UA 不带 Cookie，「带 Cookie 穿重定向」
+/// 这条路是续传链才走到的）。这层交不回**能判这件事的事实**（没有 `final_url`，
 /// 其余响应头也不外传）：#8 真要在意重定向，就该给这层加字段，而不是在 #8 里猜。
 pub(crate) fn fetch_range(
     url: &str,
