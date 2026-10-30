@@ -312,14 +312,19 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
     decrypt_stream(input, &key_bytes, out)
 }
 
-/// 从 `play_auth` 还原出 AES 密钥字节。
+/// 从 `play_auth` 还原出 16 字节 AES 密钥。
 ///
-/// [`extract_key`] 与 [`hex_decode`] 的合体：`download_resumable`（#9）要按这些字节算记录里的
-/// 密钥指纹，与两个解密入口共用同一份还原与错误文案。长度不在这里校验 —— 交给
-/// [`decrypt_audio_with_key`] / [`decrypt_stream`]，与改动前的失败时机一致。
+/// [`extract_key`] 与 [`hex_decode`] 的合体，长度校验也在这里：`download_resumable`（#9）要用
+/// 「有没有密钥」区分明文流与加密流，而一条畸形的非空 `play_auth` 可能解出空串 —— 若把它当成
+/// 空密钥，就会与明文流的指纹撞车（续传时把密文当明文交出去）。长度在**发请求之前**判掉，
+/// 错误文案仍是 `decrypt_audio_with_key` / `decrypt_stream` 用的那一条。
 pub(crate) fn key_bytes_from_play_auth(play_auth: &str) -> Result<Vec<u8>> {
     let hex_key = extract_key(play_auth)?;
-    hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))
+    let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
+    if key_bytes.len() != 16 {
+        return Err(SodaError::crypto("invalid aes key length"));
+    }
+    Ok(key_bytes)
 }
 
 /// 等价 `encryptedSampleOriginalFormat`：从 `frma` box 里读原始格式，失败则退回 `mp4a`。

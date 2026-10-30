@@ -351,6 +351,28 @@ fn a_decrypt_failure_keeps_the_encrypted_bytes_for_a_retry() {
         "交付失败不能碰目标文件"
     );
     assert!(!dec_tmp(&target).exists(), "解密失败后临时名还在盘上");
+
+    // 真正的解密失败也能「只重跑解密」：`416` 证明已经下完，不再传字节；这次仍然解不开，
+    // 加密数据继续留着（不是新一次下载）。
+    let range = format!("Content-Range: bytes */{}", corrupt.len());
+    let (retry_url, server) = stream_server(vec![response(
+        "416 Range Not Satisfiable",
+        &[range.as_str()],
+        Some(0),
+        b"",
+    )]);
+    let retry = Soda::new("")
+        .download_resumable(&song_for(&retry_url, &play_auth), &target)
+        .expect_err("同一串坏字节还是解不开");
+    assert!(matches!(retry, SodaError::Crypto(_)), "{retry:?}");
+    let requests = seen(&server);
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains(&format!("Range: bytes={}-", corrupt.len())),
+        "{}",
+        requests[0]
+    );
+    assert_eq!(part_bytes(&target).expect("加密数据仍留着"), corrupt);
     cleanup(&dir);
 }
 
@@ -441,11 +463,11 @@ fn a_blocked_rename_leaves_no_half_target_and_keeps_the_ciphertext() {
 }
 
 // ---------------------------------------------------------------------------
-// 明文流：没有 play_auth 也走同一条「临时名 + 改名」的交付
+// 明文流：没有 play_auth 也走同一条交付路径
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_plaintext_stream_is_delivered_through_the_same_temp_name() {
+fn a_plaintext_stream_is_delivered_like_an_encrypted_one() {
     let dir = sandbox("plaintext");
     let target = target_in(&dir);
     let body = b"plain m4a bytes, no play_auth".to_vec();
@@ -475,5 +497,28 @@ fn a_plaintext_stream_is_delivered_through_the_same_temp_name() {
     assert!(!part(&target).exists());
     assert!(!record(&target).exists());
     assert!(!dec_tmp(&target).exists());
+    cleanup(&dir);
+}
+
+/// 非空 `play_auth` 解出空串的畸形输入：不能把它当「明文流」的哨兵（空密钥与明文流的指纹
+/// 相同），也不能先下完再在解密时才发现 —— 发请求之前就拒掉。
+#[test]
+fn a_malformed_play_auth_is_rejected_before_the_request() {
+    let dir = sandbox("empty-key");
+    let target = target_in(&dir);
+    // 空 key_hex 构出来的 play_auth，`extract_key` 还原成空串；它不是 16 字节 AES 密钥。
+    let play_auth = build_play_auth("", 3);
+    let (url, server) = stream_server(vec![answered("200 OK", &[], b"never fetched")]);
+
+    let error = Soda::new("")
+        .download_resumable(&song_for(&url, &play_auth), &target)
+        .expect_err("空密钥不是合法的 AES 密钥");
+    assert!(matches!(error, SodaError::Crypto(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("invalid aes key length"),
+        "{error}"
+    );
+    assert!(seen(&server).is_empty(), "坏密钥不该先发请求");
+    assert!(!part(&target).exists() && !target.exists());
     cleanup(&dir);
 }

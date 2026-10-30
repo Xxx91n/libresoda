@@ -341,7 +341,7 @@ pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Resul
         return Err(SodaError::invalid_input("invalid download url"));
     }
     // 记录里存的是密钥字节的指纹（#7），所以这里解到字节为止；明文流（无 play_auth）没有密钥。
-    // 密钥长度不在这里判：与改动前一样，交给解密那一步（失败时 .part 留下，可重跑）。
+    // 密钥长度在这里判掉：畸形的非空 play_auth 可能解出空串，不能让它与明文流的指纹撞车。
     let key_bytes = if info.play_auth.trim().is_empty() {
         None
     } else {

@@ -292,7 +292,7 @@ fn stage_response(
 /// 改名失败都保留加密数据（可以再调一次：服务端若回 `416` 证明已经下完，就只重做解密，不传字节），
 /// 临时名在两条失败路径上都会被清掉。
 fn deliver(paths: &StagedPaths, target: &Path, key_bytes: Option<&[u8]>) -> Result<()> {
-    let tmp = &paths.decrypted;
+    let tmp = &paths.decrypted_tmp;
     if let Err(error) = write_decrypted(&paths.part, tmp, key_bytes) {
         // 解密失败不删 `.part`（#2 用户故事 12）：加密数据完整就能只重跑解密
         let _ = std::fs::remove_file(tmp);

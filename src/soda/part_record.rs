@@ -166,7 +166,7 @@ pub(crate) struct StagedPaths {
     pub(crate) lock: PathBuf,
     /// `{目标}.dec.tmp`：解密输出的临时名。名字在这里推导，写它、改名与失败时清理属于 #9 的
     /// 交付阶段；它不是暂存族，但 `discard` 与 7 天清扫会按名字顺带收掉崩溃留下的残骸。
-    pub(crate) decrypted: PathBuf,
+    pub(crate) decrypted_tmp: PathBuf,
 }
 
 /// 目标必须带文件名（调用方给的是落盘路径，没有文件名就是路径写错了）。
@@ -181,15 +181,15 @@ pub(crate) fn staged_paths(target: &Path) -> Result<StagedPaths> {
     let lock = part
         .as_ref()
         .and_then(|part| append_suffix(part, LOCK_SUFFIX));
-    let decrypted = append_suffix(target, DECRYPTED_SUFFIX);
-    match (part, record, record_tmp, lock, decrypted) {
-        (Some(part), Some(record), Some(record_tmp), Some(lock), Some(decrypted)) => {
+    let decrypted_tmp = append_suffix(target, DECRYPTED_SUFFIX);
+    match (part, record, record_tmp, lock, decrypted_tmp) {
+        (Some(part), Some(record), Some(record_tmp), Some(lock), Some(decrypted_tmp)) => {
             Ok(StagedPaths {
                 part,
                 record,
                 record_tmp,
                 lock,
-                decrypted,
+                decrypted_tmp,
             })
         }
         _ => Err(SodaError::invalid_input("download target has no file name")),
@@ -307,8 +307,8 @@ fn discard(paths: &StagedPaths) -> Result<()> {
             Slot::Occupied | Slot::Absent => {}
         }
     }
-    let _ = match slot_of(&paths.decrypted) {
-        Ok(Slot::File { .. } | Slot::Link) => remove_existing(&paths.decrypted),
+    let _ = match slot_of(&paths.decrypted_tmp) {
+        Ok(Slot::File { .. } | Slot::Link) => remove_existing(&paths.decrypted_tmp),
         _ => Ok(()),
     };
     Ok(())
@@ -1161,11 +1161,31 @@ mod part_record_tests {
         write_part(&target, 300);
         write_record(&target, &record(1000, None, 300)).expect("write record");
         let paths = staged_paths(&target).expect("paths");
-        std::fs::write(&paths.decrypted, b"half decrypted").expect("write dec temp");
+        std::fs::write(&paths.decrypted_tmp, b"half decrypted").expect("write dec temp");
         let orphan = dir.join("stranger.m4a.dec.tmp");
         std::fs::write(&orphan, b"not ours").expect("write orphan");
         let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
-        for path in [&paths.part, &paths.record, &paths.decrypted, &orphan] {
+        // 还年轻的一对、以及记录读不出来（认不出是我们的）的一对：旁边的 dec 残骸都不能动
+        let young = dir.join("young.m4a");
+        write_part(&young, 300);
+        write_record(&young, &record(1000, None, 300)).expect("write record");
+        let young_paths = staged_paths(&young).expect("paths");
+        std::fs::write(&young_paths.decrypted_tmp, b"fresh delivery").expect("write young dec");
+        let foreign = dir.join("foreign.m4a");
+        write_part(&foreign, 300);
+        let foreign_paths = staged_paths(&foreign).expect("paths");
+        std::fs::write(&foreign_paths.record, b"{}").expect("write junk record");
+        std::fs::write(&foreign_paths.decrypted_tmp, b"not ours").expect("write foreign dec");
+
+        let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
+        for path in [&paths.part, &paths.record, &paths.decrypted_tmp, &orphan] {
+            set_mtime(path, long_ago);
+        }
+        for path in [
+            &foreign_paths.part,
+            &foreign_paths.record,
+            &foreign_paths.decrypted_tmp,
+        ] {
             set_mtime(path, long_ago);
         }
 
@@ -1173,10 +1193,18 @@ mod part_record_tests {
         assert!(!paths.part.exists(), "过期的数据没被清掉");
         assert!(!paths.record.exists(), "过期的记录没被清掉");
         assert!(
-            !paths.decrypted.exists(),
+            !paths.decrypted_tmp.exists(),
             "跟着记录对一起的解密残骸没被清掉"
         );
         assert!(orphan.is_file(), "没有配对记录的 dec 残骸不该按后缀删");
+        assert!(
+            young_paths.decrypted_tmp.is_file(),
+            "还年轻的那一对旁边的解密残骸被清掉了"
+        );
+        assert!(
+            foreign_paths.decrypted_tmp.is_file(),
+            "认不出的记录旁边的解密残骸被清掉了"
+        );
         cleanup(&dir);
     }
 
@@ -1188,12 +1216,12 @@ mod part_record_tests {
         write_part(&target, 300);
         write_record(&target, &record(1000, None, 300)).expect("write record");
         let paths = staged_paths(&target).expect("paths");
-        std::fs::write(&paths.decrypted, b"half decrypted").expect("write dec temp");
+        std::fs::write(&paths.decrypted_tmp, b"half decrypted").expect("write dec temp");
 
         discard_parts(&target).expect("discard");
         assert!(!paths.part.exists(), "数据没被作废");
         assert!(!paths.record.exists(), "记录没被作废");
-        assert!(!paths.decrypted.exists(), "解密残骸没被一起收掉");
+        assert!(!paths.decrypted_tmp.exists(), "解密残骸没被一起收掉");
         cleanup(&dir);
     }
 
@@ -1277,7 +1305,7 @@ mod part_record_tests {
         assert_eq!(name(&staged.lock), Some("song.m4a.part.lock".to_string()));
         // 解密输出的临时名也是「目标文件名 + 后缀」（#9 交付阶段写的就是它）
         assert_eq!(
-            name(&staged.decrypted),
+            name(&staged.decrypted_tmp),
             Some("song.m4a.dec.tmp".to_string())
         );
         // 后缀是层层接上去的，所以清扫时能从记录名反推出数据名
