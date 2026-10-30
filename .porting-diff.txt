@@ -1,0 +1,200 @@
+diff --git a/docs/PORTING.md b/docs/PORTING.md
+index 5147aef..cd16408 100644
+--- a/docs/PORTING.md
++++ b/docs/PORTING.md
+@@ -39,7 +39,8 @@
+ | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
+ | （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
+ | （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由是它对外承诺的是**落盘格式**（四样字段），不是 `resume` 那种判断规则；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
+-| （上游无对应）| `staged::{download_staged, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下。`pub(crate)`：对外的入口（一次调用 + `#[non_exhaustive]` 详细结果）是 #9 的事，这里交回的 `StagedDownload` 是它的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
++| （上游无对应）| `staged::{download_staged_to_file, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下；下完之后在同一把锁里解密、改名到位、作废暂存对。`pub(crate)`：对外的入口是 `download::download_resumable`，这里交回的 `StagedDownload` 是那份报告的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、[`#9`](https://github.com/sodahub-org/libresoda/issues/9)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
++| （上游无对应）| `download::{download_resumable, DownloadReport}`：可续传下载的公开入口 —— 一次调用完成「解析流 → 暂存加密字节 → 解密 → 改名到位」，交回五个传输事实（`resumed_from` / `transferred` / `on_disk` / `total_len` / `status`），结果结构标为 `#[non_exhaustive]`。实现票 [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；解密、失败处置与可见性见下文「断点续传的解密与详细结果」 |
+ | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
+ | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
+ | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
+@@ -82,7 +83,8 @@
+ | 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
+ | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
+ | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
+-| （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**这一条不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口按 #2 的「公开接口」一节属于 #9 —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以用例放在 `soda` 这一层的兄弟模块里，让它只能看见 `pub(crate)`。等 #9 给出公开入口，`tests/` 那份按同一批形态补 |
++| （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**#8 那一批不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口当时还是 `pub(crate)` —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以那批用例放在 `soda` 这一层的兄弟模块里，只能看见 `pub(crate)`。对外入口落地后（#9），`tests/` 那份由下一行补上 |
++| （上游无对应）| `tests/download_resumable_tests.rs`：#9 的端到端用例，只走公开 API。假服务器同样用本地 `TcpListener` 手写；断言落在成品字节、暂存 / 记录 / `.dec.tmp` 的去留、`DownloadReport` 的五个事实、错误类别与线上真发出的请求。与 `staged_tests.rs` 互补：那里钉下载层，这里钉「一次调用 → 解密 → 改名」这条交付链。逐字节对比的基准就是**旧下载函数自己的产出**（`download` 对同一个假服务器的一次性整份下载），所以比的是真函数而不是复制品。失败侧两条：解密失败保留 `.part`/记录且不碰旧目标；改名被目录挡住时不留半截目标、不删加密数据。另有一条钉「只重跑解密」的恢复路线（第一次交付被目录挡住 → 第二次 `416` 判已完成、`transferred == 0` 只解密），顺带钉住上次留下的 `.dec.tmp` 被截断重用。合成素材在 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用 |
+ 
+ ## 与上游的实现差异
+ 
+@@ -135,12 +137,11 @@
+     「带 Cookie 穿重定向」这条路是续传链才走到的。这条同时也是**这层交不回的事实**
+     （没有 `final_url`，其余响应头也不外传）：#8 真要在意重定向，就该给 `RangeResponse`
+     加字段并在这里记下原因，而不是在 #8 里猜。
+-  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。**真机结论仍然悬着**：#8 没有加联网
+-    用例 —— 它的入口是 `pub(crate)`，`tests/network_tests.rs` 够不到，而这张票的验收标准全部由
+-    离线假服务器覆盖（三种状态码 + 逐字节对比 + 去留表 + 并发）。可行的落点是 #9 给出对外下载函数
+-    之后按 `scripts/run-network-tests.sh` 那套护栏跑，或照 #3 的做法写一条只读 example；在那之前
+-    「`416` 到底带不带 `bytes */N`、边缘节点认不认 `If-Range`」没有证据，别把它当已验证的事实写进
+-    文档。
++  - 上面三条都是**读 ureq 2.12.1 源码**得出的，不是 CDN 实测。**真机结论仍然悬着**：`tests/` 够
++    不到 `pub(crate)` 的入口，所以 #8 的验收全部由离线假服务器覆盖；#9 的公开入口虽然让
++    `tests/network_tests.rs` 够得着了，但本票没有加联网用例（验收同样由假服务器覆盖），按
++    `scripts/run-network-tests.sh` 那套护栏跑一次仍然欠着。在那之前「`416` 到底带不带 `bytes */N`、
++    边缘节点认不认 `If-Range`」没有证据，别把它当已验证的事实写进文档。
+   - **一处待授权的规则文**：`AGENTS.md` 移植规范 #6 的入口白名单仍写
+     `http::{get, get_full, post_json}`，既漏了既有的 `get_reader`，也没含本层新加的 `get_raw`。
+     改那行规则正文要单独取授权，先在这里记着，别把它当成「`get_raw` 是绕过 http 封装的私拉 HTTP」。
+@@ -151,12 +152,13 @@
+ * **断点续传的记录文件（`soda::part_record`，上游无对应）**：实现票
+   [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径来自
+   [`#2`](https://github.com/sodahub-org/libresoda/issues/2)「记录文件与「还能不能接上」的判据」一节。
+-  三个落盘名字都由目标路径推导（规则也写在 `part_record` 的模块头 —— #2 的用户故事 20 要求
++  五个落盘名字都由目标路径推导（规则也写在 `part_record` 的模块头 —— #2 的用户故事 20 要求
+   「命名规则固定并写进文档」）：`{目标}.part` 装未下完的**加密**字节、`{目标}.part.meta` 是记录、
+-  `{目标}.part.meta.tmp` 只是原子写的临时名（改名成功后不残留，读记录那条路永远不认它）。
++  `{目标}.part.meta.tmp` 只是原子写的临时名（改名成功后不残留，读记录那条路永远不认它）、
++  `{目标}.part.lock` 是并发锁的名字（取锁属于 #8）、`{目标}.dec.tmp` 是 #9 解密输出的临时名
++  （写法与改名属于 #9 的交付阶段，名字仍在这一处推导）。
+   7 天清扫要扫的目录同样由目标路径推导（`purge_expired_parts(target)` 取推导出的 `.part` 的
+-  `parent()`，不在 `target` 上另算一次），调用方只拿着最终路径这一个概念。`{目标}.part.lock` 的名字**也**在这里推导（`StagedPaths::lock`），
+-  但取锁、撞锁报错与那条纪律属于 #8。
++  `parent()`，不在 `target` 上另算一次），调用方只拿着最终路径这一个概念。
+ 
+   - 记录只有票面那四样：总长、强 `ETag`、密钥指纹、写入时的字节数。JSON + `deny_unknown_fields`，
+     认不出的字段（多一个、少一个都算）不当「半可信的记录」用。
+@@ -195,7 +197,9 @@
+     是因为它只动**调用方正要写的那个目标**。换来的漏是「记录还没写下就崩溃」留下的孤立 `.part`：
+     扫目录不碰没配对的 `.part`，它要等同一目标再次下载时由 `load_record` 清掉。名字撞上但记录
+     读不出来的那一对走同一条路 —— 扫目录认不出它，但 `load_record` 的口径是「凑不成可信的一对就
+-    一起作废」，所以它不会永久留着。四样字段将来若改了名，旧记录一律读不出来，扫目录这条路就再也
++    一起作废」，所以它不会永久留着。`*.dec.tmp`（#9 的解密输出临时名）同样靠那个又长又特定的后缀
++    认、按 mtime 单独清：它只有交付阶段会写，内容也可能只写了一半，没有配对的记录可查（与
++    `.part.meta.tmp` 同一取舍）。四样字段将来若改了名，旧记录一律读不出来，扫目录这条路就再也
+     碰不到那些过期的一对：**改格式时必须同时留一条清旧格式的路**，或先清一遍缓存。两边都过期时
+     **先删数据再删记录** —— 反过来一旦只有第一步成功，就正好造出前面说的那种孤儿。
+   - 清扫是**尽力而为**：先按名字认出记录族再 stat（下载目录里成千上万个无关文件不该被逐个问一遍），
+@@ -235,22 +239,24 @@
+     结构（`#[non_exhaustive]`）讲的，没给落盘格式这种保证。出口同 `resume`：出现外部调用方时再评估。
+     #8 落地时删掉了 `resume.rs` 里 `ResumeAction` / `ResumeProbe` / `decide_resume_action` 三处的
+     逐项 `#[allow(dead_code)]`，以及 `fetch.rs`、`part_record.rs` 顶部的模块级放行 —— 这三样现在
+-    有 `staged.rs` 这个非测试的消费方。还剩两处放行，等的原因**不同**：`staged.rs` 顶部一条模块级
+-    （它的入口要 #9 给出对外下载函数才算有消费方），`part_record::etag_matches` 上一条逐项（它的出口
+-    是「出现消费方，或改成拿 `If-Range` 校验响应」，跟 #9 没关系）。判据是「被死码用到仍算被用到」：#6 落地时把 `parse_content_range`
++    有 `staged.rs` 这个非测试的消费方。#9 又删掉了 `staged.rs` 顶部那条模块级放行（对外入口
++    `download::download_resumable` 成了它的非测试消费方）。**只剩一处**：`part_record::etag_matches`
++    上的逐项放行（它的出口是「出现消费方，或改成拿 `If-Range` 校验响应」，跟 #9 没关系）。判据是「被死码用到仍算被用到」：#6 落地时把 `parse_content_range`
+     的放行删掉过，而它只被当时还没人调的 `fetch_range` 用到，clippy 不报 —— 所以 #8 用掉的那些
+-    放行现在确实可以删，`staged.rs` 自己那一格则要留到 #9。
++    放行现在确实可以删；`staged.rs` 自己那一格由 #9 删掉后，全仓只剩 `etag_matches` 那一处。
+ 
+ * **断点续传的暂存下载主路径（`soda::staged`，上游无对应）**：实现票
+-  [`#8`](https://github.com/sodahub-org/libresoda/issues/8)，口径全部来自
++  [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、
++  [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，口径全部来自
+   [`#2`](https://github.com/sodahub-org/libresoda/issues/2)（文件怎么落、请求次数与重试边界、
+-  「没下完的文件留不留」那张表、并发四句）。这一层只把**加密**字节落到 `{目标}.part` 并写好
+-  `{目标}.part.meta`；解密输出、对外的详细结果结构属于
+-  [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，旧下载函数改转调属于
+-  [`#10`](https://github.com/sodahub-org/libresoda/issues/10)。
+-  - **可见性**：`download_staged` 与 `StagedDownload` 都是 `pub(crate)`，模块也不 `pub`。#2 的
+-    「公开接口」一节定的是「一次调用 + 详细结果 + 策略枚举」那一层（#9/#10），这里交回的五个事实是
+-    那层的内部件；铁律 2 的例外按同一口径走（出口是出现外部调用方），并在本票挂上口径票 #2。
++  「没下完的文件留不留」那张表、并发四句）。这一层先把**加密**字节落到 `{目标}.part` 并写好
++  `{目标}.part.meta`，再在同一把锁下解密、改名到位（#9）；对外的详细结果结构见下一节，旧下载
++  函数改转调属于 [`#10`](https://github.com/sodahub-org/libresoda/issues/10)。
++  - **可见性**：`download_staged_to_file` 与 `StagedDownload` 都是 `pub(crate)`，模块也不 `pub`；
++    对外入口是 `download::download_resumable`（#9），这里交回的五个事实是它那份报告的内部件。
++    铁律 2 的例外按同一口径走（出口是出现外部调用方）：`staged` 现在有唯一的非测试调用方，
++    模块顶部那条 `#![allow(dead_code)]` 已随 #9 删掉；只剩 `part_record::etag_matches` 那一格
++    （它的出口与 #9 无关，理由写在那个函数上面）。
+   - **锁的实现选了 std，代价是 MSRV**：`{目标}.part.lock` 用
+     [`std::fs::File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
+     （Unix 是 `flock` 的 `LOCK_EX|LOCK_NB`，Windows 是 `LockFileEx` 的
+@@ -271,8 +277,10 @@
+     `{目标}.part.lock` 这个名字上放一个指向别处的链接，这次就会去锁那个被指向的文件，于是同一目标的
+     两路下载可能各自以为拿到了锁。#7 已经写过同一个窗口（判型用 lstat，打开与改名仍按平台语义），
+     而能把自己暂存目录变成攻击面的人本来就能直接改暂存内容；这一层不再加第二道判型，换不来什么。
+-    后果限于这一次暂存：交出去的是两路 interleaved 的字节，#9 的解密会把它当坏数据拒掉（那句话归
+-    #9 的用例，不在这里声称已经验证）。同一条口径也覆盖 `.part` 名字上是链接的情形（#7 的
++    后果限于这一次暂存：交出去的是两路 interleaved 的字节。#9 的解密**不保证**能认出来 ——
++    样本边界可能仍然自洽，解出来会是噪声；「不会产出坏文件」这条因此在锁可用的范围内成立。
++    同进程内由调用方按路径互斥兜住（#2 的「库内不再加进程内的锁表」），跨进程只在锁可靠时成立。
++    同一条口径也覆盖 `.part` 名字上是链接的情形（#7 的
+     「一起作废」会先把那个链接 unlink 掉，才轮到这条路径用 `File::create` 建文件）。
+   - **「数据文件的所有读写都在锁下，没有绕过的分支」（#8 验收第 5 条）怎么算成立**：本次目标的
+     `.part` 与 `.part.meta` 只在 `acquire_lock` 之后才被碰，拿到锁之后的第一件事是 7 天清扫 ——
+@@ -318,12 +326,15 @@
+     而**中途断**（ureq 对没读满的 `Content-Length` 报 `UnexpectedEof`）与写盘失败（含磁盘满）是
+     「留着下次接」那一档 —— 这两种情形在错误上分不清，判据只能是「字节数与这次承诺的对不对得上」。
+   - **处置表按状态码落地**：`404`/`410` 删（下架/不存在），其余状态码与所有 I/O 失败保留
+-    （鉴权失败、`5xx`、认不出的、磁盘满、断流）。表里剩下的「数据本身有问题」那一格就是上面那条
+-    「交付字节与这次承诺的区间不符」；**「解密错误」不在这一层** —— 本层不解密，它归 #9。
++    （鉴权失败、`5xx`、认不出的、磁盘满、断流）。表里「数据本身有问题」那一格在这一层是上面那条
++    「交付字节与这次承诺的区间不符」；**本地解密失败不在这一层** —— 它归 #9，且 #9 的处置是
++    **保留**加密数据（见下一节），与那一格讲的不是同一件事。
+     「磁盘满」与「断流」是同一条分支（读流或写盘报回来的 I/O 错误），断流那两条用例同时钉住了
+     这一档；单独造一个 `ENOSPC` 要只读目录或磁盘配额，跨平台不可靠，没做。
+-    #2 用户故事 11 的「无权益」同样不在这一层判：本层只看得到流地址回的状态码，无权益是
+-    `resolve_download_info` 那一步的结论（归 #9）。
++    #2 用户故事 11 的「无权益」不在这一层判：它由 `resolve_download_info` 兑现成**试听回退**
++    （`Ok` + `is_preview`），不是错误；下载与交付照常走完，暂存对在交付成功后作废，所以没有
++    「无权益就删」的格子。取流以错误形式失败时（`player info url not found`、`returned preview
++    stream` 等）按 #2 表里「认不出的失败」保留 —— 不凭字符串猜一个会删数据的判据。
+   - **「删不动」在两档里的待遇不一样，是有意的**：接下来就要建 `.part` 的那条路（退回整份）让
+     删除的失败传出去 —— 旧数据还在原地就会写出「接在没人认领的字节后面」的文件；已经决定失败
+     退出那条（状态码层面的失败）吞掉它 —— 调用方拿到的本来就是失败，不会误以为旧数据已经没了，
+@@ -333,6 +344,58 @@
+     `fsync` 也不做（同上，几十 MB 的同步代价换「重下即可」的失败模式）。
+   - 已知限制照 #2 那条：网络文件系统上的锁不可靠，此时续传可能失效并退回重下，但不会产出坏文件。
+ 
++* **断点续传的解密与详细结果（`download::download_resumable`，上游无对应）**：实现票
++  [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，口径来自
++  [`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「公开接口」一节与用户故事 12/17/18。
++  - **公开入口只有一处**：`download::download_resumable(&Soda, &Song, &Path)`（同名方法
++    `Soda::download_resumable`），一次调用完成「解析流 → 暂存加密字节 → 解密 → 改名到位」。输入
++    沿用旧下载函数的 `Song`；流地址与密钥都由 `get_download_info` 解出来，调用方不传暂存路径
++    （#2：路径由库推导）。`staged` / `part_record` / `resume` / `fetch` 仍不公开。
++  - **结果是 `DownloadReport`**，五个 `pub` 字段：`resumed_from: Option<u64>`（没接上为 `None`）、
++    `transferred`（本次从网络写入的字节）、`on_disk`（交付前 `.part` 的字节数）、`total_len`、
++    `status`（把字节交给调用方的那一次请求的状态码）。**成功交付时 `on_disk` 必然等于
++    `total_len`**（本层只在下完时返回 `Ok`）；两个字段仍然独立，是为了让调用方别用
++    `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，不是这次写下的数。结构标
++    `#[non_exhaustive]`，以后加字段不破坏调用方。流信息（音质/格式/试听）仍由 `get_download_info`
++    给出，不混进这份报告，**`is_preview` 也不在里面**（需要它的调用方自己另取）。
++  - **解密在锁内，输出先落到同目录的临时名**：`{目标}.dec.tmp`，写完 `flush` 之后 `rename` 到
++    目标。与目标同目录是为了不跨设备 —— 跨设备的 `rename` 直接报错（`EXDEV` /
++    `ERROR_NOT_SAME_DEVICE`），**不会**退化成拷贝。目标只被最后那次原子改名碰过，解密或改名失败
++    都不会留下半截目标；失败路径顺手删掉临时名（删不掉也不改这次失败的性质）。
++    这把锁与下载是同一把 `{目标}.part.lock`，守卫的作用域从取锁一直覆盖到交付返回：解密读的就是
++    `.part`，#2 要求 `.part` 的所有读写都在锁下。**「交付期间锁仍被持有」没有单独的用例**（没有
++    跨平台的稳定观测点），由 `download_staged_to_file` 里单个 `_lock` 的作用域保证；用例钉的是
++    锁本身的语义（#8 的撞锁与 `try_lock` 探针）。下载段因此拆成「取锁 +
++    `download_staged_to_file`」与「`download_staged_locked`」两层；`staged_tests.rs` 用的
++    `download_staged`（只下载、不解密）现在是 `#[cfg(test)]`，避免把一条没有生产调用方的入口
++    留在库里。
++  - **解密失败不删 `.part`，也不删记录**（#2 用户故事 12 / 实施决定）。「只重跑解密」的恢复路线
++    没有单独的公开入口：再调一次 `download_resumable`，服务端若回 `416`（总长同时等于本地长度与
++    记录总长）就判已完成、**一个字节都不再传**，直接重做解密；服务端不认范围请求时退回整份。
++    `tests/download_resumable_tests.rs` 有一条用例钉这条恢复路线（用被目录占住的 `.dec.tmp`
++    制造一次交付失败，第二次 416 只解密）。处置表里「数据本身有问题 → 删除」那一格讲的是
++    **交付的字节**与这次 `Content-Range` 不符（下载层已经落地），不是本地解密失败 —— 两处判据别混。
++  - **交付成功才作废暂存对**，且删除是尽力而为：删不掉只会留下缓存垃圾，不能让调用方以为这次
++    下载失败；下一次同目标下载由 `load_record` 的「凑不成可信的一对就作废」收尾。
++  - **明文流**（没有 `play_auth`，SEO 接口对免费歌曲返回的 m4a）没有密钥：暂存的字节就是成品，
++    解密这一步退化成照抄，但走的还是「临时名 + 改名」同一条交付路径。记录里的密钥指纹此时是
++    **空密钥的 MD5**，与任何真密钥都不同；在明文与加密之间切换会让指纹对不上，续传作废重下
++    —— 这是想要的保守行为（`part_record` 的指纹用例钉住两个指纹不等，#5 的判据钉住不等的后果）。
++  - **已有目标文件被原子替换**：目标已存在、且没被别的进程占着时，改名覆盖它是两个平台的正常
++    行为（有用例先摆一个旧目标再下载）。目标是个目录时两平台都失败（也有用例）；目标被别的进程
++    打开时 Windows 上会因共享冲突失败 —— 这一档没有跨平台用例，失败时旧文件保持原样、加密数据
++    保留。
++  - **无权益**：见上一节末尾 —— 取流阶段兑现成试听回退（`Ok` + `info.is_preview`），不是失败，
++    所以处置表里没有「无权益就删」的格子；以错误形式出现的取流失败按「认不出的失败」保留，不凭
++    字符串猜一个会删数据的判据。
++  - **已知限制**：`.dec.tmp` 用 `File::create`（有就截断），与 #7/#8 记过的同一类窗口 —— 有人把
++    那个名字做成链接时，写入会跟随到别处。能把自己缓存目录变成攻击面的人本来就能直接改暂存内容，
++    这一层不再加第二道判型。进程被杀留下的半截 `.dec.tmp` 会在下一次同目标交付时被截断重用；
++    该目标再也不下载时，由 7 天清扫按 `*.dec.tmp` 后缀收走（名字也登记在 `part_record` 的表里）。
++  - **真机证据仍然欠着**：本票的验收全部由 `tests/download_resumable_tests.rs` 的假服务器覆盖，
++    没有加联网用例。`416` 到底带不带 `bytes */N`、边缘节点认不认 `If-Range` 仍然只有读 ureq
++    源码的推断，别当已验证的事实写进文档。
++
+ ## 未移植项
+ 
+ > **客户端能力（上游 `music-lib` 完全没有，2026-09-15 照官方客户端 IDL 补齐并真机验证）**：

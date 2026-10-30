@@ -350,13 +350,13 @@ fn a_decrypt_failure_keeps_the_encrypted_bytes_for_a_retry() {
         b"old target bytes",
         "交付失败不能碰目标文件"
     );
-    assert!(!dec_tmp(&target).exists(), "失败的解密临时名留在盘上");
+    assert!(!dec_tmp(&target).exists(), "解密失败后临时名还在盘上");
     cleanup(&dir);
 }
 
 /// 交付失败（这里让解密输出去撞一个目录）之后，`.part` 与记录都在；再调一次时服务端用 `416`
 /// 证明已经下完，于是**一个字节都不再传**，只重做解密 —— #2 用户故事 12 的「只重跑解密」。
-/// 顺带钉住：上一次留下的 `.dec.tmp` 会在这次交付时被截断重用。
+/// 顺带钉住：上一次交付留下的 `.dec.tmp` 会在这次交付时被截断重用。
 #[test]
 fn a_failed_delivery_is_retried_without_transferring_bytes() {
     let dir = sandbox("retry-delivery");
@@ -377,7 +377,7 @@ fn a_failed_delivery_is_retried_without_transferring_bytes() {
     assert!(record(&target).exists());
     assert!(!target.exists());
 
-    // 去掉障碍，再摆一份残骸在解密临时名上：这次的交付要把它截断重用。
+    // 去掉障碍，再摆一份残骸在解密临时名上（模拟上一次被杀的交付）：这次要把它截断重用。
     std::fs::remove_dir(dec_tmp(&target)).expect("unblock");
     std::fs::write(dec_tmp(&target), b"stale decryption residue").expect("plant residue");
 
@@ -431,7 +431,7 @@ fn a_blocked_rename_leaves_no_half_target_and_keeps_the_ciphertext() {
         .expect_err("目标是目录，改名必然失败");
     assert!(matches!(error, SodaError::Io(_)), "{error:?}");
     assert!(target.is_dir(), "挡路的目录被动了");
-    assert!(!dec_tmp(&target).exists(), "失败的解密临时名留在盘上");
+    assert!(!dec_tmp(&target).exists(), "解密失败后临时名还在盘上");
     assert_eq!(
         part_bytes(&target).expect("加密数据留着"),
         ciphertext,

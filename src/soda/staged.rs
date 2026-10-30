@@ -28,16 +28,19 @@
 //! | 下架 / 不存在（`404`/`410`） | 删除 |
 //! | 交付字节与自己承诺的区间不符（含服务器违规压 `Content-Encoding`） | 删除 |
 //! | 传输中断、磁盘满、写盘失败 | 保留 |
+//! | 本地解密失败 / 改名失败（#9 的交付阶段） | 保留 `.part` 与记录，只删临时名 |
+//! | 取流阶段判定「无权益」（试听回退） | 不是失败：照常交付，成功后作废暂存对 |
 //!
 //! 这一层只看流地址回的状态码：「无权益」是取流阶段（`resolve_download_info`）的结论，不在这里
-//! 判。它在实现里兑现成**试听回退**（`Ok` + `DownloadInfo::is_preview`），不是一次失败；交付照常
-//! 走完，暂存对在成功后作废，所以处置表里没有「无权益就删」的格子。取流以错误形式失败时一律按
-//! 「认不出的失败」保留。注意 `DownloadReport` 不携带 `is_preview`：需要这个标记的调用方用
-//! `get_download_info` 另取。
+//! 判。它在实现里兑现成**试听回退**（`Ok` + `DownloadInfo::is_preview`），不是一次失败；它与任何
+//! `Ok` 的取流结果走同一条交付路径，成功后暂存对作废，所以处置表里没有「无权益就删」的格子。
+//! 取流以错误形式失败时一律按「认不出的失败」保留。注意 `DownloadReport` 不携带 `is_preview`：
+//! 需要这个标记的调用方用 `get_download_info` 另取。
 //!
 //! 解密失败**不删** `.part`（#2 用户故事 12 / 实施决定）：加密数据完整就能只重跑解密。这与处置表
 //! 里「数据本身有问题 → 删除」不冲突 —— 那一格讲的是**交付的字节**与这次 `Content-Range` 不符，
-//! 不是本地解密这一步。成功改名到位之后才作废暂存对；作废失败只留下缓存垃圾，不影响交付。
+//! 不是本地解密这一步。成功改名到位之后才作废暂存对；`discard_parts` 的结果不改变这次成功 ——
+//! 删不掉只留下缓存垃圾（没有跨平台用例能稳定制造这种失败，代码路径就是 `let _ =`）。
 
 use super::crypto::decrypt_stream;
 use super::fetch::{fetch_range, RangeResponse};
@@ -95,7 +98,7 @@ enum PumpFail {
 
 /// 对 `target` 旁边的 `{目标}.part` 发起一次可续传的暂存下载，下完解密并改名到 `target`。
 ///
-/// `key_bytes` 必须是**解出来的 AES 密钥字节**（`crypto::extract_key(play_auth)` 再 `hex_decode`），
+/// `key_bytes` 必须是**解出来的 AES 密钥字节**（`crypto::key_bytes_from_play_auth(play_auth)`），
 /// 它的指纹写进记录，下次同目标同密钥才接得上；不能传 `play_auth` 串本身（#7 的
 /// [`PartRecord::new`] 同一条口径）。`None` 表示这次是明文流：暂存的字节就是成品，`deliver`
 /// 只把它照抄到临时名再改名。`options` 是调用方要上的头（UA / Cookie）；`If-Range` 由这里按记录
@@ -112,12 +115,18 @@ pub(crate) fn download_staged_to_file(
     target: &Path,
     options: &[RequestOption],
 ) -> Result<StagedDownload> {
-    let paths = staged_paths(target)?;
-    create_parent_dir(&paths)?;
-    let _lock = acquire_lock(&paths)?;
+    let (paths, _lock) = open_staged_target(target)?;
     let facts = download_staged_locked(url, key_bytes.unwrap_or(&[]), target, options, &paths)?;
     deliver(&paths, target, key_bytes)?;
     Ok(facts)
+}
+
+/// 两个入口共用的开场：推导暂存名 → 建父目录 → 取不等待的锁。返回的锁守卫必须活到交付结束。
+fn open_staged_target(target: &Path) -> Result<(StagedPaths, std::fs::File)> {
+    let paths = staged_paths(target)?;
+    create_parent_dir(&paths)?;
+    let lock = acquire_lock(&paths)?;
+    Ok((paths, lock))
 }
 
 /// 只下载、不解密：端到端用例用它把 #8 的下载路径与解密分开钉住。生产入口是
@@ -129,9 +138,7 @@ pub(crate) fn download_staged(
     target: &Path,
     options: &[RequestOption],
 ) -> Result<StagedDownload> {
-    let paths = staged_paths(target)?;
-    create_parent_dir(&paths)?;
-    let _lock = acquire_lock(&paths)?;
+    let (paths, _lock) = open_staged_target(target)?;
     download_staged_locked(url, key_bytes, target, options, &paths)
 }
 

@@ -11,7 +11,7 @@
 //! | `{目标}.part.meta` | `.part` 文件名 + `.meta` | 记录文件（本模块写读的就是它） |
 //! | `{目标}.part.meta.tmp` | 记录文件名 + `.tmp` | 原子写的临时名，改名成功后不残留 |
 //! | `{目标}.part.lock` | `.part` 文件名 + `.lock` | 并发锁的**名字**（#2 要求这几个名字都由库推导）；取锁与撞锁报错属于 #8 |
-//! | `{目标}.dec.tmp` | 目标文件名 + `.dec.tmp` | 解密输出的临时名（#9 的交付阶段）；改名成功后不残留，进程被杀留下的残骸由 7 天清扫收走 |
+//! | `{目标}.dec.tmp` | 目标文件名 + `.dec.tmp` | 解密输出的临时名（#9 的交付阶段）；改名成功后不残留，进程被杀留下的残骸跟着记录对一起被 7 天清扫收走 |
 //!
 //! 与 `resume` 的分工：`resume::decide_resume_action` 只回答「这次响应能不能接上」；
 //! 「记录与数据只有一方在」「`.part` 的真实长度与记录写的字节数不符」属于**记录自身**的可信度，
@@ -152,8 +152,8 @@ pub(crate) fn append_suffix(path: &Path, suffix: &str) -> Option<PathBuf> {
     Some(path.with_file_name(name))
 }
 
-/// 一个目标的五个暂存名字，全部由目标路径推导 —— #2 规定「路径由库推导，调用方不传」，
-/// 调用方只拿着最终路径这一个概念。
+/// 一个目标由路径推导出来的五个名字：四个暂存族 + 交付阶段的解密临时名。
+/// #2 规定「路径由库推导，调用方不传」，调用方只拿着最终路径这一个概念。
 pub(crate) struct StagedPaths {
     /// `{目标}.part`：未下完的加密字节。
     pub(crate) part: PathBuf,
@@ -294,23 +294,23 @@ pub(crate) fn discard_parts(target: &Path) -> Result<()> {
 /// 文件）：这条路的终点是「这个目标从头下一遍」，而 #8 下一次建 `.part` 用的是跟随语义的
 /// `File::create`，把链接留在自己的暂存名上等于留给它一个写穿到别处的坑。目录、管道这些
 /// 「名字撞上但既不是文件也不是链接」的位置仍不动 —— 那不是本 crate 的暂存，删它才是越界。
-/// 删不动时（杀软或索引器占着，Windows 上是共享冲突）**如实报错**：宁可这次失败，也不能让
+/// 前三样删不动时（杀软或索引器占着，Windows 上是共享冲突）**如实报错**：宁可这次失败，也不能让
 /// 调用方以为旧数据已经没了、转身往一份还在盘上的旧字节后面追加。
 ///
-/// `.dec.tmp` 只是交付阶段的临时名（#9），但它的名字同样由这个目标推导，且「从头下一遍」
-/// 之后本来就会被重写 —— 一起删掉，免得一份被杀的交付留下满尺寸的残骸。
+/// `.dec.tmp` 只是交付阶段的临时名（#9），它的名字同样由这个目标推导，删掉免得一份被杀的交付
+/// 留下满尺寸的残骸；但它是**尽力而为**的 —— 留下它不影响「从头下一遍」（下一次交付本来就会
+/// 截断重用），所以它的删除失败不让整次作废失败。
 fn discard(paths: &StagedPaths) -> Result<()> {
-    for path in [
-        &paths.part,
-        &paths.record,
-        &paths.record_tmp,
-        &paths.decrypted,
-    ] {
+    for path in [&paths.part, &paths.record, &paths.record_tmp] {
         match slot_of(path)? {
             Slot::File { .. } | Slot::Link => remove_existing(path)?,
             Slot::Occupied | Slot::Absent => {}
         }
     }
+    let _ = match slot_of(&paths.decrypted) {
+        Ok(Slot::File { .. } | Slot::Link) => remove_existing(&paths.decrypted),
+        _ => Ok(()),
+    };
     Ok(())
 }
 
@@ -319,13 +319,13 @@ fn discard(paths: &StagedPaths) -> Result<()> {
 /// 目录取自推导出来的 `{目标}.part` 所在目录，调用方不传（#2 把「调用方只需要知道最终路径一个
 /// 概念」当成约定）；目标是个裸文件名时扫当前目录。
 ///
-/// * 先按名字认出本模块的命名族（`*.part.meta`、它的临时名 `*.part.meta.tmp` 与交付阶段的
-///   `*.dec.tmp`）**才 stat** —— 下载目录里成千上万个无关文件不该被逐个问一遍。判龄用文件 mtime。
+/// * 先按名字认出本模块的命名族（`*.part.meta` 与它的临时名 `*.part.meta.tmp`）**才 stat** ——
+///   下载目录里成千上万个无关文件不该被逐个问一遍。判龄用文件 mtime。
 /// * **认得出是我们的才动**：记录必须按那四样字段读得出来。少了这一道，一对同样叫
 ///   `X.part` / `X.part.meta` 的别人家的文件就会被按名字删掉。唯一的例外是临时名 —— 它的
 ///   **定义**就是「可能只写了一半」，内容判不了，只能靠那个又长又特定的后缀认；写成功就被
-///   改名走，留在那儿的一定是崩溃残骸。`*.dec.tmp`（#9 的解密输出临时名）同理：它只有本
-///   crate 的交付阶段会写，同样按后缀认、按 mtime 单独清，没有配对的 `.part` 可查。
+///   改名走，留在那儿的一定是崩溃残骸。交付阶段的 `{目标}.dec.tmp`（#9）**不单独认**：它只
+///   跟着一对过期记录一起被收（名字由目标名推导），否则「光名字撞上就删别人文件」的口子就开了。
 /// * **没有可认出的配对的 `.part` 不动**：`.part` 这个后缀不是本 crate 独占的。代价是两种
 ///   本模块扫不到的残留 —— 「记录还没写下就崩溃」留下的孤立 `.part`，以及一对名字撞上但记录
 ///   读不出来的文件（谁家的都不是，只能等同一目标再次下载时由 [`load_record`] 一起作废）。
@@ -365,16 +365,6 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
         let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
             continue;
         };
-        // 解密临时名（#9）只有一个写者：我们的交付阶段。它没有配对的记录，内容也可能只写了一半，
-        // 所以按那个又长又特定的后缀认、按 mtime 单独清（与 `.part.meta.tmp` 同一取舍）。
-        if name.ends_with(DECRYPTED_SUFFIX) {
-            if let Ok(entry_slot) = slot_of(&path) {
-                if expired(&entry_slot, now) {
-                    let _ = remove_existing(&path);
-                }
-            }
-            continue;
-        }
         // 临时名归到它最终要改成的记录名上：两个都算本模块的文件
         let (record_name, is_tmp) = match name.strip_suffix(TMP_SUFFIX) {
             Some(base) if base.ends_with(RECORD_SUFFIX) => (base, true),
@@ -421,6 +411,14 @@ pub(crate) fn purge_expired_parts(target: &Path) -> Result<()> {
             }
             // 其余一律不动：还年轻、判不出年龄、或那个位置是链接/目录/管道
             _ => continue,
+        }
+        // 交付阶段被杀的残骸：解密临时名由目标名推导，跟着这一对一起收。它不单独按后缀认，
+        // 否则「光名字撞上就删别人文件」的口子就开了；认不出这一对时它留给下一次同目标交付。
+        if let Some(target_name) = data_name.strip_suffix(PART_SUFFIX) {
+            let dec_path = dir.join(format!("{target_name}{DECRYPTED_SUFFIX}"));
+            if matches!(slot_of(&dec_path), Ok(Slot::File { .. })) {
+                let _ = remove_existing(&dec_path);
+            }
         }
         let _ = remove_existing(&path);
     }
@@ -1098,8 +1096,8 @@ mod part_record_tests {
             recorded,
             PartRecord::new(1000, None, OTHER_KEY, 1).key_fingerprint
         );
-        // 明文流（#9）没有密钥，指纹记的是空密钥：与任何真密钥都不同，明文/加密之间切换时
-        // 「指纹对不上」那条判据（#5）会作废重下
+        // 明文流（#9）没有密钥，指纹记的是空密钥；这里与 KEY 对照：两者不同，明文/加密之间
+        // 切换时「指纹对不上」那条判据（#5）会作废重下
         assert_ne!(key_fingerprint(&[]), md5_hex_upper(KEY));
         // 同一个密钥的两种十六进制写法解出来是同一把：指纹不受大小写影响
         let lower = hex_decode("00112233445566778899aabbccddeeff").expect("lower hex");
@@ -1155,24 +1153,47 @@ mod part_record_tests {
     }
 
     #[test]
-    fn sweep_collects_a_crashed_decryption_temp() {
-        // #9 的解密输出临时名没有配对的记录：进程被杀会留下满尺寸的残骸，由 7 天兜底收走；
-        // 还在写的那一份不能动
+    fn sweep_collects_a_crashed_decryption_temp_with_its_pair() {
+        // #9 的解密输出临时名**不单独认**：进程被杀会留下 .part/.meta/.dec.tmp 三件套，
+        // 过期时跟着这一对一起收；没有配对记录的孤立残骸不动（不能光凭后缀删别人的文件）
         let dir = sandbox("sweep-dec-tmp");
         let target = dir.join("song.m4a");
-        let stale = dir.join("stale.m4a.dec.tmp");
-        let young = dir.join("young.m4a.dec.tmp");
-        for path in [&stale, &young] {
-            std::fs::write(path, b"half decrypted").expect("write dec temp");
+        write_part(&target, 300);
+        write_record(&target, &record(1000, None, 300)).expect("write record");
+        let paths = staged_paths(&target).expect("paths");
+        std::fs::write(&paths.decrypted, b"half decrypted").expect("write dec temp");
+        let orphan = dir.join("stranger.m4a.dec.tmp");
+        std::fs::write(&orphan, b"not ours").expect("write orphan");
+        let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
+        for path in [&paths.part, &paths.record, &paths.decrypted, &orphan] {
+            set_mtime(path, long_ago);
         }
-        set_mtime(
-            &stale,
-            SystemTime::now() - MAX_AGE - Duration::from_secs(60),
-        );
 
-        purge_expired_parts(&target).expect("purge");
-        assert!(!stale.exists(), "过期的解密临时名没被清掉");
-        assert!(young.is_file(), "还在写的解密临时名被清掉了");
+        purge_expired_parts(&dir.join("purge-trigger.m4a")).expect("purge");
+        assert!(!paths.part.exists(), "过期的数据没被清掉");
+        assert!(!paths.record.exists(), "过期的记录没被清掉");
+        assert!(
+            !paths.decrypted.exists(),
+            "跟着记录对一起的解密残骸没被清掉"
+        );
+        assert!(orphan.is_file(), "没有配对记录的 dec 残骸不该按后缀删");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn discard_collects_a_crashed_decryption_temp() {
+        // 同一目标的「一起作废」顺手收掉交付阶段的残骸：它不影响数据路径，但留着白占磁盘
+        let dir = sandbox("discard-dec-tmp");
+        let target = dir.join("song.m4a");
+        write_part(&target, 300);
+        write_record(&target, &record(1000, None, 300)).expect("write record");
+        let paths = staged_paths(&target).expect("paths");
+        std::fs::write(&paths.decrypted, b"half decrypted").expect("write dec temp");
+
+        discard_parts(&target).expect("discard");
+        assert!(!paths.part.exists(), "数据没被作废");
+        assert!(!paths.record.exists(), "记录没被作废");
+        assert!(!paths.decrypted.exists(), "解密残骸没被一起收掉");
         cleanup(&dir);
     }
 
