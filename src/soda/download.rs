@@ -257,8 +257,7 @@ pub fn download(soda: &Soda, song: &Song, output_path: &Path) -> Result<()> {
 /// **加密**字节落到 `.part`，再解密到 `.dec.tmp` 改名到位；代价与删除旧策略的计划记在
 /// `docs/PORTING.md`。需要续传能力请用 [`download_resumable`]。
 pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadInfo> {
-    download_with_strategy(soda, song, output_path, DownloadStrategy::Legacy)
-        .map(|(info, _)| info)
+    download_with_strategy(soda, song, output_path, DownloadStrategy::Legacy).map(|(info, _)| info)
 }
 
 /// 两种策略共用的「解析流 → 暂存下载 → 交付」。

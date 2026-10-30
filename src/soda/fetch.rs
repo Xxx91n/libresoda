@@ -385,11 +385,7 @@ mod fetch_tests {
     #[test]
     fn a_full_fetch_sends_no_range_header() {
         // 旧策略（#10）要的是改动前那条请求的形状：整份 GET，不带 `Range`。
-        let (url, server) = fake_server(http_response(
-            "200 OK",
-            &["ETag: \"v9\""],
-            &body_of(1000),
-        ));
+        let (url, server) = fake_server(http_response("200 OK", &["ETag: \"v9\""], &body_of(1000)));
         let fetched = fetch_full(&url, &[]).expect("200");
 
         assert_eq!(fetched.status, 200);
