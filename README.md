@@ -17,6 +17,7 @@
 | 歌词（逐字 → LRC） | ✅ 已移植 | `lyric.go` |
 | 音质/时长择优（无损、Hi-Res、杜比） | ✅ 已移植 | `sodaQualityRank` 等 |
 | 下载 + 加密流解密（spade + CENC） | ✅ 已移植 | `download.go`、`crypto.go` |
+| 可续传下载（范围续传 + 可验证的传输字节） | ✅ **新增** | `download::download_resumable`（上游无对应；暂存/记录/锁与详细结果见 [`docs/PORTING.md`](docs/PORTING.md)） |
 | VIP 账号探测 / VIP 曲目识别 | ✅ 已移植 | `account.go`、`LabelInfo` |
 | 我的歌单 | ✅ 已移植 | `user_playlist.go` |
 | 链接解析（短链 / 分享页 / 各种 id） | ✅ 已移植 | `sodaExtract*` |
@@ -35,10 +36,11 @@
 | 我收藏的歌单 / 专辑（列表） | ✅ **已打通** | `collection::collected_items`（`/luna/me/collection/mixed` + 重复 key `item_types`，参数与客户端一致：`count=500, item_types=[album, playlist]`）；实测 收藏前 0 条 → 收藏后 1 条且命中 → 取消后 0 条。注意：**空列表时服务端不返回 `mixed_collections` 字段**，`parse_mixed_collections` 会把这种情况当空数组 |
 | 歌单分类（编辑分类） | ⛔ 上游即未实现 | `playlist.go` |
 
-测试现状：**193 个离线用例**（库内单测 121 + 集成测试 72：合成 MP4 加解密往返、二维码
+测试现状：**203 个离线用例**（库内单测 123 + 集成测试 80：合成 MP4 加解密往返、二维码
 URL/摘要、签名提供者形状与鉴权头、抓包凭证解析、新接口的请求体/回包解析、续传链的判据与
 端到端下载）+ 4 个 doctest + **11 个 `#[ignore]` 联网用例**（VIP 无损下载/解密、缓存刷新、
-我的歌单、搜索、歌词、整曲取流诊断、QR 调试）。这两个数会随用例增减而失真 —— 按模块的覆盖
+我的歌单、搜索、歌词、整曲取流诊断、QR 调试）+ 1 个库内真机范围探针（`fetch::range_probe`，
+同样 `#[ignore]`）。这几个数会随用例增减而失真 —— 按模块的覆盖
 范围看 [`docs/PORTING.md`](docs/PORTING.md) 的测试对照表，那份是按形状写的，不按个数。
 
 ## 自写客户端接入
@@ -203,7 +205,7 @@ src/
     playlist.rs      歌单（分页 + web 兜底）
     lyric.rs         歌词
     track.rs         单曲详情、播放地址、video_model 解析
-    download.rs      下载信息解析与落盘（含解密）
+    download.rs      下载信息解析与落盘（含解密；可续传入口 download_resumable）
     account.rs       VIP 账号探测
     user_playlist.rs 我的歌单
     crypto.rs        spade 密钥 + MP4/CENC 解密
@@ -216,7 +218,7 @@ src/
     resume.rs        续传判断纯函数（本地字节 + 记录 + 这次响应 → 动作；不对外）
     fetch.rs         续传取数层（一次范围请求交回状态码 / 范围头 / ETag；不对外）
     part_record.rs   {目标}.part.meta 记录文件（原子写、一起作废、7 天清扫；不对外）
-    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；#9 才对外）
+    staged.rs        可续传的暂存下载主路径（加密字节 + 不等待的锁；对外入口在 download.rs）
     feed.rs          推荐流 / 听歌模式（类型化模型 + 原始 JSON）
     playlist_edit.rs 歌单写操作（创建/改名/删除/加删歌/排序/敏感词）
     collection.rs    收藏（单曲/歌单/专辑/艺人）与「我收藏的」列表

@@ -19,6 +19,8 @@ pub(crate) struct RangeResponse {
     /// 要不要拿它记录、比较时是否忽略大小写、要不要拿它发 `If-Range`，都是记录文件（#7）
     /// 与调用方的事。一条相关的规矩：RFC 9110 §13.1.5 规定弱标记的 entity-tag **不能**进
     /// `If-Range`，服务端按强比较判定，弱的一律不成立 —— 那时服务器会回整份，旧数据白扔。
+    /// 2026-10-30 的一次真机测量里，这个边缘会校验 `If-Range`（拿过期值试，回 `200` 整份），
+    /// 而且这次响应根本没带 `ETag`；样本只有一个边缘，仍只把它当「省一次白下载」的优化。
     pub(crate) etag: Option<String>,
     /// 响应体读取器，尚未解密。不预分配、也不按响应里的任何长度开内存，由调用方边读边写盘。
     ///
@@ -360,5 +362,226 @@ mod fetch_tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("invalid download url"), "{err}");
+    }
+}
+
+/// 票 #9 的真机取证：`416` 到底带不带 `bytes */N`、边缘节点认不认 `If-Range`。
+///
+/// 放在 `fetch` 的模块内而不是 `tests/`：要的就是 [`fetch_range`] 交回的状态码与范围头，
+/// 而它是 `pub(crate)`。**一律 `#[ignore]`**，只在有凭据的机器上手动跑。输出只有状态码与
+/// 布尔事实 —— 不印 URL、Cookie、track id，也不印文件大小（AGENTS.md「测试规范」）。
+///
+/// ```text
+/// SODA_COOKIE=... [SODA_TRACK_ID=... | SODA_KEYWORD=...]
+/// [QISHUI_SIGNER_URL=... QISHUI_SIGNER_TOKEN=...]
+///   cargo test --lib -- --ignored --nocapture resume_range_evidence_online
+/// ```
+#[cfg(test)]
+mod range_probe {
+    use crate::http::RequestOption;
+    use crate::soda::download::{resolve_download_info, song_track_id};
+    use crate::soda::signature::{AppCredentials, HttpSignature};
+    use crate::soda::types::USER_AGENT;
+    use crate::soda::Soda;
+    use std::sync::Arc;
+
+    fn env_value(name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "network + SODA_COOKIE + track id/keyword"]
+    fn resume_range_evidence_online() {
+        let cookie = env_value("SODA_COOKIE");
+        if cookie.trim().is_empty() {
+            eprintln!("skip: SODA_COOKIE not set");
+            return;
+        }
+
+        let soda = Soda::new(cookie);
+        if let Some(provider) = HttpSignature::from_env() {
+            soda.set_signature_provider(Arc::new(provider));
+        }
+        let device_id = env_value("SODA_DEVICE_ID");
+        if !device_id.is_empty() {
+            soda.set_app_credentials(AppCredentials {
+                device_id,
+                iid: env_value("SODA_IID"),
+                fp: env_value("SODA_FP"),
+                ..Default::default()
+            });
+        }
+
+        let track_id = {
+            let explicit = env_value("SODA_TRACK_ID");
+            if !explicit.trim().is_empty() {
+                explicit
+            } else {
+                let keyword = {
+                    let kw = env_value("SODA_KEYWORD");
+                    if kw.trim().is_empty() {
+                        "周杰伦".to_string()
+                    } else {
+                        kw
+                    }
+                };
+                let songs = match soda.search(&keyword) {
+                    Ok(songs) => songs,
+                    // 不印错误原文：取流层的错误可能带着签名 URL（AGENTS.md「安全与合规」）
+                    Err(_) => {
+                        eprintln!("search_failed");
+                        return;
+                    }
+                };
+                match songs.into_iter().next() {
+                    Some(song) => song_track_id(&song),
+                    None => {
+                        eprintln!("search_empty");
+                        return;
+                    }
+                }
+            }
+        };
+        let info = match resolve_download_info(&soda, &track_id, None) {
+            Ok(info) => info,
+            Err(_) => {
+                eprintln!("resolve_failed");
+                return;
+            }
+        };
+        if info.url.trim().is_empty() {
+            eprintln!("resolve_empty_url");
+            return;
+        }
+        let options = [RequestOption::new().header("User-Agent", USER_AGENT)];
+
+        // 1) 从 0 起的范围请求：条件支持、范围头形状、强 ETag 是否在
+        let first = match super::fetch_range(&info.url, 0, &options) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("range0_fetch_error");
+                return;
+            }
+        };
+        let first_total = first.range.as_ref().map(|range| range.total).unwrap_or(0);
+        let etag = first.etag.clone();
+        eprintln!(
+            "range0: status={} range_present={} first_zero={} last_present={} total_present={} etag_present={}",
+            first.status,
+            first.range.is_some(),
+            first.range.as_ref().and_then(|range| range.first) == Some(0),
+            first.range.as_ref().and_then(|range| range.last).is_some(),
+            first_total > 0,
+            etag.as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        );
+        drop(first.reader);
+
+        // 用响应里的总长；没有范围头时退回元数据里的体积（只用来选偏移，不打印）
+        let expected_total = if first_total > 0 {
+            first_total
+        } else if info.size > 0 {
+            info.size as u64
+        } else {
+            eprintln!("skip: no total length from Content-Range or metadata");
+            return;
+        };
+
+        // 2) 偏移等于总长：`416` 的范围头是 `bytes */N` 还是别的形态
+        let past_end = match super::fetch_range(&info.url, expected_total, &options) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("past_end_fetch_error");
+                return;
+            }
+        };
+        let total_only = past_end
+            .range
+            .as_ref()
+            .map(|range| range.first.is_none() && range.last.is_none())
+            .unwrap_or(false);
+        eprintln!(
+            "past_end: status={} range_present={} total_only={} n_equals_expected={}",
+            past_end.status,
+            past_end.range.is_some(),
+            total_only,
+            past_end
+                .range
+                .as_ref()
+                .map(|range| range.total == expected_total)
+                .unwrap_or(false),
+        );
+        drop(past_end.reader);
+
+        // 3) 带一个明显过期的 `If-Range`：200 = 服务端真的校验（拒绝范围），206 = 不校验
+        let stale = [
+            RequestOption::new().header("User-Agent", USER_AGENT),
+            RequestOption::new().header("If-Range", "\"qishui-probe-stale\""),
+        ];
+        let stale_range = match super::fetch_range(&info.url, 0, &stale) {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!("stale_if_range_fetch_error");
+                return;
+            }
+        };
+        eprintln!(
+            "if_range_stale: status={} honored={}",
+            stale_range.status,
+            stale_range.status == 200
+        );
+        drop(stale_range.reader);
+
+        // 4) 带当前的强 ETag：应当仍然按范围答（`206`）
+        if let Some(etag) = etag.as_deref().filter(|value| !value.trim().is_empty()) {
+            let weak = etag.starts_with("W/") || etag.starts_with("w/");
+            if !weak {
+                let current = [
+                    RequestOption::new().header("User-Agent", USER_AGENT),
+                    RequestOption::new().header("If-Range", etag),
+                ];
+                let current_range = match super::fetch_range(&info.url, 0, &current) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!("current_if_range_fetch_error");
+                        return;
+                    }
+                };
+                eprintln!(
+                    "if_range_current: status={} served_range={}",
+                    current_range.status,
+                    current_range.status == 206
+                );
+                drop(current_range.reader);
+
+                // 5) 真实重试路径：偏移等于总长 + 当前 ETag 的 `If-Range`
+                let retry = [
+                    RequestOption::new().header("User-Agent", USER_AGENT),
+                    RequestOption::new().header("If-Range", etag),
+                ];
+                let retry_range = match super::fetch_range(&info.url, expected_total, &retry) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!("retry_fetch_error");
+                        return;
+                    }
+                };
+                eprintln!(
+                    "past_end_with_if_range: status={} total_only={}",
+                    retry_range.status,
+                    retry_range
+                        .range
+                        .as_ref()
+                        .map(|range| range.first.is_none() && range.last.is_none())
+                        .unwrap_or(false),
+                );
+                drop(retry_range.reader);
+            } else {
+                eprintln!("if_range_current: skipped=weak_etag");
+            }
+        } else {
+            eprintln!("if_range_current: skipped=no_etag");
+        }
     }
 }

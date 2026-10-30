@@ -49,8 +49,7 @@ pub struct SencSample {
 
 /// 等价 `DecryptAudio`：整文件解密（`play_auth` 解出 AES 密钥，再按 senc 样本解密）。
 pub fn decrypt_audio(file_data: &[u8], play_auth: &str) -> Result<Vec<u8>> {
-    let hex_key = extract_key(play_auth)?;
-    let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
+    let key_bytes = key_bytes_from_play_auth(play_auth)?;
     decrypt_audio_with_key(file_data, &key_bytes)
 }
 
@@ -309,9 +308,24 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
     play_auth: &str,
     out: &mut W,
 ) -> Result<()> {
+    let key_bytes = key_bytes_from_play_auth(play_auth)?;
+    decrypt_stream(input, &key_bytes, out)
+}
+
+/// 从 `play_auth` 还原出 16 字节 AES 密钥。
+///
+/// [`extract_key`] 与 [`hex_decode`] 的合体，长度校验也在这里：`download_resumable`（#9）要用
+/// 「有没有密钥」区分明文流与加密流，而一条畸形的非空 `play_auth` 可能解出空串 —— 若把它当成
+/// 空密钥，就会与明文流的指纹撞车（续传时把密文当明文交出去）。长度在**发流请求之前**判掉，
+/// 错误文案仍是 `decrypt_audio_with_key` / `decrypt_stream` 用的那一条（`tests/crypto_tests.rs`
+/// 从这两个入口各断一次）。
+pub(crate) fn key_bytes_from_play_auth(play_auth: &str) -> Result<Vec<u8>> {
     let hex_key = extract_key(play_auth)?;
     let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
-    decrypt_stream(input, &key_bytes, out)
+    if key_bytes.len() != 16 {
+        return Err(SodaError::crypto("invalid aes key length"));
+    }
+    Ok(key_bytes)
 }
 
 /// 等价 `encryptedSampleOriginalFormat`：从 `frma` box 里读原始格式，失败则退回 `mp4a`。
