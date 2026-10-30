@@ -9,9 +9,10 @@
 //! 接着补，服务器不认范围请求就安全退回整份。下完之后**在同一把锁下**单独走一遍解密，写到同目录
 //! 的 `{目标}.dec.tmp`，成功后改名到目标、再作废暂存对。对外的详细结果结构是
 //! [`crate::soda::download::DownloadReport`]；旧下载函数（`download` / `download_with_info`）在
-//! #10 之后也走这条路径，由 [`DownloadStrategy::Legacy`] 精确复现改动前的行为。三个内部件在这里
-//! 接上：[`super::part_record`] 管暂存名字与记录文件，[`super::fetch`] 管一次取数交回的事实，
-//! [`super::resume`] 管「这次响应能不能接上」的判断。
+//! #10 之后也走这条路径，由 [`DownloadStrategy::Legacy`] 复现改动前的三条下载契约（不续传、
+//! 一次整份请求、失败即删本次暂存；与改动前不完全相同的边角记在 `docs/PORTING.md`）。
+//! 三个内部件在这里接上：[`super::part_record`] 管暂存名字与记录文件，[`super::fetch`] 管一次
+//! 取数交回的事实，[`super::resume`] 管「这次响应能不能接上」的判断。
 //!
 //! 请求次数：可续传策略一次调用最多 2 次，第 2 次只发生在协议退回整份时（#2 的请求次数边界）；
 //! 旧策略只有 1 次整份请求。库内**不重试、不等待、不睡眠** —— 网络类失败第一次就返回给调用方，
@@ -45,19 +46,19 @@
 //! 不是本地解密这一步。成功改名到位之后才作废暂存对；`discard_parts` 的结果不改变这次成功 ——
 //! 删不掉只留下缓存垃圾（没有跨平台用例能稳定制造这种失败，代码路径就是 `let _ =`）。
 //!
-//! 旧策略（[`DownloadStrategy::Legacy`]）不适用上面这张表：它不续传，任何失败都把本次调用写下的
-//! `.part` / 记录 / `.dec.tmp` 一起删掉，对应 `download` / `download_with_info` 改动前的
-//! 「失败即删没下完的文件」（#10）。
+//! 旧策略（[`DownloadStrategy::Legacy`]）不适用上面这张表：它不续传，取锁成功之后任何失败都把
+//! 本次调用写下的 `.part` / 记录 / `.dec.tmp` 一起删掉，对应 `download` / `download_with_info`
+//! 改动前的「失败即删没下完的文件」（#10）。
 
 use super::crypto::decrypt_stream;
-use super::fetch::{fetch_full, fetch_range, RangeResponse};
+use super::fetch::{fetch_range, RangeResponse};
 use super::part_record::{
     discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts, staged_paths,
     write_record, PartRecord, StagedPaths,
 };
 use super::resume::{decide_resume_action, ResumeAction, ResumeProbe};
 use crate::error::{Result, SodaError};
-use crate::http::RequestOption;
+use crate::http::{get_reader, RequestOption};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
@@ -160,9 +161,10 @@ pub(crate) fn download_staged_to_file(
         Ok(facts) => Ok(facts),
         Err(error) => {
             if strategy == DownloadStrategy::Legacy {
-                // 旧策略「失败即删没下完的文件」：不管失败出在哪一段，都把本次写下的 `.part`、
-                // 记录与 `.dec.tmp` 清掉。删不掉也不改这次失败的性质（调用方拿到的仍是原始错误），
-                // 下一次同目标下载会由 `load_record` 的「凑不成可信的一对就作废」收尾。
+                // 取锁成功之后，旧策略「失败即删没下完的文件」：不管失败出在哪一段，都把本次
+                // 写下的 `.part`、记录与 `.dec.tmp` 清掉。删不掉也不改这次失败的性质（调用方拿到
+                // 的仍是原始错误），下一次同目标下载（旧策略开始前作废、可续传策略读记录时作废）
+                // 会把它收尾。取锁本身失败时什么暂存都没碰，不在这里处理。
                 let _ = discard_parts(target);
             }
             Err(error)
@@ -216,8 +218,8 @@ fn download_staged_locked(
     }
 }
 
-/// 旧策略的下载段：先作废这个目标留下的任何暂存（旧函数不续传），再发**一次**不带 `Range` 的
-/// 整份请求。失败后的暂存清理由 [`download_staged_to_file`] 统一收尾。
+/// 旧策略的下载段：先作废这个目标留下的任何暂存（旧函数不续传），再发**一次**整份请求。
+/// 失败后的暂存清理由 [`download_staged_to_file`] 统一收尾。
 fn download_legacy_locked(
     url: &str,
     key_bytes: &[u8],
@@ -227,10 +229,16 @@ fn download_legacy_locked(
 ) -> Result<StagedDownload> {
     // 旧行为不认识 `.part`：同目标之前的暂存一律作废，绝不能接在它后面。
     discard_parts(target)?;
-    let response = fetch_full(url, options)?;
-    if !starts_at_zero(&response) {
-        return Err(fail_on_status(target, response.status));
-    }
+    // 改动前的旧函数就用 `http::get_reader` 取流：请求形状（不带 `Range`）与 HTTP 状态码的
+    // 错误文本都是原样，开放式区间被边缘封顶也不会让一次正常下载变成失败。
+    let reader = get_reader(url, options)?;
+    let response = RangeResponse {
+        // 旧函数不需要状态码（报告由包装层丢弃），这里只走 `get_reader` 成功后的 2xx 正文。
+        status: 200,
+        range: None,
+        etag: None,
+        reader,
+    };
     stage_response(response, target, paths, 0, key_bytes)
 }
 

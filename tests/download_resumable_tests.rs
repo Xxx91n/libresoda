@@ -1,6 +1,8 @@
 //! 可续传下载（`download::download_resumable`）的端到端用例（票
 //! [`#9`](https://github.com/sodahub-org/libresoda/issues/9)，上级
-//! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
+//! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。票
+//! [`#10`](https://github.com/sodahub-org/libresoda/issues/10) 的旧包装转调用例也在这里，
+//! 复用同一套假服务器与合成素材。
 //!
 //! #2 的「测试决定」要求这一层放在**新的集成测试文件**里：用例只看得见公开 API，所以断言只能落在
 //! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误类别与
@@ -631,5 +633,28 @@ fn the_legacy_wrapper_removes_staging_after_a_failure() {
     assert!(!record(&target).exists(), "旧策略失败要删掉记录");
     assert!(!dec_tmp(&target).exists(), "旧策略失败不该留下解密临时名");
     assert!(!target.exists(), "旧策略失败不该产出目标文件");
+    cleanup(&dir);
+}
+
+/// 下载成功但**交付段**（解密）失败：旧策略同样删掉暂存，不像可续传策略那样留着密文等
+/// 只重跑解密。
+#[test]
+fn the_legacy_wrapper_removes_staging_after_a_delivery_failure() {
+    let dir = sandbox("legacy-delivery-failure");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    // 下载这一步成功（`200` 整份），但这串字节不是 MP4：解密必然失败。
+    let corrupt = b"this is not an mp4".to_vec();
+    let (url, _) = stream_server(vec![answered("200 OK", &[], &corrupt)]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("解不开的东西该报错");
+
+    assert!(matches!(error, SodaError::Crypto(_)), "{error:?}");
+    assert!(!part(&target).exists(), "交付失败后旧策略要删掉 .part");
+    assert!(!record(&target).exists(), "交付失败后旧策略要删掉记录");
+    assert!(!dec_tmp(&target).exists(), "交付失败后不该留下解密临时名");
+    assert!(!target.exists(), "交付失败后不该产出目标文件");
     cleanup(&dir);
 }

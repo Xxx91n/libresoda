@@ -252,10 +252,11 @@ pub fn download(soda: &Soda, song: &Song, output_path: &Path) -> Result<()> {
 /// 同 [`download`]，但把**这次实际拉取的流信息**（音质 / 格式 / 码率 / 是否试听）
 /// 一并返回，方便客户端显示「当前实际是什么档位」。
 ///
-/// 行为与 #10 之前一致：不续传、每次只发一次整份请求、失败即删本次写下的暂存
+/// 保留 #10 之前的三条下载契约：不续传、每次只发一次整份请求、失败即删本次写下的暂存
 /// （`{目标}.part` / 记录 / `{目标}.dec.tmp`）。成功路径现在会多一遍整文件读写 —— 先把
-/// **加密**字节落到 `.part`，再解密到 `.dec.tmp` 改名到位；代价与删除旧策略的计划记在
-/// `docs/PORTING.md`。需要续传能力请用 [`download_resumable`]。
+/// **加密**字节落到 `.part`，再解密到 `.dec.tmp` 改名到位。与改动前不完全相同的边角
+/// （预存目标不再被失败的调用删除、同目标并发改由锁报错、错误文本与变体）以及删除旧策略的
+/// 计划都记在 `docs/PORTING.md`。需要续传能力请用 [`download_resumable`]。
 pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadInfo> {
     download_with_strategy(soda, song, output_path, DownloadStrategy::Legacy).map(|(info, _)| info)
 }
@@ -323,8 +324,7 @@ pub struct DownloadReport {
     /// 独立是为了让调用方别用 `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，
     /// 不是这次写下的数（#2 验收）。
     pub on_disk: u64,
-    /// 文件总长：`206` / `416` 用这次 `Content-Range` 的总长（`416` 判成已下完时它就是本地
-    /// 长度）；`200` 没有范围事实，用交付的字节数。
+    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
     pub total_len: u64,
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
