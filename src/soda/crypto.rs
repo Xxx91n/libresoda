@@ -49,8 +49,7 @@ pub struct SencSample {
 
 /// 等价 `DecryptAudio`：整文件解密（`play_auth` 解出 AES 密钥，再按 senc 样本解密）。
 pub fn decrypt_audio(file_data: &[u8], play_auth: &str) -> Result<Vec<u8>> {
-    let hex_key = extract_key(play_auth)?;
-    let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
+    let key_bytes = key_bytes_from_play_auth(play_auth)?;
     decrypt_audio_with_key(file_data, &key_bytes)
 }
 
@@ -309,9 +308,18 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
     play_auth: &str,
     out: &mut W,
 ) -> Result<()> {
-    let hex_key = extract_key(play_auth)?;
-    let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;
+    let key_bytes = key_bytes_from_play_auth(play_auth)?;
     decrypt_stream(input, &key_bytes, out)
+}
+
+/// 从 `play_auth` 还原出 AES 密钥字节。
+///
+/// [`extract_key`] 与 [`hex_decode`] 的合体：`download_resumable`（#9）要按这些字节算记录里的
+/// 密钥指纹，与两个解密入口共用同一份还原与错误文案。长度不在这里校验 —— 交给
+/// [`decrypt_audio_with_key`] / [`decrypt_stream`]，与改动前的失败时机一致。
+pub(crate) fn key_bytes_from_play_auth(play_auth: &str) -> Result<Vec<u8>> {
+    let hex_key = extract_key(play_auth)?;
+    hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))
 }
 
 /// 等价 `encryptedSampleOriginalFormat`：从 `frma` box 里读原始格式，失败则退回 `mp4a`。

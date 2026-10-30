@@ -30,9 +30,10 @@
 //! | 传输中断、磁盘满、写盘失败 | 保留 |
 //!
 //! 这一层只看流地址回的状态码：「无权益」是取流阶段（`resolve_download_info`）的结论，不在这里
-//! 判。它在实现里兑现成**试听回退**（`Ok` + `is_preview`，见 `download::download_resumable`），
-//! 不是一次失败，所以处置表里没有「无权益就删」的格子；取流以错误形式失败时一律按「认不出的失败」
-//! 保留。
+//! 判。它在实现里兑现成**试听回退**（`Ok` + `DownloadInfo::is_preview`），不是一次失败；交付照常
+//! 走完，暂存对在成功后作废，所以处置表里没有「无权益就删」的格子。取流以错误形式失败时一律按
+//! 「认不出的失败」保留。注意 `DownloadReport` 不携带 `is_preview`：需要这个标记的调用方用
+//! `get_download_info` 另取。
 //!
 //! 解密失败**不删** `.part`（#2 用户故事 12 / 实施决定）：加密数据完整就能只重跑解密。这与处置表
 //! 里「数据本身有问题 → 删除」不冲突 —— 那一格讲的是**交付的字节**与这次 `Content-Range` 不符，
@@ -41,20 +42,17 @@
 use super::crypto::decrypt_stream;
 use super::fetch::{fetch_range, RangeResponse};
 use super::part_record::{
-    append_suffix, discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts,
-    staged_paths, write_record, PartRecord, StagedPaths,
+    discard_parts, file_len, key_fingerprint, load_record, purge_expired_parts, staged_paths,
+    write_record, PartRecord, StagedPaths,
 };
 use super::resume::{decide_resume_action, ResumeAction, ResumeProbe};
 use crate::error::{Result, SodaError};
 use crate::http::RequestOption;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 一次读写的块大小：响应体不进内存（同 `download_with_info` 的流式做法）。
 const STAGE_CHUNK: usize = 64 * 1024;
-
-/// 解密输出的临时名后缀：`{目标}.dec.tmp`，与目标同目录（跨文件系统改名会退化成拷贝、失去原子性）。
-const DECRYPTED_SUFFIX: &str = ".dec.tmp";
 
 /// 一次暂存下载交回的事实，全是外部可见的：磁盘上有什么、这次传了多少、服务器怎么答的。
 /// 对外的详细结果结构是 [`crate::soda::download::DownloadReport`]（`#[non_exhaustive]`），
@@ -99,15 +97,15 @@ enum PumpFail {
 ///
 /// `key_bytes` 必须是**解出来的 AES 密钥字节**（`crypto::extract_key(play_auth)` 再 `hex_decode`），
 /// 它的指纹写进记录，下次同目标同密钥才接得上；不能传 `play_auth` 串本身（#7 的
-/// [`PartRecord::new`] 同一条口径）。`None` 表示这次是明文流：暂存的字节就是成品，`finish`
+/// [`PartRecord::new`] 同一条口径）。`None` 表示这次是明文流：暂存的字节就是成品，`deliver`
 /// 只把它照抄到临时名再改名。`options` 是调用方要上的头（UA / Cookie）；`If-Range` 由这里按记录
 /// 里的强 `ETag` 加上，调用方自己传的同名头优先。
 ///
 /// 落盘顺序（#7 交给 #8 的四条义务）：取锁 → `purge_expired_parts` → `load_record` → 判断 → 写盘
-/// → 解密到 `{目标}.dec.tmp` → 改名 → 作废暂存对。锁一直罩到交付完成：解密的输入就是 `.part`，
-/// 而 #2 要求 `.part` 的**所有**读写都在锁下，没有绕过的分支。记录只在 `.part` 写完（或写坏）
-/// 之后写一次：崩溃留下的「`.part` 比记录长」由 `load_record` 一起作废，所以这里不中途重写记录
-/// —— 保证的是「断网后接得上」，不保证「进程被杀也接得上」。
+/// → 解密到 `{目标}.dec.tmp` → 改名 → 作废暂存对。锁守卫活到 `deliver` 返回（同一个 `_lock`
+/// 的作用域覆盖整段）：解密的输入就是 `.part`，而 #2 要求 `.part` 的**所有**读写都在锁下。
+/// 记录只在 `.part` 写完（或写坏）之后写一次：崩溃留下的「`.part` 比记录长」由 `load_record`
+/// 一起作废，所以这里不中途重写记录 —— 保证的是「断网后接得上」，不保证「进程被杀也接得上」。
 pub(crate) fn download_staged_to_file(
     url: &str,
     key_bytes: Option<&[u8]>,
@@ -118,7 +116,7 @@ pub(crate) fn download_staged_to_file(
     create_parent_dir(&paths)?;
     let _lock = acquire_lock(&paths)?;
     let facts = download_staged_locked(url, key_bytes.unwrap_or(&[]), target, options, &paths)?;
-    finish(&paths, target, key_bytes)?;
+    deliver(&paths, target, key_bytes)?;
     Ok(facts)
 }
 
@@ -281,32 +279,26 @@ fn stage_response(
 
 /// 把 `.part` 里的字节交付到 `target`：解密（明文流则照抄）到 `{目标}.dec.tmp`，成功后改名到位，
 /// 再作废暂存对。调用方必须持有 `{目标}.part.lock` —— 它读 `.part`，而 #2 要求 `.part` 的所有
-/// 读写都在锁下。
+/// 读写都在锁下（这里由 `download_staged_to_file` 里那个 `_lock` 的作用域罩住，没有另取）。
 ///
 /// 失败时目标文件**一个字节都没被碰过**：内容只经由最后那次原子改名到达 `target`。解密失败与
-/// 改名失败都保留加密数据（可以只重跑解密），临时名在两条失败路径上都会被清掉。
-fn finish(paths: &StagedPaths, target: &Path, key_bytes: Option<&[u8]>) -> Result<()> {
-    let tmp = decrypted_tmp_path(target)?;
-    if let Err(error) = write_decrypted(&paths.part, &tmp, key_bytes) {
+/// 改名失败都保留加密数据（可以再调一次：服务端若回 `416` 证明已经下完，就只重做解密，不传字节），
+/// 临时名在两条失败路径上都会被清掉。
+fn deliver(paths: &StagedPaths, target: &Path, key_bytes: Option<&[u8]>) -> Result<()> {
+    let tmp = &paths.decrypted;
+    if let Err(error) = write_decrypted(&paths.part, tmp, key_bytes) {
         // 解密失败不删 `.part`（#2 用户故事 12）：加密数据完整就能只重跑解密
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(&tmp, target) {
+    if let Err(error) = std::fs::rename(tmp, target) {
         // 改名要么整个发生、要么没发生：目标没被碰过，半截也不留在盘上
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(error.into());
     }
     // 交付已经完成：清不掉暂存只留下缓存垃圾，不能让调用方以为这次下载失败
     let _ = discard_parts(target);
     Ok(())
-}
-
-/// `{目标}.dec.tmp`：解密输出的临时名，与目标同一个目录（#2 的实施决定 —— 跨文件系统的改名
-/// 会退化成拷贝，失去原子性）。
-fn decrypted_tmp_path(target: &Path) -> Result<PathBuf> {
-    append_suffix(target, DECRYPTED_SUFFIX)
-        .ok_or_else(|| SodaError::invalid_input("download target has no file name"))
 }
 
 /// 解密一遍到 `out`；`key_bytes` 为 `None` 时是明文流，原样照抄。

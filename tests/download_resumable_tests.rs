@@ -3,16 +3,13 @@
 //! [`#2`](https://github.com/sodahub-org/libresoda/issues/2)）。
 //!
 //! #2 的「测试决定」要求这一层放在**新的集成测试文件**里：用例只看得见公开 API，所以断言只能落在
-//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误文本与
+//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误类别与
 //! 线上真发了几次什么请求。假服务器按 #2 的约定用本地 `TcpListener` 手写，不引 mock 库。
 //!
-//! 合成 MP4 的构造与 `tests/crypto_tests.rs` 同源（集成测试各自是独立 crate，没法共享那里的私有
-//! 辅助）：这里只需要「一把已知密钥能解开的加密样本」，用来证明交付的是解密后的成品而不是密文，
-//! 并让「与一次性整份下载逐字节相同」能真的比出来。
+//! 合成素材（密钥、MP4 box、`play_auth`）来自 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用；
+//! 这里只需要「一把已知密钥能解开的加密样本」，用来证明交付的是解密后的成品而不是密文，并让
+//! 「与一次性整份下载逐字节相同」能真的比出来。
 
-use aes::cipher::{KeyIvInit, StreamCipher};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use libresoda::soda::crypto::decrypt_audio_with_key;
 use libresoda::{Soda, SodaError, Song};
 use std::io::{Read, Write};
@@ -21,11 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+mod common;
 
-const KEY: [u8; 16] = [
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-];
+use common::{build_mp4, build_play_auth, ctr_apply, KEY};
 
 /// 第一趟故意断在第 100 个字节：整份密文比它长得多（见 [`encrypted_fixture`]）。
 const CUT: usize = 100;
@@ -115,74 +110,8 @@ fn seen(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// 合成素材：加密 MP4 + 可被还原的 play_auth
+// 合成素材：两个样本的加密 MP4
 // ---------------------------------------------------------------------------
-
-fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + payload.len());
-    out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(payload);
-    out
-}
-
-fn ctr_apply(data: &[u8], iv8: &[u8; 8]) -> Vec<u8> {
-    let mut iv = [0u8; 16];
-    iv[..8].copy_from_slice(iv8);
-    let mut cipher = Aes128Ctr::new((&KEY).into(), (&iv).into());
-    let mut out = data.to_vec();
-    cipher.apply_keystream(&mut out);
-    out
-}
-
-/// 构造一个包含 moov(trak(mdia(minf(stbl(stsd, stsz, senc, tenc))))) + mdat 的最小 MP4。
-fn build_mp4(
-    sample_sizes: &[u32],
-    senc_payload: &[u8],
-    mdat_payload: &[u8],
-    iv_size: u8,
-) -> Vec<u8> {
-    let mut stsz_payload = vec![0u8; 12];
-    stsz_payload[8..12].copy_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    for size in sample_sizes {
-        stsz_payload.extend_from_slice(&size.to_be_bytes());
-    }
-    let stsz = mp4_box(b"stsz", &stsz_payload);
-
-    let frma = mp4_box(b"frma", b"mp4a");
-    let mut enca_payload = vec![0u8; 28];
-    enca_payload.extend_from_slice(&frma);
-    let enca = mp4_box(b"enca", &enca_payload);
-    let mut stsd_payload = vec![0u8; 8];
-    stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-    stsd_payload.extend_from_slice(&enca);
-    let stsd = mp4_box(b"stsd", &stsd_payload);
-
-    let senc = mp4_box(b"senc", senc_payload);
-
-    let mut tenc_payload = vec![0u8; 8];
-    tenc_payload[7] = iv_size;
-    let tenc = mp4_box(b"tenc", &tenc_payload);
-    let schi = mp4_box(b"schi", &tenc);
-    let sinf = mp4_box(b"sinf", &schi);
-
-    let mut stbl_payload = Vec::new();
-    stbl_payload.extend_from_slice(&stsd);
-    stbl_payload.extend_from_slice(&stsz);
-    stbl_payload.extend_from_slice(&senc);
-    stbl_payload.extend_from_slice(&sinf);
-    let stbl = mp4_box(b"stbl", &stbl_payload);
-
-    let minf = mp4_box(b"minf", &stbl);
-    let mdia = mp4_box(b"mdia", &minf);
-    let trak = mp4_box(b"trak", &mdia);
-    let moov = mp4_box(b"moov", &trak);
-
-    let mut file = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
-    file.extend_from_slice(&moov);
-    file.extend_from_slice(&mp4_box(b"mdat", mdat_payload));
-    file
-}
 
 /// 两个样本的加密 MP4：解密之后是两个可预期的明文样本。
 fn encrypted_fixture() -> Vec<u8> {
@@ -204,39 +133,6 @@ fn encrypted_fixture() -> Vec<u8> {
 
 fn key_hex(key: &[u8]) -> String {
     key.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// 按上游 `extractKey` 的逆向算法构造一个可被还原的 `play_auth`（同 `tests/crypto_tests.rs`）。
-fn build_play_auth(key_hex: &str, skip: u8) -> String {
-    // tmp = [skip 字符, key_hex..., skip 个填充字节]
-    let mut tmp: Vec<u8> = Vec::new();
-    tmp.push(b'0' + skip);
-    tmp.extend_from_slice(key_hex.as_bytes());
-    tmp.resize(tmp.len() + skip as usize, 0u8);
-
-    let desired = |index: usize| -> u8 {
-        let value = tmp[index] as i32 + (index as u32).count_ones() as i32 + 21;
-        (value % 255) as u8
-    };
-
-    // input[i] = buff[i] ^ desired(i)，其中 buff = [0xFA, 0x55] + input
-    let mut input = vec![0u8; tmp.len()];
-    input[0] = desired(0) ^ 0xFA;
-    if tmp.len() > 1 {
-        input[1] = desired(1) ^ 0x55;
-    }
-    for index in 2..tmp.len() {
-        input[index] = desired(index) ^ input[index - 2];
-    }
-
-    // padding_len 必须为 0：要求 b0 ^ b1 ^ b2 == 48（'0'）
-    let b1 = input[0];
-    let b2 = input[1];
-    let b0 = 0x30u8 ^ b1 ^ b2;
-
-    let mut bytes_data = vec![b0, b1, b2];
-    bytes_data.extend_from_slice(&input[2..]);
-    BASE64.encode(bytes_data)
 }
 
 /// `play_auth` 是 base64（含 `+` `/` `=`），在 `#auth=` 里必须百分号转义，否则
@@ -433,6 +329,8 @@ fn a_decrypt_failure_keeps_the_encrypted_bytes_for_a_retry() {
     let dir = sandbox("decrypt-failure");
     let target = target_in(&dir);
     let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    // 目标位置上先放一份旧文件：交付失败不该动它。
+    std::fs::write(&target, b"old target bytes").expect("plant old target");
     // 下载这一步成功（`200` 整份），但这串字节不是 MP4：解密必然失败。
     let corrupt = b"this is not an mp4".to_vec();
     let (url, _) = stream_server(vec![answered("200 OK", &[], &corrupt)]);
@@ -447,8 +345,73 @@ fn a_decrypt_failure_keeps_the_encrypted_bytes_for_a_retry() {
         "重跑解密要用的就是这串字节"
     );
     assert!(record(&target).exists(), "记录也得留着，下一次才接得上");
-    assert!(!target.exists(), "失败不该产出目标文件");
+    assert_eq!(
+        std::fs::read(&target).expect("旧目标还在"),
+        b"old target bytes",
+        "交付失败不能碰目标文件"
+    );
     assert!(!dec_tmp(&target).exists(), "失败的解密临时名留在盘上");
+    cleanup(&dir);
+}
+
+/// 交付失败（这里让解密输出去撞一个目录）之后，`.part` 与记录都在；再调一次时服务端用 `416`
+/// 证明已经下完，于是**一个字节都不再传**，只重做解密 —— #2 用户故事 12 的「只重跑解密」。
+/// 顺带钉住：上一次留下的 `.dec.tmp` 会在这次交付时被截断重用。
+#[test]
+fn a_failed_delivery_is_retried_without_transferring_bytes() {
+    let dir = sandbox("retry-delivery");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 第一次：下载成功，但解密输出的名字被一个目录占着 —— 交付失败，加密数据留着。
+    std::fs::create_dir(dec_tmp(&target)).expect("block the dec temp");
+    let (first_url, _) = stream_server(vec![answered("200 OK", &[], &ciphertext)]);
+    let error = soda
+        .download_resumable(&song_for(&first_url, &play_auth), &target)
+        .expect_err("解密输出写不进去");
+    assert!(matches!(error, SodaError::Io(_)), "{error:?}");
+    assert_eq!(part_bytes(&target).expect("加密数据留着"), ciphertext);
+    assert!(record(&target).exists());
+    assert!(!target.exists());
+
+    // 去掉障碍，再摆一份残骸在解密临时名上：这次的交付要把它截断重用。
+    std::fs::remove_dir(dec_tmp(&target)).expect("unblock");
+    std::fs::write(dec_tmp(&target), b"stale decryption residue").expect("plant residue");
+
+    // 第二次：`416` 的 `bytes */N` 同时等于本地长度与记录总长 → 判已完成，只解密。
+    let range = format!("Content-Range: bytes */{total}");
+    let (retry_url, server) = stream_server(vec![response(
+        "416 Range Not Satisfiable",
+        &[range.as_str()],
+        Some(0),
+        b"",
+    )]);
+    let report = soda
+        .download_resumable(&song_for(&retry_url, &play_auth), &target)
+        .expect("416 之后只重做解密");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains(&format!("Range: bytes={total}-")),
+        "{}",
+        requests[0]
+    );
+    assert_eq!(report.status, 416);
+    assert_eq!(report.transferred, 0, "已下完时一个字节都不该再传");
+    assert_eq!(report.resumed_from, None);
+    assert_eq!(report.on_disk, total as u64);
+    assert_eq!(report.total_len, total as u64);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt"),
+        "只重做解密也要交出正确的成品"
+    );
+    assert!(!part(&target).exists() && !record(&target).exists());
+    assert!(!dec_tmp(&target).exists(), "残骸没被这次交付换掉");
     cleanup(&dir);
 }
 
@@ -486,6 +449,8 @@ fn a_plaintext_stream_is_delivered_through_the_same_temp_name() {
     let dir = sandbox("plaintext");
     let target = target_in(&dir);
     let body = b"plain m4a bytes, no play_auth".to_vec();
+    // 目标位置上先放一份旧文件：成功交付要把旧内容替换掉。
+    std::fs::write(&target, b"old target bytes").expect("plant old target");
     let (url, _) = stream_server(vec![answered("200 OK", &[], &body)]);
     // 空 `play_auth`：SEO 接口对免费歌曲返回明文 m4a，暂存的字节就是成品。
     let song = Song {
@@ -502,7 +467,11 @@ fn a_plaintext_stream_is_delivered_through_the_same_temp_name() {
     assert_eq!(report.transferred, body.len() as u64);
     assert_eq!(report.on_disk, body.len() as u64);
     assert_eq!(report.total_len, body.len() as u64);
-    assert_eq!(std::fs::read(&target).expect("输出文件"), body);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        body,
+        "成功交付要覆盖旧目标"
+    );
     assert!(!part(&target).exists());
     assert!(!record(&target).exists());
     assert!(!dec_tmp(&target).exists());

@@ -311,7 +311,9 @@ pub struct DownloadReport {
     /// 本次实际从网络写入的字节数（`416` 判成已下完时为 0）。与 `on_disk` 是两个独立字段，
     /// 不让调用方相减（#2 验收）。
     pub transferred: u64,
-    /// 磁盘上累计的字节数：交付前 `{目标}.part` 的长度，完整时等于 `total_len`。
+    /// 磁盘上累计的字节数：交付前 `{目标}.part` 的长度。成功交付时它等于 `total_len`；两个字段
+    /// 独立是为了让调用方别用 `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，
+    /// 不是这次写下的数（#2 验收）。
     pub on_disk: u64,
     /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
     pub total_len: u64,
@@ -324,13 +326,14 @@ pub struct DownloadReport {
 ///
 /// 一次调用完成全部工作（#2 的公开接口）：协议退回整份时库内最多多发一次请求，不重试、不等待、
 /// 不睡眠。落盘的名字全部由 `output_path` 推导 —— `{目标}.part` / `.part.meta` / `.part.lock`
-/// （见 `part_record`）与解密输出的临时名 `{目标}.dec.tmp`。
+/// 与解密输出的临时名 `{目标}.dec.tmp`（见 `part_record` 的命名表）。
 ///
-/// 失败时的两条：解密失败**不删**加密数据，调用方可以只重跑解密（#2 用户故事 12）；目标文件只在
-/// 最后那次改名时才被碰，失败不留半截产物。
+/// 失败时的两条：解密失败**不删**加密数据，再调一次时服务端若回 `416` 证明已经下完，就只重做
+/// 解密、不再传字节（#2 用户故事 12）；目标文件只在最后那次改名时才被碰，失败不留半截产物。
 ///
-/// 返回的 [`DownloadReport`] 描述这次传输本身；流信息（音质/格式/是否试听）用
-/// [`get_download_info`] 另取（与 [`download_with_info`] 的分工）。
+/// 返回的 [`DownloadReport`] 只描述这次传输本身；流信息（音质/格式/是否试听）用
+/// [`get_download_info`] 另取 —— 这份报告不携带「这次是不是试听片段」的标记（与
+/// [`download_with_info`] 的分工）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
     let info = get_download_info(soda, song)?;
     let url = info.url.trim();
@@ -338,14 +341,11 @@ pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Resul
         return Err(SodaError::invalid_input("invalid download url"));
     }
     // 记录里存的是密钥字节的指纹（#7），所以这里解到字节为止；明文流（无 play_auth）没有密钥。
+    // 密钥长度不在这里判：与改动前一样，交给解密那一步（失败时 .part 留下，可重跑）。
     let key_bytes = if info.play_auth.trim().is_empty() {
         None
     } else {
-        let hex_key = super::crypto::extract_key(&info.play_auth)?;
-        Some(
-            super::crypto::hex_decode(&hex_key)
-                .ok_or_else(|| SodaError::crypto("invalid hex key"))?,
-        )
+        Some(super::crypto::key_bytes_from_play_auth(&info.play_auth)?)
     };
     let options =
         [crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)];
