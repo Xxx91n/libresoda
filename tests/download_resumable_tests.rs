@@ -501,7 +501,7 @@ fn a_plaintext_stream_is_delivered_like_an_encrypted_one() {
 }
 
 /// 非空 `play_auth` 解出空串的畸形输入：不能把它当「明文流」的哨兵（空密钥与明文流的指纹
-/// 相同），也不能先下完再在解密时才发现 —— 发请求之前就拒掉。
+/// 相同），也不能先下完再在解密时才发现 —— 发流请求之前就拒掉。
 #[test]
 fn a_malformed_play_auth_is_rejected_before_the_request() {
     let dir = sandbox("empty-key");
@@ -518,7 +518,7 @@ fn a_malformed_play_auth_is_rejected_before_the_request() {
         error.to_string().contains("invalid aes key length"),
         "{error}"
     );
-    assert!(seen(&server).is_empty(), "坏密钥不该先发请求");
+    assert!(seen(&server).is_empty(), "坏密钥不该先发流请求");
     assert!(!part(&target).exists() && !target.exists());
     cleanup(&dir);
 }

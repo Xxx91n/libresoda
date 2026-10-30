@@ -76,10 +76,10 @@ pub(crate) struct PartRecord {
 impl PartRecord {
     /// 组一条记录。
     ///
-    /// `key_bytes` 必须是**解出来的 AES 密钥字节**：先 `crypto::extract_key(play_auth)` 拿到
-    /// 十六进制文本，再 `crypto::hex_decode(..)` 解成字节，传后者。不能传 `play_auth` 字符串，
-    /// 也不能传那串十六进制文本本身 —— #3 记下过同一个密钥可能有大写和小写两种写法，比文本会
-    /// 把同一把判成两把。长度这里不校验：不是 16 字节的东西 `crypto` 在解密时本来就会拒。
+    /// `key_bytes` 必须是**解出来的 AES 密钥字节**：用 `crypto::key_bytes_from_play_auth`
+    /// （`extract_key` + `hex_decode` + 长度校验）拿到。不能传 `play_auth` 字符串，也不能传那串
+    /// 十六进制文本本身 —— #3 记下过同一个密钥可能有大写和小写两种写法，比文本会把同一把判成
+    /// 两把。长度这里**不再校验**：生产入口在发流请求前就校验过；本函数只对传进来的字节算指纹。
     pub(crate) fn new(
         total_len: u64,
         etag: Option<&str>,
@@ -1141,14 +1141,16 @@ mod part_record_tests {
         write_part(&target, 300);
         write_record(&target, &record(1000, None, 300)).expect("write record");
         let (part_path, record_path) = paths(&target);
-        set_mtime(
-            &record_path,
-            SystemTime::now() - MAX_AGE - Duration::from_secs(60),
-        );
+        let dec_path = staged_paths(&target).expect("paths").decrypted_tmp;
+        std::fs::write(&dec_path, b"half decrypted").expect("write dec temp");
+        let long_ago = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
+        set_mtime(&record_path, long_ago);
+        set_mtime(&dec_path, long_ago);
 
         purge_expired_parts(&dir.join("purge-trigger.m4a")).expect("purge");
         assert!(part_path.is_file());
         assert!(record_path.is_file(), "数据还年轻，记录不该被单独清掉");
+        assert!(dec_path.is_file(), "整对没有全过期，解密残骸不该被单独清掉");
         cleanup(&dir);
     }
 

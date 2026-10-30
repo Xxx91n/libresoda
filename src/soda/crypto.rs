@@ -316,8 +316,9 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
 ///
 /// [`extract_key`] 与 [`hex_decode`] 的合体，长度校验也在这里：`download_resumable`（#9）要用
 /// 「有没有密钥」区分明文流与加密流，而一条畸形的非空 `play_auth` 可能解出空串 —— 若把它当成
-/// 空密钥，就会与明文流的指纹撞车（续传时把密文当明文交出去）。长度在**发请求之前**判掉，
-/// 错误文案仍是 `decrypt_audio_with_key` / `decrypt_stream` 用的那一条。
+/// 空密钥，就会与明文流的指纹撞车（续传时把密文当明文交出去）。长度在**发流请求之前**判掉，
+/// 错误文案仍是 `decrypt_audio_with_key` / `decrypt_stream` 用的那一条（`tests/crypto_tests.rs`
+/// 从这两个入口各断一次）。
 pub(crate) fn key_bytes_from_play_auth(play_auth: &str) -> Result<Vec<u8>> {
     let hex_key = extract_key(play_auth)?;
     let key_bytes = hex_decode(&hex_key).ok_or_else(|| SodaError::crypto("invalid hex key"))?;

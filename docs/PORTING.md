@@ -374,21 +374,27 @@
   - **解密失败不删 `.part`，也不删记录**（#2 用户故事 12 / 实施决定）。「只重跑解密」的恢复路线
     没有单独的公开入口：再调一次 `download_resumable`，服务端若回 `416`（总长同时等于本地长度与
     记录总长）就判已完成、**一个字节都不再传**，直接重做解密；服务端不认范围请求时退回整份。
-    `tests/download_resumable_tests.rs` 有一条用例钉这条恢复路线（用被目录占住的 `.dec.tmp`
-    制造一次交付失败，第二次 416 只解密）。处置表里「数据本身有问题 → 删除」那一格讲的是
+    `tests/download_resumable_tests.rs` 有两条用例钉这条恢复路线：一条用被目录占住的 `.dec.tmp`
+    制造交付失败、第二次 416 只解密（`transferred == 0`）；另一条让**真正的解密失败**后再来一次
+    416，断言仍然不再传字节、密文继续留着。处置表里「数据本身有问题 → 删除」那一格讲的是
     **交付的字节**与这次 `Content-Range` 不符（下载层已经落地），不是本地解密失败 —— 两处判据别混。
-  - **错误变体的两段不对称**：下载段的 I/O 失败被包成 `SodaError::Http("staged download
-    interrupted: …")`（#8 的既有文案），交付段（建临时名 / 解密 / 改名）的 I/O 失败是
-    `SodaError::Io`。同一类磁盘故障在两个阶段是两个变体；`SodaError` 不改公开形状（#2 的
-    「不改公开的错误类型」），调用方别按变体判「磁盘满」。
+  - **错误变体不按阶段对齐**：下载段（写 `.part`）的 I/O 失败被包成
+    `SodaError::Http("staged download interrupted: …")`（#8 的既有文案）；交付段里
+    **建临时名 / 打开 / `flush` / 改名**是 `SodaError::Io`，而**解密过程中的读写错误**又被
+    `crypto` 包成 `SodaError::Crypto`（`read box header failed` / `write failed`）。同一类磁盘
+    故障可能落在三种变体里；`SodaError` 不改公开形状（#2 的「不改公开的错误类型」），调用方别按
+    变体判「磁盘满」。
   - **交付成功才作废暂存对**，且删除是尽力而为：删不掉只会留下缓存垃圾，不能让调用方以为这次
     下载失败；下一次同目标下载由 `load_record` 的「凑不成可信的一对就作废」收尾。
   - **明文流**（没有 `play_auth`，SEO 接口对免费歌曲返回的 m4a）没有密钥：暂存的字节就是成品，
     解密这一步退化成照抄，但走的还是「临时名 + 改名」同一条交付路径。记录里的密钥指纹此时是
     **空密钥的 MD5**，与真密钥不同；在明文与加密之间切换会让指纹对不上，续传作废重下
     —— 这是想要的保守行为（`part_record` 的指纹用例钉住两个指纹不等，#5 的判据钉住不等的后果）。
-    正因为「空密钥」是明文的哨兵，畸形的非空 `play_auth`（`extract_key` 解出空串）**在发请求前**
-    就按 `invalid aes key length` 拒掉，不会与明文流的指纹撞车（`download_resumable_tests` 有用例）。
+    正因为「空密钥」是明文的哨兵，畸形的非空 `play_auth`（`extract_key` 解出空串）**在发流请求
+    之前**就按 `invalid aes key length` 拒掉，不会与明文流的指纹撞车（`download_resumable_tests`
+    有一条；`crypto_tests` 另从 `decrypt_audio` / `decrypt_stream_with_auth` 两个入口各断一次）。
+    长度校验收在 `crypto::key_bytes_from_play_auth` 里，两个移植入口与 #9 共用 —— 对它们而言文案
+    与时机（先于任何解析/读取）都不变。
   - **已有目标文件被原子替换**：目标已存在、且没被别的进程占着时，`rename` 覆盖它是正常行为；
     用例在 Linux（CI 唯一的平台）上先摆一个旧目标再下载。Windows 的 `MoveFileEx` 语义相同，但
     本仓库 CI 不跑 Windows，这一档没有 Windows 证据。目标是个目录时两平台都失败（也有用例）；

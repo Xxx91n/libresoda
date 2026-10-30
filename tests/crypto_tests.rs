@@ -4,9 +4,9 @@
 //! 这里通过合成 MP4 结构补齐离线可回归的单元测试。
 
 use libresoda::soda::crypto::{
-    box_child_start, decode_base36, decrypt_audio_with_key, decrypt_senc_sample, decrypt_stream,
-    encrypted_sample_original_format, extract_key, find_box, find_box_deep, parse_senc, parse_stsz,
-    SencSample,
+    box_child_start, decode_base36, decrypt_audio, decrypt_audio_with_key, decrypt_senc_sample,
+    decrypt_stream, decrypt_stream_with_auth, encrypted_sample_original_format, extract_key,
+    find_box, find_box_deep, parse_senc, parse_stsz, SencSample,
 };
 use std::io::Read;
 
@@ -418,6 +418,24 @@ fn extract_key_round_trip() {
     let key_hex = "00112233445566778899aabbccddeeff";
     let play_auth = build_play_auth(key_hex, 3);
     assert_eq!(extract_key(&play_auth).expect("extract"), key_hex);
+}
+
+#[test]
+fn decrypt_entries_reject_a_wrong_length_key() {
+    // 非空 play_auth 解出空串：两个移植过来的解密入口都要在读写之前按同一条文案拒绝
+    let play_auth = build_play_auth("", 3);
+    let err = decrypt_audio(&[], &play_auth).expect_err("空密钥");
+    assert!(err.to_string().contains("invalid aes key length"), "{err}");
+
+    let mut input = Dribble {
+        data: b"",
+        pos: 0,
+        step: 8,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream_with_auth(&mut input, &play_auth, &mut out).expect_err("空密钥");
+    assert!(err.to_string().contains("invalid aes key length"), "{err}");
+    assert!(out.is_empty(), "拒绝发生在写任何输出之前");
 }
 
 #[test]
