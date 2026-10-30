@@ -337,8 +337,7 @@ pub struct DownloadReport {
 /// [`get_download_info`] 另取 —— 这份报告不携带「这次是不是试听片段」的标记（与
 /// [`download_with_info`] 的分工）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
-    let (_, staged) =
-        download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
+    let (_, staged) = download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
     Ok(DownloadReport {
         resumed_from: staged.resumed_from,
         transferred: staged.transferred,
