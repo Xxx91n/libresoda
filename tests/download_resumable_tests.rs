@@ -522,3 +522,114 @@ fn a_malformed_play_auth_is_rejected_before_the_request() {
     assert!(!part(&target).exists() && !target.exists());
     cleanup(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// 票 #10：旧下载函数只做参数转调，共用同一套暂存实现
+// ---------------------------------------------------------------------------
+
+/// 旧函数仍然「一次调用 = 一次整份请求」，不带 `Range`；交回的流信息就是这次真正下载的那
+/// 一份（不二次解析）；成功交付之后暂存对与解密临时名都不留。
+#[test]
+fn the_legacy_wrapper_downloads_once_without_ranges() {
+    let dir = sandbox("legacy-one-shot");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let (url, server) = stream_server(vec![answered("200 OK", &[], &ciphertext)]);
+
+    let info = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect("旧下载函数");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1, "旧策略只发一次请求");
+    assert!(
+        !requests[0].to_ascii_lowercase().contains("\r\nrange:"),
+        "旧策略不带范围头：{}",
+        requests[0]
+    );
+    assert_eq!(info.url, url, "返回的是这次真正取流的那一份");
+    assert_eq!(info.play_auth, play_auth);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    assert!(!part(&target).exists(), "成功交付后还留着 .part");
+    assert!(!record(&target).exists(), "成功交付后还留着记录");
+    assert!(!dec_tmp(&target).exists(), "成功交付后还留着解密临时名");
+    cleanup(&dir);
+}
+
+/// 旧函数不认可续传留下的暂存：它从头整份取，绝不接在 `.part` 后面（#10「不续传」）。
+#[test]
+fn the_legacy_wrapper_ignores_resumable_staging() {
+    let dir = sandbox("legacy-ignores-staging");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 先用可续传路径留下一段能接的暂存。
+    let range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (dropped_url, _) = stream_server(vec![response(
+        "206 Partial Content",
+        &[range.as_str(), "ETag: \"v1\""],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+    soda.download_resumable(&song_for(&dropped_url, &play_auth), &target)
+        .expect_err("断流不是成功");
+    assert_eq!(part_bytes(&target).expect("留下的暂存"), ciphertext[..CUT]);
+
+    // 旧函数从头下：一次整份请求，且不带上一次留下的偏移。
+    let (url, server) = stream_server(vec![answered("200 OK", &["ETag: \"v1\""], &ciphertext)]);
+    soda.download(&song_for(&url, &play_auth), &target)
+        .expect("旧策略从头下");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].to_ascii_lowercase().contains("\r\nrange:"),
+        "旧策略不该带范围头：{}",
+        requests[0]
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    assert!(!part(&target).exists() && !record(&target).exists());
+    cleanup(&dir);
+}
+
+/// 旧策略「失败即删没下完的文件」：下载段断流后 `.part`、记录、解密临时名与目标都不留，
+/// 不像可续传策略那样把半截密文留给下一次。
+#[test]
+fn the_legacy_wrapper_removes_staging_after_a_failure() {
+    let dir = sandbox("legacy-failure-cleanup");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    // 声明整份长度，却只给 100 个字节就断。
+    let (url, _) = stream_server(vec![response(
+        "200 OK",
+        &[],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+
+    let error = Soda::new("")
+        .download_with_info(&song_for(&url, &play_auth), &target)
+        .expect_err("断流该报错");
+
+    assert!(
+        error.to_string().contains("staged download interrupted"),
+        "{error}"
+    );
+    assert!(!part(&target).exists(), "旧策略失败要删掉 .part");
+    assert!(!record(&target).exists(), "旧策略失败要删掉记录");
+    assert!(!dec_tmp(&target).exists(), "旧策略失败不该留下解密临时名");
+    assert!(!target.exists(), "旧策略失败不该产出目标文件");
+    cleanup(&dir);
+}

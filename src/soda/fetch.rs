@@ -44,8 +44,8 @@ pub(crate) struct RangeResponse {
 ///
 /// 透传有个前提：ureq 每跟一跳重定向就剥掉 `Cookie`，而这层不回 `final_url`，所以
 /// 「被重定向去了别的源站、Cookie 没跟上」在这里看不出来（既有的 [`crate::http::get_reader`]
-/// 走的是同一套机制；只是今天 `download_with_info` 发流只带 UA 不带 Cookie，「带 Cookie
-/// 穿重定向」这条路是续传链才走到的）。这层交不回**能判这件事的事实**（没有 `final_url`，
+/// 走的是同一套机制；今天两个下载入口发流都只带 UA 不带 Cookie，「带 Cookie 穿重定向」
+/// 这条路是续传链才走到的）。这层交不回**能判这件事的事实**（没有 `final_url`，
 /// 其余响应头也不外传）：#8 真要在意重定向，就该给这层加字段，而不是在 #8 里猜。
 pub(crate) fn fetch_range(
     url: &str,
@@ -58,6 +58,24 @@ pub(crate) fn fetch_range(
     }
     let with_range = merge_options(options).header("Range", format!("bytes={offset}-"));
     let raw = get_raw(url, &[with_range])?;
+    Ok(RangeResponse {
+        status: raw.status,
+        range: raw.header("content-range").and_then(parse_content_range),
+        etag: raw.header("etag").map(str::to_string),
+        reader: raw.reader,
+    })
+}
+
+/// 不带 `Range` 的整份取数：旧下载策略（`download` / `download_with_info`，票 #10）用。
+///
+/// 交回的事实与 [`fetch_range`] 相同，只是不拼 `Range` 头：旧策略要的是 #10 之前那条请求的
+/// 形状 —— 服务器回整份 `200`，不会因为开放式区间被某个边缘封顶就把一次正常下载变成失败。
+pub(crate) fn fetch_full(url: &str, options: &[RequestOption]) -> Result<RangeResponse> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(SodaError::invalid_input("invalid download url"));
+    }
+    let raw = get_raw(url, options)?;
     Ok(RangeResponse {
         status: raw.status,
         range: raw.header("content-range").and_then(parse_content_range),
@@ -362,6 +380,27 @@ mod fetch_tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("invalid download url"), "{err}");
+    }
+
+    #[test]
+    fn a_full_fetch_sends_no_range_header() {
+        // 旧策略（#10）要的是改动前那条请求的形状：整份 GET，不带 `Range`。
+        let (url, server) = fake_server(http_response(
+            "200 OK",
+            &["ETag: \"v9\""],
+            &body_of(1000),
+        ));
+        let fetched = fetch_full(&url, &[]).expect("200");
+
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.range, None);
+        assert_eq!(fetched.etag.as_deref(), Some("\"v9\""));
+        assert_eq!(drain(fetched.reader).len(), 1000);
+        let request = server.join().expect("server");
+        assert!(
+            !request.to_ascii_lowercase().contains("\r\nrange:"),
+            "整份取数不该带范围头：{request}"
+        );
     }
 }
 

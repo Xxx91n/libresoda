@@ -4,6 +4,7 @@
 //! 加密流（带 `play_auth`）在下载时本地解密。
 
 use super::quality::{is_lossless, is_preview, quality_rank, track_duration_seconds};
+use super::staged::DownloadStrategy;
 use super::track::{
     best_from_video_model_with_preference, fetch_pc_track_v2, fetch_player_info, fetch_web_track_v2,
 };
@@ -11,7 +12,6 @@ use super::types::DownloadInfo;
 use super::Soda;
 use crate::error::{Result, SodaError};
 use crate::model::{Song, SOURCE_SODA};
-use std::io::Write;
 use std::path::Path;
 
 /// 等价 `GetDownloadInfo`。
@@ -244,55 +244,64 @@ pub fn get_download_url(soda: &Soda, song: &Song) -> Result<String> {
     Ok(info.full_url())
 }
 
-/// 等价 `Download`：拉取流 →（必要时）解密 → 写文件。
+/// 等价 `Download`：转调 [`download_with_info`]（同一套暂存实现上的「旧策略」）。
 pub fn download(soda: &Soda, song: &Song, output_path: &Path) -> Result<()> {
     download_with_info(soda, song, output_path).map(|_| ())
 }
 
 /// 同 [`download`]，但把**这次实际拉取的流信息**（音质 / 格式 / 码率 / 是否试听）
 /// 一并返回，方便客户端显示「当前实际是什么档位」。
+///
+/// 行为与 #10 之前一致：不续传、每次只发一次整份请求、失败即删本次写下的暂存
+/// （`{目标}.part` / 记录 / `{目标}.dec.tmp`）。成功路径现在会多一遍整文件读写 —— 先把
+/// **加密**字节落到 `.part`，再解密到 `.dec.tmp` 改名到位；代价与删除旧策略的计划记在
+/// `docs/PORTING.md`。需要续传能力请用 [`download_resumable`]。
 pub fn download_with_info(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadInfo> {
+    download_with_strategy(soda, song, output_path, DownloadStrategy::Legacy)
+        .map(|(info, _)| info)
+}
+
+/// 两种策略共用的「解析流 → 暂存下载 → 交付」。
+///
+/// 交回的 [`DownloadInfo`] 就是**这次真正用到的**那一份：包装函数不能自己再解析一次，
+/// 否则会多一次 `pc/track_v2` 请求，而且第二次解析可能给出另一条流（不同 CDN / 档位 /
+/// 新 `play_auth`），返回给调用方的音质与 `is_preview` 会与落盘文件不是同一条（#10 的前向
+/// 约束）。
+fn download_with_strategy(
+    soda: &Soda,
+    song: &Song,
+    output_path: &Path,
+    strategy: DownloadStrategy,
+) -> Result<(DownloadInfo, DownloadReport)> {
     let info = get_download_info(soda, song)?;
     let url = info.url.trim();
     if url.is_empty() {
         return Err(SodaError::invalid_input("invalid download url"));
     }
-
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    // 边下边解密边写盘：整曲不再进内存。无损单曲 40~80MB，之前「body + 解密副本」
-    // 会让峰值内存翻倍；配合多首预取并发，实测能占到几百 MB。
+    // 记录里存的是密钥字节的指纹（#7），所以这里解到字节为止；明文流（无 play_auth）没有密钥。
+    // 密钥长度在这里判掉：畸形的非空 play_auth 可能解出空串，不能让它与明文流的指纹撞车。
+    let key_bytes = if info.play_auth.trim().is_empty() {
+        None
+    } else {
+        Some(super::crypto::key_bytes_from_play_auth(&info.play_auth)?)
+    };
     let options =
         [crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)];
-    let mut reader = crate::http::get_reader(url, &options)?;
-    let file = std::fs::File::create(output_path)?;
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
-
-    let written = if info.play_auth.trim().is_empty() {
-        // SEO url_player_info 对免费歌曲返回明文 m4a（无 play_auth），直接落盘
-        std::io::copy(&mut reader, &mut writer)
-            .map(|_| ())
-            .map_err(|err| SodaError::http(err.to_string()))
-    } else {
-        super::crypto::decrypt_stream_with_auth(&mut reader, &info.play_auth, &mut writer)
-    }
-    .and_then(|()| {
-        writer
-            .flush()
-            .map_err(|err| SodaError::http(err.to_string()))
-    });
-    drop(writer);
-
-    if let Err(err) = written {
-        // 半截文件不能留在缓存里冒充有效音频
-        let _ = std::fs::remove_file(output_path);
-        return Err(err);
-    }
-    Ok(info)
+    let staged = super::staged::download_staged_to_file(
+        url,
+        key_bytes.as_deref(),
+        output_path,
+        &options,
+        strategy,
+    )?;
+    let report = DownloadReport {
+        resumed_from: staged.resumed_from,
+        transferred: staged.transferred,
+        on_disk: staged.on_disk,
+        total_len: staged.total_len,
+        status: staged.status,
+    };
+    Ok((info, report))
 }
 
 /// 一次可续传下载交回的传输事实（[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的
@@ -315,7 +324,8 @@ pub struct DownloadReport {
     /// 独立是为了让调用方别用 `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，
     /// 不是这次写下的数（#2 验收）。
     pub on_disk: u64,
-    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
+    /// 文件总长：`206` / `416` 用这次 `Content-Range` 的总长（`416` 判成已下完时它就是本地
+    /// 长度）；`200` 没有范围事实，用交付的字节数。
     pub total_len: u64,
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
@@ -335,29 +345,8 @@ pub struct DownloadReport {
 /// [`get_download_info`] 另取 —— 这份报告不携带「这次是不是试听片段」的标记（与
 /// [`download_with_info`] 的分工）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
-    let info = get_download_info(soda, song)?;
-    let url = info.url.trim();
-    if url.is_empty() {
-        return Err(SodaError::invalid_input("invalid download url"));
-    }
-    // 记录里存的是密钥字节的指纹（#7），所以这里解到字节为止；明文流（无 play_auth）没有密钥。
-    // 密钥长度在这里判掉：畸形的非空 play_auth 可能解出空串，不能让它与明文流的指纹撞车。
-    let key_bytes = if info.play_auth.trim().is_empty() {
-        None
-    } else {
-        Some(super::crypto::key_bytes_from_play_auth(&info.play_auth)?)
-    };
-    let options =
-        [crate::http::RequestOption::new().header("User-Agent", super::types::USER_AGENT)];
-    let staged =
-        super::staged::download_staged_to_file(url, key_bytes.as_deref(), output_path, &options)?;
-    Ok(DownloadReport {
-        resumed_from: staged.resumed_from,
-        transferred: staged.transferred,
-        on_disk: staged.on_disk,
-        total_len: staged.total_len,
-        status: staged.status,
-    })
+    download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)
+        .map(|(_, report)| report)
 }
 
 impl Soda {

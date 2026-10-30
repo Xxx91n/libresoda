@@ -43,7 +43,8 @@ pub(crate) mod resume;
 pub mod search;
 pub mod signature;
 pub mod song;
-// 暂存下载主路径：对外入口是 `download::download_resumable`，模块本身仍不 pub（docs/PORTING.md）。
+// 暂存下载主路径：对外入口是 `download` 的三个公开函数（旧策略转调 + download_resumable），
+// 模块本身仍不 pub（docs/PORTING.md）。
 pub(crate) mod staged;
 pub mod stream;
 pub mod track;
