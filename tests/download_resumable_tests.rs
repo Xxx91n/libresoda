@@ -745,21 +745,21 @@ fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
     assert!(record(&target).is_file(), "可续传路径该留下记录");
 
     // 旧函数这次撞上 404 / 503：请求没成功，暂存必须原样留着。
-    for status in ["404 Not Found", "503 Service Unavailable"] {
-        let (url, server) = stream_server(vec![answered(status, &[], b"no stream")]);
+    for (code, line) in [("404", "404 Not Found"), ("503", "503 Service Unavailable")] {
+        let (url, server) = stream_server(vec![answered(line, &[], b"no stream")]);
         let error = soda
             .download(&song_for(&url, &play_auth), &target)
-            .expect_err(status);
+            .expect_err(line);
 
-        assert!(error.to_string().contains(status), "{error}");
+        assert!(error.to_string().contains(code), "{error}");
         assert_eq!(seen(&server).len(), 1, "旧策略只该试这一次");
         assert_eq!(
             part_bytes(&target).expect("失败请求抹掉了暂存"),
             ciphertext[..CUT],
-            "{status}：取流失败时暂存不该被删"
+            "{code}：取流失败时暂存不该被删"
         );
-        assert!(record(&target).is_file(), "{status}：记录不该被删");
-        assert!(!target.exists(), "{status}：失败的调用不该产出目标文件");
+        assert!(record(&target).is_file(), "{code}：记录不该被删");
+        assert!(!target.exists(), "{code}：失败的调用不该产出目标文件");
     }
 
     // 传输层失败（连上就断、没有 HTTP 状态码）同样不该动暂存。
