@@ -721,7 +721,7 @@ fn the_legacy_wrapper_keeps_a_pre_existing_target_on_failure() {
 
 /// 旧策略**取流就失败**时不能动盘上已有的续传暂存：这次调用一个字节都没下，那份暂存仍属于
 /// 下一次可续传调用（票 #20 第 1 条）。修复前 `discard_parts` 抢在请求之前，一次 `503` 就会
-/// 把 95% 的进度抹掉。
+/// 把已经下完的暂存整个抹掉。
 #[test]
 fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
     let dir = sandbox("legacy-keeps-staging-on-http-error");
