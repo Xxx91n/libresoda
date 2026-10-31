@@ -720,7 +720,7 @@ fn the_legacy_wrapper_keeps_a_pre_existing_target_on_failure() {
 }
 
 /// 旧策略**取流就失败**时不能动盘上已有的续传暂存：这次调用一个字节都没下，那份暂存仍属于
-/// 下一次可续传调用（票 #20 第 1 条）。改动前 `discard_parts` 抢在请求之前，一次 `503` 就会
+/// 下一次可续传调用（票 #20 第 1 条）。修复前 `discard_parts` 抢在请求之前，一次 `503` 就会
 /// 把 95% 的进度抹掉。
 #[test]
 fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
@@ -773,6 +773,23 @@ fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
     );
     assert!(record(&target).is_file(), "连接层失败时记录不该被删");
     assert!(!target.exists(), "失败的调用不该产出目标文件");
+
+    // 连接被拒：端口上根本没有监听者。
+    let refused = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        format!("http://{addr}/stream")
+    };
+    soda.download(&song_for(&refused, &play_auth), &target)
+        .expect_err("连接被拒是失败");
+    assert_eq!(
+        part_bytes(&target).expect("连接被拒抹掉了暂存"),
+        ciphertext[..CUT],
+        "连接被拒时暂存不该被删"
+    );
+    assert!(record(&target).is_file(), "连接被拒时记录不该被删");
+    assert!(!target.exists(), "失败的调用不该产出目标文件");
     cleanup(&dir);
 }
 
@@ -799,6 +816,7 @@ fn the_legacy_wrapper_downloads_the_whole_song_when_record_tmp_is_occupied() {
         "整曲要照常落盘"
     );
     assert!(blocked.is_dir(), "不是我们的目录被删了");
-    assert!(!part(&target).exists() && !record(&target).exists() && !dec_tmp(&target).exists());
+    // 记录写本来就失败、成功交付也会清掉它：这里只断数据与交付临时名不残留。
+    assert!(!part(&target).exists() && !dec_tmp(&target).exists());
     cleanup(&dir);
 }
