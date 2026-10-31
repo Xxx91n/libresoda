@@ -99,7 +99,7 @@ soda.download(&song, Path::new("/tmp/soda.m4a"))?;
 # Ok::<(), libresoda::SodaError>(())
 ```
 
-`soda.download` / `soda.download_with_info` 保留旧策略（不续传、失败即删本次暂存），底下与
+`soda.download` / `soda.download_with_info` 保留旧策略（不续传、取流后失败即删本次暂存），底下与
 `soda.download_resumable` 共用同一套实现；需要断点续传时用后者，它交回 `DownloadReport`
 （接上偏移 / 本次传输 / 磁盘累计 / 总长 / 状态码）。
 
