@@ -10,7 +10,7 @@
 //! 的 `{目标}.dec.tmp`，成功后改名到目标、再作废暂存对。对外的详细结果结构是
 //! [`crate::soda::download::DownloadReport`]；旧下载函数（`download` / `download_with_info`）在
 //! #10 之后也走这条路径，由 [`DownloadStrategy::Legacy`] 复现改动前的三条下载契约（不续传、
-//! 一次整份请求、失败即删本次暂存；与改动前不完全相同的边角记在 `docs/PORTING.md`）。
+//! 一次整份请求、取流成功后失败即删本次暂存；与改动前不完全相同的边角记在 `docs/PORTING.md`）。
 //! 三个内部件在这里接上：[`super::part_record`] 管暂存名字与记录文件，[`super::fetch`] 管一次
 //! 取数交回的事实，[`super::resume`] 管「这次响应能不能接上」的判断。
 //!
@@ -47,10 +47,11 @@
 //! 删不掉只留下缓存垃圾（没有跨平台用例能稳定制造这种失败，代码路径就是 `let _ =`）。
 //!
 //! 旧策略（[`DownloadStrategy::Legacy`]）不适用上面这张表：它不续传。取流请求成功之后，
-//! 本次调用写下的 `.part` / `.dec.tmp` 在任何失败时都会删掉，对应 `download` /
-//! `download_with_info` 改动前的「失败即删没下完的文件」（#10）；取流本身都还没成功（连不上 /
-//! `5xx`）时一个字节都没下，不会动盘上先前留下的可续传暂存。旧策略也不写 `.part.meta`：它没有
-//! 任何读者，记录写失败不该把已经下完的字节一起丢掉（#20）。
+//! 本次调用写下的 `.part` / `.part.meta` / `.dec.tmp` 在任何失败时都会删掉，对应
+//! `download` / `download_with_info` 改动前的「失败即删没下完的文件」（#10）；取流本身都还
+//! 没成功（连不上 / `4xx` / `5xx`）时一个字节都没下，不会动盘上先前留下的可续传暂存。
+//! 旧策略也写 `.part.meta`，但写失败不改变这次调用的结果：记录留给 7 天清扫认出崩溃残骸，
+//! 也让下一次可续传调用能捡起来（#20）。
 
 use super::crypto::decrypt_stream;
 use super::fetch::{fetch_range, RangeResponse};
@@ -240,8 +241,15 @@ fn download_legacy_locked(
         etag: None,
         reader,
     };
-    // 旧策略不写记录文件：它没有读者，记录写失败只会在整曲已经下完后再制造一个失败点。
-    let result = stage_response(response, target, paths, 0, key_bytes, false);
+    // 旧策略的记录写失败不改变这次调用的结果，理由见 `stage_response`。
+    let result = stage_response(
+        response,
+        target,
+        paths,
+        0,
+        key_bytes,
+        DownloadStrategy::Legacy,
+    );
     if result.is_err() {
         // 作废之后写下的就是本次调用的暂存，失败时删掉它；删不掉也不改这次失败的性质。
         let _ = discard_parts(target);
@@ -302,12 +310,26 @@ fn download_resumable_locked(
             total_len: offset,
             status: first.status,
         }),
-        Plan::Append { offset } => stage_response(first, target, paths, offset, key_bytes, true),
+        Plan::Append { offset } => stage_response(
+            first,
+            target,
+            paths,
+            offset,
+            key_bytes,
+            DownloadStrategy::Resumable,
+        ),
         Plan::Rewrite => {
             // 这里的删除失败要传出去：下一句就要建 `.part`，旧数据还在原地的话写出来的就是
             // 「接在没人认领的字节后面」。`fail_on_status` 那一档反过来吞掉，理由记在那函数上。
             discard_parts(target)?;
-            stage_response(first, target, paths, 0, key_bytes, true)
+            stage_response(
+                first,
+                target,
+                paths,
+                0,
+                key_bytes,
+                DownloadStrategy::Resumable,
+            )
         }
         Plan::Refetch => {
             discard_parts(target)?;
@@ -316,7 +338,14 @@ fn download_resumable_locked(
             if !starts_at_zero(&again) {
                 return Err(fail_on_status(target, again.status));
             }
-            stage_response(again, target, paths, 0, key_bytes, true)
+            stage_response(
+                again,
+                target,
+                paths,
+                0,
+                key_bytes,
+                DownloadStrategy::Resumable,
+            )
         }
     }
 }
@@ -336,15 +365,16 @@ fn starts_at_zero(response: &RangeResponse) -> bool {
 /// `Content-Encoding`，交回的字节被解压过」那条兜底），比它短且读完了也作废（服务器自己
 /// 前后不一致）；中途断（`Err`）不在此列，那是「断网接着补」的正常形态。
 ///
-/// `persist_record` 为 `true` 时才写 `.part.meta`（可续传策略要它来接着补）；旧策略没有读者，
-/// 传 `false` —— 记录写失败不该把已经整份下完的 `.part` 一起丢掉（#20）。
+/// 记录写不写由 `strategy` 决定：可续传策略**必须**写成功（下一次靠它接上）；旧策略写记录
+/// 是尽力而为 —— 它没有下载路径读者，但 7 天清扫靠记录认出崩溃残骸，下一次可续传调用也能
+/// 捡起来；记录写失败不能把已经下完的字节一起丢掉（#20）。
 fn stage_response(
     response: RangeResponse,
     target: &Path,
     paths: &StagedPaths,
     base: u64,
     key_bytes: &[u8],
-    persist_record: bool,
+    strategy: DownloadStrategy,
 ) -> Result<StagedDownload> {
     let promised = response
         .range
@@ -358,9 +388,8 @@ fn stage_response(
         Ok(delivered) => delivered,
         Err(PumpFail::Interrupted(error)) => {
             let text = error.to_string();
-            if persist_record {
-                keep_record(target, paths, total_hint, etag, key_bytes);
-            }
+            // 尽力而为：写不进去也不能改变这次失败的性质（对旧策略，外层随后还会清理）。
+            keep_record(target, paths, total_hint, etag, key_bytes);
             return Err(SodaError::http(format!(
                 "staged download interrupted: {text}"
             )));
@@ -377,9 +406,14 @@ fn stage_response(
     let on_disk = base + delivered;
     // `200` 没有范围事实：整份响应读完了，交付的字节数就是总长。
     let total_len = total_hint.unwrap_or(on_disk);
-    if persist_record {
-        let record = PartRecord::new(total_len, etag, key_bytes, on_disk);
-        write_record(target, &record)?;
+    let record = PartRecord::new(total_len, etag, key_bytes, on_disk);
+    match strategy {
+        DownloadStrategy::Legacy => {
+            // 旧策略写记录是尽力而为：写失败只该少一份缓存线索，不该把整曲已经下完的
+            // `.part` 一起丢掉（#20）。
+            let _ = write_record(target, &record);
+        }
+        DownloadStrategy::Resumable => write_record(target, &record)?,
     }
 
     if on_disk != total_len {

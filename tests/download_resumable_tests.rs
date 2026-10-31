@@ -744,26 +744,40 @@ fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
     assert_eq!(part_bytes(&target).expect("留下的暂存"), ciphertext[..CUT]);
     assert!(record(&target).is_file(), "可续传路径该留下记录");
 
-    // 旧函数这次撞上 503：请求没成功，暂存必须原样留着。
-    let (url, server) = stream_server(vec![answered("503 Service Unavailable", &[], b"try later")]);
-    let error = soda
-        .download(&song_for(&url, &play_auth), &target)
-        .expect_err("503 是失败");
+    // 旧函数这次撞上 404 / 503：请求没成功，暂存必须原样留着。
+    for status in ["404 Not Found", "503 Service Unavailable"] {
+        let (url, server) = stream_server(vec![answered(status, &[], b"no stream")]);
+        let error = soda
+            .download(&song_for(&url, &play_auth), &target)
+            .expect_err(status);
 
-    assert!(error.to_string().contains("503"), "{error}");
-    assert_eq!(seen(&server).len(), 1, "旧策略只该试这一次");
+        assert!(error.to_string().contains(status), "{error}");
+        assert_eq!(seen(&server).len(), 1, "旧策略只该试这一次");
+        assert_eq!(
+            part_bytes(&target).expect("失败请求抹掉了暂存"),
+            ciphertext[..CUT],
+            "{status}：取流失败时暂存不该被删"
+        );
+        assert!(record(&target).is_file(), "{status}：记录不该被删");
+        assert!(!target.exists(), "{status}：失败的调用不该产出目标文件");
+    }
+
+    // 传输层失败（连上就断、没有 HTTP 状态码）同样不该动暂存。
+    let (url, _) = stream_server(vec![Vec::new()]);
+    soda.download(&song_for(&url, &play_auth), &target)
+        .expect_err("连接断开是失败");
     assert_eq!(
-        part_bytes(&target).expect("失败请求抹掉了暂存"),
+        part_bytes(&target).expect("连接失败抹掉了暂存"),
         ciphertext[..CUT],
-        "取流失败时暂存不该被删"
+        "连接层失败时暂存不该被删"
     );
-    assert!(record(&target).is_file(), "取流失败时记录不该被删");
+    assert!(record(&target).is_file(), "连接层失败时记录不该被删");
     assert!(!target.exists(), "失败的调用不该产出目标文件");
     cleanup(&dir);
 }
 
 /// 记录文件的原子写临时名（`{目标}.part.meta.tmp`）被目录占着时，旧策略仍要把整曲落盘：
-/// 它没有读者会去读记录，不该为写记录付出失败代价（票 #20 第 2 条）。
+/// 记录写失败只该少一份缓存线索，不能把已经下完的字节一起丢掉（票 #20 第 2 条）。
 #[test]
 fn the_legacy_wrapper_downloads_the_whole_song_when_record_tmp_is_occupied() {
     let dir = sandbox("legacy-record-tmp-blocked");

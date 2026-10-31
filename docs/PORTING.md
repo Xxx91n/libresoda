@@ -39,7 +39,7 @@
 | （上游无对应）| `resume::{parse_content_range, decide_resume_action}`：断点续传的纯判断（本地字节 + 记录 + 这次响应 → 动作）。`pub(crate)` 不对外，因为公开它等于承诺判断规则（铁律 2 的例外）；实现票 [`#5`](https://github.com/sodahub-org/libresoda/issues/5)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；判据与可见性的备注见下文「与上游的实现差异」 |
 | （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
 | （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由是它对外承诺的是**落盘格式**（四样字段），不是 `resume` 那种判断规则；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
-| （上游无对应）| `staged::{download_staged_to_file, DownloadStrategy, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下；下完之后在同一把锁里解密、改名到位、作废暂存对。`DownloadStrategy::{Legacy, Resumable}` 是同一套实现上的两种行为（#10）：旧策略不续传、只发一次整份请求、失败即删暂存。`pub(crate)`：对外入口是 `download` 的三个公开函数，这里交回的 `StagedDownload` 是 `DownloadReport` 的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、[`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
+| （上游无对应）| `staged::{download_staged_to_file, DownloadStrategy, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下；下完之后在同一把锁里解密、改名到位、作废暂存对。`DownloadStrategy::{Legacy, Resumable}` 是同一套实现上的两种行为（#10）：旧策略不续传、只发一次整份请求、取流成功后失败即删本次暂存（取流失败不动作废前已有的暂存）。`pub(crate)`：对外入口是 `download` 的三个公开函数，这里交回的 `StagedDownload` 是 `DownloadReport` 的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、[`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
 | （上游无对应）| `download::{download_resumable, DownloadReport}`：可续传下载的公开入口 —— 一次调用完成「解析流 → 暂存加密字节 → 解密 → 改名到位」，交回五个传输事实（`resumed_from` / `transferred` / `on_disk` / `total_len` / `status`），结果结构标为 `#[non_exhaustive]`。旧 `download` / `download_with_info` 在 #10 之后也走同一条实现（`Legacy` 策略），函数体只做参数转调。实现票 [`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；解密、失败处置、可见性与删除计划见下文「断点续传的解密与详细结果」「旧下载函数的转调与策略枚举」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
@@ -448,8 +448,8 @@
     盘上已有的续传暂存，#20）；只发一次整份 GET，**不带 `Range`**（直接用改动前的
     `http::get_reader`，不是把偏移写成 0 的范围请求 —— 开放式区间可能被边缘封顶，那会把旧
     函数的一次正常下载变成失败）；作废之后任何失败都把本次调用写下的 `.part` / `.dec.tmp`
-    一起删掉（「失败即删没下完的文件」）。旧策略**不写 `.part.meta`**：它没有任何读者，记录
-    写失败不该把已经下完的字节一起丢掉（#20）。
+    一起删掉（「失败即删没下完的文件」）。旧策略也写 `.part.meta`，但写失败不改变这次调用的
+    结果：记录留给 7 天清扫认出崩溃残骸，下一次可续传调用也能捡起来（#20）。
   - **代价：成功路径多一遍整文件读写**（#10 验收第 4 条要求写明）。旧策略也走「先写加密
     `.part`，再解密到 `.dec.tmp`，改名」这条共用路径，所以一次成功下载比 #10 之前多一次本地
     读 + 写，并临时占用约一份密文的磁盘空间；峰值内存仍按 64KB 块计算。这是 #2 明写的取舍：
