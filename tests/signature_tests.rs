@@ -101,11 +101,11 @@ fn command_signature_reports_failure() {
 
 #[test]
 fn command_signature_refuses_output_when_the_request_was_never_written() {
-    // 载荷取 2 MiB，是为了超过这几档而不是押注某个默认值：Linux 新管道默认 16 页（4 KiB 页时是
-    // 64 KiB），无 CAP_SYS_RESOURCE 的进程用 F_SETPIPE_SZ 最多提到 pipe-max-size 的默认上限 1 MiB
-    //（pipe(7)）；Windows 那侧 std 按 PIPE_BUFFER_CAPACITY 申请 64 KiB。确定性的另一半是这根管道
-    // 的容量没人动过 —— std 与本用例的 sh 都不调 F_SETPIPE_SZ，于是写入完不成、断管是确定事实，
-    // 这种「回 0 + 合法 JSON」就不能当签名用。
+    // 载荷取 2 MiB 是为了超过这几档、而不是押注某个默认值：Linux 新管道默认 16 页（4 KiB 页时是
+    // 64 KiB），没有 CAP_SYS_RESOURCE 的进程用 F_SETPIPE_SZ 最多提到 pipe-max-size 的默认上限
+    // 1 MiB（带 CAP_SYS_RESOURCE 的还能更高 —— pipe(7)）；Windows 那侧 std 按 PIPE_BUFFER_CAPACITY
+    // 申请 64 KiB。确定性的另一半是这根管道的容量没人动过：std 与本用例的 sh 都不调 F_SETPIPE_SZ，
+    // 于是写入完不成、断管是确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
     let provider =
         CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
     let error = provider
