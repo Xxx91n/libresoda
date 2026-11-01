@@ -99,7 +99,7 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 这时写入撞上的是断管（Linux 上是 `Broken pipe (os error 32)`），而真正能说明原因的两个
 事实——**退出码**和 **stderr**——在进程的返回值里。`CommandSignature::sign` 因此把断管当
 非致命，继续收退出码，最终报 `signer exited with exit status: N: <stderr>`
-（`ExitStatus` 在 Windows 上印作 `exit code: N`）。
+（`ExitStatus` 在 Windows 上印作 `exit code: N`，被信号一类高位状态顶掉的退出码会印成十六进制）。
 既然写入撞了断管，这次请求就没送到签名器手上 —— 它随后回 `0` + 合法 JSON 也不算成功，
 `sign()` 报 `signer exited without reading the request`。但拦得住的只有**报得出断管**的那一半：
 写入被管道缓冲吃掉、签名器一个字节都没读，库这边看不出来，所以这条契约得由签名器自己守住。

@@ -501,8 +501,8 @@
   走到这里）。对外的契约（签名器必须先把 stdin 读干净再退出）写在 `docs/SIGNER-SERVICE.md` §2.2。
   断管之后子进程仍回 `0` + 合法 JSON 的，**不当签名用**：那份回包不是按这次请求算出来的，报
   `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体
-  撑过管道容量让写入必然完不成（std 两侧都按 64 KiB 建管道 —— `Stdio::piped` 在 Windows 走
-  `NtCreateNamedPipeFile`，见 std `sys/process/windows/child_pipe.rs` 的 `PIPE_BUFFER_CAPACITY`），
+  撑过管道容量让写入必然完不成（两侧实际都是 64 KiB —— Windows 那侧由 std 显式设置，`Stdio::piped`
+  走 `NtCreateNamedPipeFile` 配 std 的 `PIPE_BUFFER_CAPACITY`；Linux 那侧是内核给管道的默认值），
   这条分支就确定能钉；而「写入被
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
   两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
