@@ -100,6 +100,24 @@ fn command_signature_reports_failure() {
 }
 
 #[test]
+fn command_signature_refuses_output_when_the_request_was_never_written() {
+    // 请求体撑到超过管道容量（Linux 64 KiB、Windows 4 KiB）：写入不可能完成，子进程又一口
+    // 不读，断管就成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
+    let provider =
+        CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
+    let error = provider
+        .sign(&sign_request(
+            "https://api.qishui.com/x",
+            "POST",
+            &"x".repeat(256 * 1024),
+        ))
+        .expect_err("没写进请求的签名器，回 0 也不算成功");
+    let text = error.to_string();
+    assert!(text.contains("without reading the request"), "{text}");
+    assert!(!text.contains("stdin write"), "{text}");
+}
+
+#[test]
 fn apply_signature_to_url_keeps_existing_query() {
     let url = "https://api.qishui.com/passport/web/check_qrconnect/?aid=386088&token=abc";
     let response = SignResponse {
