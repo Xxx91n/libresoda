@@ -435,11 +435,11 @@ impl SignatureProvider for CommandSignature {
                 .stdin
                 .as_mut()
                 .ok_or_else(|| SodaError::http("signer stdin unavailable"))?;
-            if let Err(err) = stdin.write_all(&payload) {
+            match stdin.write_all(&payload) {
+                Ok(()) => {}
                 // 断管 = 签名器没读 stdin 就退出了；退出码与 stderr 才是原因，交给下面的 wait_with_output。
-                if err.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(SodaError::http(format!("signer stdin write: {err}")));
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(err) => return Err(SodaError::http(format!("signer stdin write: {err}"))),
             }
         }
         drop(child.stdin.take());

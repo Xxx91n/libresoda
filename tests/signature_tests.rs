@@ -89,8 +89,12 @@ fn command_signature_reports_failure() {
         .sign(&sign_request("https://api.qishui.com/x", "GET", ""))
         .expect_err("should fail");
     let text = error.to_string();
+    // 退出码这行 Unix 印 `exit status: 3`，Windows 印 `exit code: 3`。
     assert!(text.contains("signer exited"), "{text}");
-    assert!(text.contains("exit status: 3"), "要有退出码：{text}");
+    assert!(
+        text.contains("exit status: 3") || text.contains("exit code: 3"),
+        "要有退出码：{text}"
+    );
     assert!(text.contains("boom"), "要有 stderr：{text}");
     assert!(!text.contains("stdin write"), "{text}");
 }
