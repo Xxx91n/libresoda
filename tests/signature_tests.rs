@@ -82,8 +82,8 @@ fn command_signature_reads_json_from_stdout() {
 
 #[test]
 fn command_signature_reports_failure() {
-    // 子进程不读 stdin 就退出：写入会撞上断管，但调用方要看到的是退出码与 stderr，
-    // 不是一根断掉的管子。
+    // 子进程不读 stdin 就退出：写入可能撞上断管，也可能抢在它退出之前进了管道缓冲，
+    // 但两种结局都收敛到同一句退出码错误 —— 调用方要看到的是那个，不是一根断掉的管子。
     let provider = CommandSignature::new("sh").args(["-c", "printf boom >&2; exit 3"]);
     let error = provider
         .sign(&sign_request("https://api.qishui.com/x", "GET", ""))
@@ -101,8 +101,8 @@ fn command_signature_reports_failure() {
 
 #[test]
 fn command_signature_refuses_output_when_the_request_was_never_written() {
-    // 请求体撑到超过管道容量（std 两侧都是 64 KiB：Windows 的 `Stdio::piped` 走
-    // NtCreateNamedPipeFile，不是 CreatePipe 那个 4 KiB 默认）：写入不可能完成，子进程又一口不读，
+    // 请求体撑到超过管道容量（std 两侧都按 64 KiB 建管道，Windows 那侧走 NtCreateNamedPipeFile，
+    // 见 std 的 child_pipe.rs）：写入不可能完成，子进程又一口不读，
     // 断管就成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
     let provider =
         CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
