@@ -89,6 +89,18 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 兼容 Meting-API 的扁平回包 `{"ok":true,"X-Helios":"…","X-Medusa":"…"}`。
 
+### 2.2 外部签名器必须先读干净 stdin
+
+`CommandSignature` 把请求 JSON 写进子进程 stdin 后才知道它是否成功。因此约定：
+
+> **外部签名器必须先把 stdin 读干净再退出，即便它不消费请求体。**
+
+脚本路径写错、参数不匹配、启动即报错这类配置错误会让签名器根本不读 stdin 就退出；
+这时写入撞上的是断管（`Broken pipe (os error 32)`），而真正能说明原因的两个事实——
+**退出码**和 **stderr**——在进程的返回值里。`CommandSignature::sign` 因此把断管当非致命，
+继续收退出码，最终报 `signer exited with exit status: N: <stderr>`。
+`HttpSignature` 那侧没有这个问题（HTTP 客户端自己负责把 body 发完）。
+
 ## 3. libresoda 侧用法
 
 ```rust
