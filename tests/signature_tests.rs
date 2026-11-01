@@ -101,15 +101,17 @@ fn command_signature_reports_failure() {
 
 #[test]
 fn command_signature_refuses_output_when_the_request_was_never_written() {
-    // 请求体撑到超过管道容量（两侧实际都是 64 KiB：Windows 那侧由 std 显式设，Linux 那侧是内核默认）：
-    // 写入不可能完成，子进程又一口不读，断管就成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
+    // 载荷要撑到「这条管道再怎么配也装不下」：Linux 新管道默认 16 页 = 64 KiB，非特权进程用
+    // F_SETPIPE_SZ 最多提到 pipe-max-size 的默认上限 1 MiB（pipe(7)）；Windows 那侧 std 按 64 KiB
+    // 建（PIPE_BUFFER_CAPACITY）。取 2 MiB 就超过所有这些值，写入必然完不成，子进程又一口不读，
+    // 断管成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
     let provider =
         CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
     let error = provider
         .sign(&sign_request(
             "https://api.qishui.com/x",
             "POST",
-            &"x".repeat(256 * 1024),
+            &"x".repeat(2 * 1024 * 1024),
         ))
         .expect_err("没写进请求的签名器，回 0 也不算成功");
     let text = error.to_string();
