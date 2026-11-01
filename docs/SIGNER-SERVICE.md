@@ -100,6 +100,8 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 事实——**退出码**和 **stderr**——在进程的返回值里。`CommandSignature::sign` 因此把断管当
 非致命，继续收退出码，最终报 `signer exited with exit status: N: <stderr>`
 （`ExitStatus` 在 Windows 上印作 `exit code: N`）。
+反过来，签名器没读到请求却回 `0` + 合法 JSON 也不算成功 —— 那份回包不是按这次请求算出来的，
+`sign()` 报 `signer exited without reading the request`。
 `HttpSignature` 那侧没有这根管道，body 由 HTTP 客户端自己发完。
 
 ## 3. libresoda 侧用法
