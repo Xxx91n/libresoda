@@ -500,9 +500,11 @@
   自己打印出 `requires cookie` 这类子串就会改变分类（这是既有的拼接行为，#13 只是让断管那条也
   走到这里）。对外的契约（签名器必须先把 stdin 读干净再退出）写在 `docs/SIGNER-SERVICE.md` §2.2。
   断管之后子进程仍回 `0` + 合法 JSON 的，**不当签名用**：那份回包不是按这次请求算出来的，报
-  `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。这条分支没有
-  确定性离线用例 —— 写赢/写输两侧的结局本来就不同，能稳定钉住的只有非 0 退出那一档。
-  两条如实记着的限制：`CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
+  `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体
+  撑过管道容量（Linux 64 KiB、Windows 4 KiB）让写入必然完不成，这条分支就是确定能钉的；而「写入被
+  管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
+  两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
+  `CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
   若关掉 stdin 却永不退出，`wait_with_output` 会无限等；`browser.rs` 的外部请求器是同一形状的
   stdin 写入，#13 没扫它，仍会把断管当致命错误报。
 
