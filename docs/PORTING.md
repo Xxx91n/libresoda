@@ -500,11 +500,12 @@
   自己打印出 `requires cookie` 这类子串就会改变分类（这是既有的拼接行为，#13 只是让断管那条也
   走到这里）。对外的契约（签名器必须先把 stdin 读干净再退出）写在 `docs/SIGNER-SERVICE.md` §2.2。
   断管之后子进程仍回 `0` + 合法 JSON 的，**不当签名用**：那份回包不是按这次请求算出来的，报
-  `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体
-  撑过管道容量让写入必然完不成（Linux 新管道默认 16 页 = 64 KiB，非特权进程用 `F_SETPIPE_SZ` 最多
-  提到 `pipe-max-size` 的默认上限 1 MiB —— `pipe(7)`；Windows 那侧 std 按 `PIPE_BUFFER_CAPACITY`
-  的 64 KiB 建管道），用例的载荷取 2 MiB 是为了超过这些值、不押注某个默认值，
-  这条分支就确定能钉；而「写入被
+  `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体撑到
+  2 MiB 来让写入完不成：Linux 新管道默认 16 页（4 KiB 页时是 64 KiB），无 `CAP_SYS_RESOURCE` 的进程
+  用 `F_SETPIPE_SZ` 最多提到 `pipe-max-size` 的默认上限 1 MiB（`pipe(7)`），Windows 那侧 std 按
+  `PIPE_BUFFER_CAPACITY` 申请 64 KiB —— 取 2 MiB 是为了超过这几档，而不是押注某个默认值。确定性的
+  另一半是这根管道的容量没人动过：std 与用例里的 `sh` 都不调 `F_SETPIPE_SZ`，宿主把 `pipe-max-size`
+  提上去也不会让这根管道自己长大，除非有人特意对着它的 fd 动手。这条分支因而钉得住；而「写入被
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
   两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
   `CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
