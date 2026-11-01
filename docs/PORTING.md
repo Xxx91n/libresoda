@@ -502,8 +502,8 @@
   断管之后子进程仍回 `0` + 合法 JSON 的，**不当签名用**：那份回包不是按这次请求算出来的，报
   `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体撑到
   2 MiB 来让写入完不成 —— 这个数超过 Linux 新管道的默认容量、超过 `pipe-max-size` 的默认上限，也超过
-  std 在 Windows 申请的 `PIPE_BUFFER_CAPACITY`；逐档出处（`pipe(7)`）和「这根管道的容量没人动过」
-  那半个前提写在 `tests/signature_tests.rs` 对应用例的注释里，此处不复述，免得两处漂。
+  std 在 Windows 申请的 `PIPE_BUFFER_CAPACITY`；逐档出处与「这根管道的容量没人动过」那半个前提写在
+  `tests/signature_tests.rs` 对应用例的注释里，此处不复述，免得两处漂。
   这条分支因而钉得住；而「写入被
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
   两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
