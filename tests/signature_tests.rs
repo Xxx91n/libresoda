@@ -101,8 +101,9 @@ fn command_signature_reports_failure() {
 
 #[test]
 fn command_signature_refuses_output_when_the_request_was_never_written() {
-    // 请求体撑到超过管道容量（Linux 64 KiB、Windows 4 KiB）：写入不可能完成，子进程又一口
-    // 不读，断管就成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
+    // 请求体撑到超过管道容量（std 两侧都是 64 KiB：Windows 的 `Stdio::piped` 走
+    // NtCreateNamedPipeFile，不是 CreatePipe 那个 4 KiB 默认）：写入不可能完成，子进程又一口不读，
+    // 断管就成了确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
     let provider =
         CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
     let error = provider
