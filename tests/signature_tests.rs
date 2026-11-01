@@ -82,13 +82,17 @@ fn command_signature_reads_json_from_stdout() {
 
 #[test]
 fn command_signature_reports_failure() {
-    // 子进程要先吃掉 stdin：直接 exit 会让 write_all 撞上断管，
-    // 报出 "signer stdin write" 而不是我们想断言的退出码错误。
-    let provider = CommandSignature::new("sh").args(["-c", "cat >/dev/null; exit 3"]);
+    // 子进程不读 stdin 就退出：写入会撞上断管，但调用方要看到的是退出码与 stderr，
+    // 不是一根断掉的管子。
+    let provider = CommandSignature::new("sh").args(["-c", "printf boom >&2; exit 3"]);
     let error = provider
         .sign(&sign_request("https://api.qishui.com/x", "GET", ""))
         .expect_err("should fail");
-    assert!(error.to_string().contains("signer exited"), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("signer exited"), "{text}");
+    assert!(text.contains("exit status: 3"), "要有退出码：{text}");
+    assert!(text.contains("boom"), "要有 stderr：{text}");
+    assert!(!text.contains("stdin write"), "{text}");
 }
 
 #[test]
