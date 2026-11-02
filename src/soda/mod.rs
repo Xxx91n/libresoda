@@ -22,6 +22,8 @@ pub mod artist;
 pub mod browser;
 #[cfg(feature = "cdp-signer")]
 pub mod cdp_signer;
+// 外部子进程执行器：签名器与请求器共用，只给这两个模块用（docs/PORTING.md）。
+pub(crate) mod child;
 pub mod collection;
 pub mod crypto;
 pub mod download;

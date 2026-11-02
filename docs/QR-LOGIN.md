@@ -143,6 +143,8 @@ use libresoda::soda::browser::CommandRequester;
 use libresoda::soda::signature::HttpSignature;
 
 // 需要 a_bogus：交给本地 Chromium 签名页
+// 等待上限默认 240 s（fetch 180 s + 页面导航余量），可用 `.timeout_ms(..)` 调整；
+// 到点会终止并回收子进程，报 `requester timed out after {N} ms`（票 #23）。
 soda.set_browser_requester(Arc::new(
     CommandRequester::new("node").args(["tools/qishui-signer/sign-cli.mjs"]),
 ));

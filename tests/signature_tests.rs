@@ -121,6 +121,65 @@ fn command_signature_refuses_output_when_the_request_was_never_written() {
 }
 
 #[test]
+fn command_signature_times_out_when_signer_never_reads_or_exits() {
+    // 载荷撑到 2 MiB（容量出处见上一条用例）：写入在管道满时就会卡住，而签名器既不读
+    // stdin 也不退出。票 #23 要求时限同时盖住写入那一侧，到点 kill + 回收，不能无限等。
+    // `exec` 让 sh 被 sleep 顶替：kill 打到的就是真正活着的那个进程，不留后台孙进程。
+    let provider = CommandSignature::new("sh")
+        .args(["-c", "exec sleep 30"])
+        .timeout_ms(200);
+    let started = std::time::Instant::now();
+    let error = provider
+        .sign(&sign_request(
+            "https://api.qishui.com/x",
+            "POST",
+            &"x".repeat(2 * 1024 * 1024),
+        ))
+        .expect_err("签名器不退出就得报超时");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(
+        !text.contains("signer exited"),
+        "超时不能伪装成正常退出：{text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "超时用例拖了 {elapsed:?}"
+    );
+}
+
+#[test]
+fn command_signature_times_out_while_draining_signer_output() {
+    // 固定 512 KiB 请求经 `cat` 原样写回 stdout，超过 64 KiB 的默认管道容量。`cat` 只有把
+    // 这 512 KiB 全部写出去才会走到后面的 stderr 标记 —— 不排空 stdout 就会堵在管道上，
+    // 永远看不到 `drained`。到点仍必须终止 + 回收并交回超时错误，而不是互锁。
+    let provider = CommandSignature::new("sh")
+        .args(["-c", "cat; printf drained >&2; exec sleep 30"])
+        .timeout_ms(1_000);
+    let started = std::time::Instant::now();
+    let error = provider
+        .sign(&sign_request(
+            "https://api.qishui.com/x",
+            "POST",
+            &"x".repeat(512 * 1024),
+        ))
+        .expect_err("写满输出又不退出，也得超时");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(!text.contains("signer exited"), "{text}");
+    assert!(
+        text.contains("drained"),
+        "stdout 排空后子进程才走得到 stderr 标记：{text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "排空用例拖了 {elapsed:?}"
+    );
+}
+
+#[test]
 fn apply_signature_to_url_keeps_existing_query() {
     let url = "https://api.qishui.com/passport/web/check_qrconnect/?aid=386088&token=abc";
     let response = SignResponse {

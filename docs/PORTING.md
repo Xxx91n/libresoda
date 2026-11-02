@@ -506,10 +506,40 @@
   `tests/signature_tests.rs` 对应用例的注释里，此处不复述，免得两处漂。
   这条分支因而钉得住；而「写入被
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
-  两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
-  `CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
-  若关掉 stdin 却永不退出，`wait_with_output` 会无限等；`browser.rs` 的外部请求器是同一形状的
-  stdin 写入，#13 没扫它，仍会把断管当致命错误报。
+
+* **外部子进程的等待上限（`soda::child::run`，上游无对应）**：实现票
+  [`#23`](https://github.com/sodahub-org/libresoda/issues/23)，收掉上一条如实记着的两条限制。
+  `CommandSignature` 与 `CommandRequester` 现在共用一个 `pub(crate)` 执行器
+  （`src/soda/child.rs`），口径如下：
+
+  - **顺序**：spawn → 写 stdin 的线程（写完即 drop 写端）+ stdout/stderr 各一个排空线程 →
+    主线程按 `timeout_ms` 轮询 `try_wait`。限时内退出由 `try_wait`（底层 `waitpid(WNOHANG)`）
+    取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr → 返回超时错误。
+    所有路径都不再有无界 `wait_with_output`。
+  - **写入侧也有上限**：`write_all` 在独立线程里跑，所以载荷超过管道容量而签名器既不读也不退出时，
+    主线程仍能按时 kill。断管仍归因给退出码/stderr；非断管的写入错误先终止 + 收尸，再报
+    `signer stdin write: {err}`（`#23` 评论指出的第三处漏收尸，`browser.rs` 同形一并修）。
+  - **错误分类**：不新增公开变体，仍是 `SodaError::Http`。超时文案为
+    `signer timed out after {timeout_ms} ms`（有 stderr 时补 `: {stderr}`），前缀与
+    `signer exited...` 可区分；三条冻结文案（`signer exited with {退出码}: {stderr}` /
+    `signer exited without reading the request: {stderr}` / `signer stdin write: {err}`）原样保留。
+    请求器按同一口径用 `requester` 前缀。
+  - **线程收集有宽限**：子进程结束/被终止后，三条工作线程用 1 s 有界等待收集，不是无限 `join`。
+    正常路径它们随管道 EOF 立即结束；只有孙进程攥着管道时才可能走满宽限 —— 目的是不让调用方
+    被重新锁死。
+  - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
+    stdout/stderr 移入排空线程；主线程只持有 `Child` 负责 kill/wait。
+  - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
+    `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
+    这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
+    需要改用 `new`/`timeout_ms`；仓内没有这种用法。
+  - **SIGPIPE 前提**：`write_all` 断管返回 `Err(BrokenPipe)` 而不是把进程打死，前提是宿主忽略了
+    SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
+    将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
+  - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
+    等待侧同时到点）、固定 512 KiB 经 `cat` 写回 stdout 后再打 stderr 标记（只有排空 stdout 才走得到
+    标记）；`tests/browser_tests.rs` 三条 —— 非 0 退出、断管归因、超时。全部离线，单条时限
+    200 ms–1 s，不拖慢 `cargo test`。
 
 ## 未移植项
 
