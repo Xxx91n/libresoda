@@ -191,20 +191,46 @@ fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// 记录被读走多少字节，用来证明超限后仍在排空。
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
 
     #[test]
     fn reader_caps_capture_and_keeps_draining() {
-        let input = vec![b'x'; MAX_CAPTURE_BYTES + READ_CHUNK_BYTES];
+        let total = MAX_CAPTURE_BYTES + READ_CHUNK_BYTES;
+        let read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            inner: Cursor::new(vec![b'x'; total]),
+            read: Arc::clone(&read),
+        };
         let collected = collect(
-            Some(spawn_reader(Cursor::new(input))),
+            Some(spawn_reader(reader)),
             Instant::now() + Duration::from_secs(5),
         )
         .expect("读线程应把结果送回来");
         assert_eq!(
             collected.len(),
             MAX_CAPTURE_BYTES,
-            "超出上限的字节应读走但不留在内存里"
+            "内存里只留上限以内的字节"
+        );
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            total,
+            "超出上限的字节也必须读走（排空）"
         );
     }
 }
