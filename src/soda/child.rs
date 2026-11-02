@@ -12,7 +12,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::process::{Command, ExitStatus};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -135,8 +135,5 @@ where
 fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
     let receiver = receiver?;
     let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(value) => Some(value),
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-    }
+    receiver.recv_timeout(remaining).ok()
 }
