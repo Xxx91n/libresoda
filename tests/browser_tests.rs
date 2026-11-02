@@ -55,8 +55,5 @@ fn command_requester_times_out_when_child_never_exits() {
     let text = error.to_string();
     assert!(text.contains("requester timed out"), "{text}");
     assert!(!text.contains("requester exited"), "{text}");
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "超时用例拖了 {elapsed:?}"
-    );
+    assert!(elapsed < Duration::from_secs(3), "超时用例拖了 {elapsed:?}");
 }

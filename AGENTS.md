@@ -112,6 +112,8 @@ SODA_COOKIE="sessionid=...; sid_tt=..." cargo test -- --ignored --nocapture
 * 离线测试放 `tests/offline_tests.rs`：链接解析、搜索 URL 参数、图片 URL、VIP 标记、
   音质择优、歌词转换、`_ROUTER_DATA` 抽取。
 * 解密测试放 `tests/crypto_tests.rs`：box 解析、样本解密、**合成 MP4 往返**、spade 密钥往返。
+* 签名器/请求器测试放 `tests/signature_tests.rs`、`tests/browser_tests.rs`：子进程协议、
+  断管归因、等待上限与输出排空（离线）。
 * 联网测试放 `tests/network_tests.rs`：一律 `#[ignore]`，用 `SODA_*` 环境变量驱动，
   **禁止**把 Cookie、track id 等隐私数据写进仓库或测试输出（模式参照上游
   `sodaRedactValue`）。

@@ -144,7 +144,7 @@ fn command_signature_times_out_when_signer_never_reads_or_exits() {
         "超时不能伪装成正常退出：{text}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
+        elapsed < std::time::Duration::from_secs(3),
         "超时用例拖了 {elapsed:?}"
     );
 }
@@ -174,7 +174,7 @@ fn command_signature_times_out_while_draining_signer_output() {
         "stdout 排空后子进程才走得到 stderr 标记：{text}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
+        elapsed < std::time::Duration::from_secs(4),
         "排空用例拖了 {elapsed:?}"
     );
 }

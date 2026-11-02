@@ -517,18 +517,23 @@
     取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr → 返回超时错误。
     所有路径都不再有无界 `wait_with_output`。
   - **写入侧也有上限**：`write_all` 在独立线程里跑，所以载荷超过管道容量而签名器既不读也不退出时，
-    主线程仍能按时 kill。断管仍归因给退出码/stderr；非断管的写入错误先终止 + 收尸，再报
-    `signer stdin write: {err}`（`#23` 评论指出的第三处漏收尸，`browser.rs` 同形一并修）。
+    主线程仍能按时 kill。每次轮询也看一眼写线程的结果：断管仍归因给退出码/stderr；非断管的
+    写入错误一旦观察到就先终止 + 收尸，再报 `signer stdin write: {err}`（`#23` 评论指出的第三处
+    漏收尸，`browser.rs` 同形一并修）。子进程退出时写入仍未结束的，按「请求没交全」处理，
+    不吃掉 #13 的 `signer exited without reading the request`。
   - **错误分类**：不新增公开变体，仍是 `SodaError::Http`。超时文案为
     `signer timed out after {timeout_ms} ms`（有 stderr 时补 `: {stderr}`），前缀与
     `signer exited...` 可区分；三条冻结文案（`signer exited with {退出码}: {stderr}` /
     `signer exited without reading the request: {stderr}` / `signer stdin write: {err}`）原样保留。
     请求器按同一口径用 `requester` 前缀。
-  - **线程收集有宽限**：子进程结束/被终止后，三条工作线程用 1 s 有界等待收集，不是无限 `join`。
+  - **线程收集有宽限**：子进程结束/被终止后，工作线程用 1 s 有界等待收集，不是无限 `join`。
     正常路径它们随管道 EOF 立即结束；只有孙进程攥着管道时才可能走满宽限 —— 目的是不让调用方
-    被重新锁死。
+    被重新锁死。宽限只保证调用方回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；
+    超时路径只等 stderr 一个宽限，不再等写线程。
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
     stdout/stderr 移入排空线程；主线程只持有 `Child` 负责 kill/wait。
+  - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
+    「按对端产出的量无限增长」的来源（AGENTS.md 内存安全铁律 2）；正常签名回包远小于这个数。
   - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
     `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
     这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
