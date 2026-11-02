@@ -543,10 +543,12 @@
     SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
-    等待侧同时到点）、固定 512 KiB 经 `cat` 写回 stdout 后再打 stderr 标记（只有排空 stdout 才走得到
-    标记）；`tests/browser_tests.rs` 三条 —— 非 0 退出、断管归因、超时；`src/soda/child.rs`
-    一条单元用例钉 8 MiB 收集上限（超出字节读走但丢弃）。全部离线，单条时限 200 ms–1 s，
-    不拖慢 `cargo test`。
+    等待侧同时到点）、直接子进程写固定 256 KiB stdout 后再打 stderr 标记（只有排空 stdout 才走得到
+    标记）；`tests/browser_tests.rs` 四条 —— 非 0 退出、断管归因、超时、排空（128 KiB 回包完整解析 +
+    256 KiB 输出超时后带回标记）；`src/soda/child.rs` 一条单元用例钉 8 MiB 收集上限（超出字节读走但
+    丢弃）。全部离线，单条时限 200 ms–1 s，不拖慢 `cargo test`。排空用例的探针只用 shell 内建、
+    不 fork 子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回
+    已排空的 stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
 
 ## 未移植项
 

@@ -149,21 +149,28 @@ fn command_signature_times_out_when_signer_never_reads_or_exits() {
     );
 }
 
+/// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
+/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— kill 掉直接子进程后管道写端
+/// 全部关闭，Windows（Git Bash/msys2）与 Unix 都能在超时路径取回已排空的 stderr。
+/// （`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。）
+const DRAIN_PROBE_SCRIPT: &str = concat!(
+    "i=0; while [ $i -lt 4096 ]; do ",
+    "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
+    "i=$((i+1)); done; ",
+    "printf drained >&2; ",
+    "while :; do :; done",
+);
+
 #[test]
 fn command_signature_times_out_while_draining_signer_output() {
-    // 固定 512 KiB 请求经 `cat` 原样写回 stdout，超过 64 KiB 的默认管道容量。`cat` 只有把
-    // 这 512 KiB 全部写出去才会走到后面的 stderr 标记 —— 不排空 stdout 就会堵在管道上，
-    // 永远看不到 `drained`。到点仍必须终止 + 回收并交回超时错误，而不是互锁。
+    // 探针固定写 256 KiB（4× 64 KiB 默认管道容量）：没有排空线程就会堵在 stdout 上，
+    // 走不到 stderr 标记。到点必须终止 + 回收，并交回可区分的超时错误。
     let provider = CommandSignature::new("sh")
-        .args(["-c", "cat; printf drained >&2; exec sleep 30"])
+        .args(["-c", DRAIN_PROBE_SCRIPT])
         .timeout_ms(1_000);
     let started = std::time::Instant::now();
     let error = provider
-        .sign(&sign_request(
-            "https://api.qishui.com/x",
-            "POST",
-            &"x".repeat(512 * 1024),
-        ))
+        .sign(&sign_request("https://api.qishui.com/x", "POST", ""))
         .expect_err("写满输出又不退出，也得超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
