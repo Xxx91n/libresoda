@@ -530,7 +530,9 @@
     正常路径它们随管道 EOF 立即结束；只有孙进程攥着管道时才可能走满宽限 —— 目的是不让调用方
     被重新锁死。宽限只保证调用方回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；
     超时路径只等 stderr 一个宽限，不再等写线程。宽限内没送达的流按空输出处理 —— 读取错误或
-    管道被孙进程攥着时，后续会以解码/响应解析错误暴露，不会静默当成功。
+    管道被孙进程攥着时，后续会以解码/响应解析错误暴露，不会静默当成功。对超时错误而言，这意味着
+    后继进程攥着写端时错误文本可能不带 stderr（测试探针刻意避开这种形态）；要补成「宽限到时先交出
+    部分缓冲」属于可观测性增强，需另开票。
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
     stdout/stderr 移入排空线程；主线程只持有 `Child` 负责 kill/wait。
   - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
@@ -543,12 +545,13 @@
     SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
-    等待侧同时到点）、直接子进程写固定 256 KiB stdout 后再打 stderr 标记（只有排空 stdout 才走得到
-    标记）；`tests/browser_tests.rs` 四条 —— 非 0 退出、断管归因、超时、排空（128 KiB 回包完整解析 +
-    256 KiB 输出超时后带回标记）；`src/soda/child.rs` 一条单元用例钉 8 MiB 收集上限（超出字节读走但
-    丢弃）。全部离线，单条时限 200 ms–1 s，不拖慢 `cargo test`。排空用例的探针只用 shell 内建、
-    不 fork 子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回
-    已排空的 stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
+    等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
+    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 四条 —— 非 0 退出、
+    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记）；`src/soda/child.rs`
+    一条单元用例钉 8 MiB 收集上限（超出字节读走但丢弃）。全部离线，单条时限 200 ms–2 s（大回包用例
+    用 5 s 守卫，正常路径毫秒级），不拖慢 `cargo test`。排空用例的探针只用 shell 内建、不 fork
+    子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回已排空的
+    stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
 
 ## 未移植项
 

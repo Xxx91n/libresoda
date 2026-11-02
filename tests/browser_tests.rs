@@ -46,8 +46,8 @@ fn command_requester_attributes_broken_pipe_to_exit_status() {
 fn command_requester_drains_and_parses_large_response() {
     // 固定 128 KiB body（外层 JSON 因此超过 64 KiB 默认管道容量）：只有边写边排空，
     // 子进程才能写完并以 0 退出，回包才能完整解析成 BrowserResponse。
-    // 超过 `child` 的 8 MiB 收集上限时 stdout 会被截断（超出读走但丢弃），
-    // `serde_json` 会报 `requester 返回无法解析`，不会交出半包。
+    // 超过 `child` 的 8 MiB 收集上限时 stdout 会被截断（超出读走但丢弃，
+    // 上限本身由 `src/soda/child.rs` 的单元用例钉住），解析会失败而不是交出半包。
     const LARGE_RESPONSE_SCRIPT: &str = concat!(
         // 先把请求读干净再回包：避免子进程抢在写入之前退出，被误判成「没读请求」。
         "cat >/dev/null; ",
@@ -55,7 +55,9 @@ fn command_requester_drains_and_parses_large_response() {
         "i=0; while [ $i -lt 4096 ]; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; i=$((i+1)); done; ",
         "printf '\"}'"
     );
-    let requester = CommandRequester::new("sh").args(["-c", LARGE_RESPONSE_SCRIPT]);
+    let requester = CommandRequester::new("sh")
+        .args(["-c", LARGE_RESPONSE_SCRIPT])
+        .timeout_ms(5_000);
     let response = requester
         .request(&BrowserRequest::default())
         .expect("大回包应能解析");
@@ -67,6 +69,7 @@ fn command_requester_drains_and_parses_large_response() {
 /// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
 /// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— kill 掉直接子进程后管道写端
 /// 全部关闭，Windows（Git Bash/msys2）与 Unix 都能在超时路径取回已排空的 stderr。
+/// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
 const DRAIN_PROBE_SCRIPT: &str = concat!(
     "i=0; while [ $i -lt 4096 ]; do ",
     "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
@@ -79,7 +82,7 @@ const DRAIN_PROBE_SCRIPT: &str = concat!(
 fn command_requester_times_out_while_draining_output() {
     let requester = CommandRequester::new("sh")
         .args(["-c", DRAIN_PROBE_SCRIPT])
-        .timeout_ms(1_000);
+        .timeout_ms(2_000);
     let started = Instant::now();
     let error = requester
         .request(&BrowserRequest::default())
@@ -87,11 +90,12 @@ fn command_requester_times_out_while_draining_output() {
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("requester timed out"), "{text}");
+    assert!(!text.contains("requester exited"), "{text}");
     assert!(
         text.contains("drained"),
         "stdout 排空后子进程才走得到 stderr 标记：{text}"
     );
-    assert!(elapsed < Duration::from_secs(4), "排空用例拖了 {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "排空用例拖了 {elapsed:?}");
 }
 
 #[test]
