@@ -101,7 +101,7 @@ pub(crate) fn run(
     };
 
     let grace_deadline = Instant::now() + THREAD_GRACE;
-    let write_result = collect(write_rx, grace_deadline);
+    let write_result = collect(Some(write_rx), grace_deadline);
     let stdout = collect(stdout, grace_deadline).unwrap_or_default();
     let stderr = collect(stderr, grace_deadline).unwrap_or_default();
 
@@ -132,7 +132,8 @@ where
     rx
 }
 
-fn collect<T>(receiver: Receiver<T>, deadline: Instant) -> Option<T> {
+fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
+    let receiver = receiver?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     match receiver.recv_timeout(remaining) {
         Ok(value) => Some(value),
