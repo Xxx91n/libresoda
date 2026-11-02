@@ -84,6 +84,7 @@ pub(crate) fn run(
     let started = Instant::now();
     let mut write_error: Option<io::Error> = None;
     let mut write_finished = false;
+    let mut write_incomplete = false;
     let exit_status = loop {
         if !write_finished {
             match write_rx.try_recv() {
@@ -99,7 +100,11 @@ pub(crate) fn run(
                 }
                 Ok(None) => write_finished = true,
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => write_finished = true,
+                // 线程没送结果就没了（异常退出）：不知道写完没有，按没交全处理。
+                Err(TryRecvError::Disconnected) => {
+                    write_incomplete = true;
+                    write_finished = true;
+                }
             }
         }
         match child.try_wait() {
@@ -130,7 +135,6 @@ pub(crate) fn run(
     };
 
     let grace_deadline = Instant::now() + THREAD_GRACE;
-    let mut write_incomplete = false;
     if !write_finished {
         match collect(Some(write_rx), grace_deadline) {
             Some(Some(err)) if err.kind() != ErrorKind::BrokenPipe => {
@@ -182,4 +186,25 @@ fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
     let receiver = receiver?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     receiver.recv_timeout(remaining).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reader_caps_capture_and_keeps_draining() {
+        let input = vec![b'x'; MAX_CAPTURE_BYTES + READ_CHUNK_BYTES];
+        let collected = collect(
+            Some(spawn_reader(Cursor::new(input))),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("读线程应把结果送回来");
+        assert_eq!(
+            collected.len(),
+            MAX_CAPTURE_BYTES,
+            "超出上限的字节应读走但不留在内存里"
+        );
+    }
 }
