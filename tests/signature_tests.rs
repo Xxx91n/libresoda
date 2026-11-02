@@ -82,13 +82,42 @@ fn command_signature_reads_json_from_stdout() {
 
 #[test]
 fn command_signature_reports_failure() {
-    // 子进程要先吃掉 stdin：直接 exit 会让 write_all 撞上断管，
-    // 报出 "signer stdin write" 而不是我们想断言的退出码错误。
-    let provider = CommandSignature::new("sh").args(["-c", "cat >/dev/null; exit 3"]);
+    // 子进程不读 stdin 就退出：写入可能撞上断管，也可能抢在它退出之前进了管道缓冲，
+    // 但两种结局都收敛到同一句退出码错误 —— 调用方要看到的是那个，不是一根断掉的管子。
+    let provider = CommandSignature::new("sh").args(["-c", "printf boom >&2; exit 3"]);
     let error = provider
         .sign(&sign_request("https://api.qishui.com/x", "GET", ""))
         .expect_err("should fail");
-    assert!(error.to_string().contains("signer exited"), "{error}");
+    let text = error.to_string();
+    // 退出码这行 Unix 印 `exit status: 3`，Windows 印 `exit code: 3`。
+    assert!(text.contains("signer exited"), "{text}");
+    assert!(
+        text.contains("exit status: 3:") || text.contains("exit code: 3:"),
+        "要有退出码：{text}"
+    );
+    assert!(text.contains("boom"), "要有 stderr：{text}");
+    assert!(!text.contains("stdin write"), "{text}");
+}
+
+#[test]
+fn command_signature_refuses_output_when_the_request_was_never_written() {
+    // 载荷取 2 MiB 是为了超过这几档、而不是押注某个默认值：Linux 新管道默认 16 页（4 KiB 页时是
+    // 64 KiB），没有 CAP_SYS_RESOURCE 的进程用 F_SETPIPE_SZ 最多提到 pipe-max-size 的默认上限
+    // 1 MiB（带 CAP_SYS_RESOURCE 的还能更高 —— pipe(7)）；Windows 那侧 std 按 PIPE_BUFFER_CAPACITY
+    // 申请 64 KiB。确定性的另一半是这根管道的容量没人动过：std 与本用例的 sh 都不调 F_SETPIPE_SZ，
+    // 于是写入完不成、断管是确定事实 —— 这种「回 0 + 合法 JSON」不能当签名用。
+    let provider =
+        CommandSignature::new("sh").args(["-c", "printf '%s' '{\"msToken\":\"forged\"}'; exit 0"]);
+    let error = provider
+        .sign(&sign_request(
+            "https://api.qishui.com/x",
+            "POST",
+            &"x".repeat(2 * 1024 * 1024),
+        ))
+        .expect_err("没写进请求的签名器，回 0 也不算成功");
+    let text = error.to_string();
+    assert!(text.contains("without reading the request"), "{text}");
+    assert!(!text.contains("stdin write"), "{text}");
 }
 
 #[test]

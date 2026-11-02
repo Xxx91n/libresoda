@@ -490,6 +490,27 @@
     预存的旧目标；#20 两条：取流失败（404 / 503 / 连接断开 / 被拒）时已有的续传暂存原样留着、
     记录临时名被目录占位时仍能把整曲落盘。
 
+* **签名器提前退出时的错误归属（`soda::signature::CommandSignature`，上游无对应）**：实现票
+  [`#13`](https://github.com/sodahub-org/libresoda/issues/13)。`write_all` 撞上 `ErrorKind::BrokenPipe`
+  不再当致命错误返回，而是继续 `wait_with_output`，交回 `signer exited with {退出码}: {stderr}`；
+  其它写入错误仍是 `signer stdin write: {err}`。断管只说明签名器没读 stdin 就退出了，退出码与
+  stderr 才是能说明"它为什么退出"的事实；Windows + Git Bash 的管道缓冲会让写入抢在退出之前完成，
+  所以这条只在 Linux 上暴露过。公开错误类型没变（仍是 `SodaError::Http`，没新增变体），新增的
+  文案本身不参与 `is_missing_entitlement` 的子串判断 —— 但 stderr 是原值拼进错误文本的，签名器
+  自己打印出 `requires cookie` 这类子串就会改变分类（这是既有的拼接行为，#13 只是让断管那条也
+  走到这里）。对外的契约（签名器必须先把 stdin 读干净再退出）写在 `docs/SIGNER-SERVICE.md` §2.2。
+  断管之后子进程仍回 `0` + 合法 JSON 的，**不当签名用**：那份回包不是按这次请求算出来的，报
+  `signer exited without reading the request`（CodeRabbit 搬运审查的 minor 成立项）。用例把请求体撑到
+  2 MiB 来让写入完不成 —— 这个数超过 Linux 新管道的默认容量、超过 `pipe-max-size` 的默认上限，也超过
+  std 在 Windows 申请的 `PIPE_BUFFER_CAPACITY`；逐档出处与「这根管道的容量没人动过」那半个前提写在
+  `tests/signature_tests.rs` 对应用例的注释里，此处不复述，免得两处漂。
+  这条分支因而钉得住；而「写入被
+  管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
+  两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
+  `CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
+  若关掉 stdin 却永不退出，`wait_with_output` 会无限等；`browser.rs` 的外部请求器是同一形状的
+  stdin 写入，#13 没扫它，仍会把断管当致命错误报。
+
 ## 未移植项
 
 > **客户端能力（上游 `music-lib` 完全没有，2026-09-15 照官方客户端 IDL 补齐并真机验证）**：

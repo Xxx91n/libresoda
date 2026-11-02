@@ -383,6 +383,9 @@ impl SignatureProvider for HttpSignature {
 /// stdin : {"url":"...","method":"POST","body":"...","ts_ms":1789394000000}
 /// stdout: {"ms_token":"...","a_bogus":"...","headers":{"bd-ticket-guard-version":"2"}}
 /// ```
+///
+/// 签名器必须**先把 stdin 读干净再退出**，即便它不消费请求体：否则写入会撞上断管，
+/// 而这时唯一能说清"它为什么退出"的只剩退出码和 stderr。
 #[derive(Debug, Clone)]
 pub struct CommandSignature {
     pub program: String,
@@ -427,14 +430,20 @@ impl SignatureProvider for CommandSignature {
             .spawn()
             .map_err(|err| SodaError::http(format!("signer spawn {}: {err}", self.program)))?;
 
+        let mut request_write_failed = false;
         {
             let stdin = child
                 .stdin
                 .as_mut()
                 .ok_or_else(|| SodaError::http("signer stdin unavailable"))?;
-            stdin
-                .write_all(&payload)
-                .map_err(|err| SodaError::http(format!("signer stdin write: {err}")))?;
+            match stdin.write_all(&payload) {
+                Ok(()) => {}
+                // 断管 = 签名器没读 stdin 就退出了；退出码与 stderr 才是原因，交给下面的 wait_with_output。
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                    request_write_failed = true
+                }
+                Err(err) => return Err(SodaError::http(format!("signer stdin write: {err}"))),
+            }
         }
         drop(child.stdin.take());
 
@@ -445,6 +454,13 @@ impl SignatureProvider for CommandSignature {
             return Err(SodaError::http(format!(
                 "signer exited with {}: {}",
                 output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        if request_write_failed {
+            // 请求根本没写进去，它回 0 加合法 JSON 也不是按这次请求算出来的，不能当签名用。
+            return Err(SodaError::http(format!(
+                "signer exited without reading the request: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
