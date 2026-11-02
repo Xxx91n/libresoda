@@ -129,13 +129,15 @@ fn command_signature_times_out_when_signer_never_reads_or_exits() {
         .args(["-c", "exec sleep 30"])
         .timeout_ms(200);
     let started = std::time::Instant::now();
-    let error = provider
-        .sign(&sign_request(
-            "https://api.qishui.com/x",
-            "POST",
-            &"x".repeat(2 * 1024 * 1024),
-        ))
-        .expect_err("签名器不退出就得报超时");
+    let request = sign_request(
+        "https://api.qishui.com/x",
+        "POST",
+        &"x".repeat(2 * 1024 * 1024),
+    );
+    let error = run_with_watchdog(std::time::Duration::from_secs(3), move || {
+        provider.sign(&request)
+    })
+    .expect_err("签名器不退出就得报超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("timed out"), "{text}");
@@ -162,6 +164,20 @@ const DRAIN_PROBE_SCRIPT: &str = concat!(
     "while :; do :; done",
 );
 
+/// 把可能永久阻塞的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
+fn run_with_watchdog<T, F>(timeout: std::time::Duration, task: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(task());
+    });
+    rx.recv_timeout(timeout)
+        .expect("调用没有在期限内返回（用例自身挂住了）")
+}
+
 #[test]
 fn command_signature_times_out_while_draining_signer_output() {
     // 两个方向同时压住：探针固定写 256 KiB（4× 64 KiB 默认管道容量）且从不读 stdin，
@@ -172,13 +188,15 @@ fn command_signature_times_out_while_draining_signer_output() {
         .args(["-c", DRAIN_PROBE_SCRIPT])
         .timeout_ms(2_000);
     let started = std::time::Instant::now();
-    let error = provider
-        .sign(&sign_request(
-            "https://api.qishui.com/x",
-            "POST",
-            &"x".repeat(2 * 1024 * 1024),
-        ))
-        .expect_err("写满输出又不退出，也得超时");
+    let request = sign_request(
+        "https://api.qishui.com/x",
+        "POST",
+        &"x".repeat(2 * 1024 * 1024),
+    );
+    let error = run_with_watchdog(std::time::Duration::from_secs(5), move || {
+        provider.sign(&request)
+    })
+    .expect_err("写满输出又不退出，也得超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("timed out"), "{text}");

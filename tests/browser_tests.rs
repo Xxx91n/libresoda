@@ -7,6 +7,20 @@
 use libresoda::soda::browser::{BrowserRequest, BrowserRequester, CommandRequester};
 use std::time::{Duration, Instant};
 
+/// 把可能永久阻塞的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
+fn run_with_watchdog<T, F>(timeout: Duration, task: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(task());
+    });
+    rx.recv_timeout(timeout)
+        .expect("调用没有在期限内返回（用例自身挂住了）")
+}
+
 #[test]
 fn command_requester_rejects_non_zero_exit() {
     let requester = CommandRequester::new("sh").args(["-c", "printf bad >&2; exit 7"]);
@@ -84,9 +98,10 @@ fn command_requester_times_out_while_draining_output() {
         .args(["-c", DRAIN_PROBE_SCRIPT])
         .timeout_ms(2_000);
     let started = Instant::now();
-    let error = requester
-        .request(&BrowserRequest::default())
-        .expect_err("写满输出又不退出，也得超时");
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("写满输出又不退出，也得超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("requester timed out"), "{text}");
@@ -104,9 +119,10 @@ fn command_requester_times_out_when_child_never_exits() {
         .args(["-c", "exec sleep 30"])
         .timeout_ms(200);
     let started = Instant::now();
-    let error = requester
-        .request(&BrowserRequest::default())
-        .expect_err("子进程不退出就得报超时");
+    let error = run_with_watchdog(Duration::from_secs(3), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("子进程不退出就得报超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("requester timed out"), "{text}");
