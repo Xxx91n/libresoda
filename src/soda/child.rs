@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 轮询 `try_wait` 的起始间隔。只决定退出检测的粒度。
+/// 轮询 `try_wait` 的起始间隔。只决定退出检测与「到点那一拍」的粒度。
 ///
 /// 数值出处与超时口径见 `docs/PORTING.md`「轮询退避」一条（票 #28），这里不复述，免得两处漂。
 const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
@@ -24,7 +24,7 @@ const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
 /// 轮询 `try_wait` 的间隔上限。翻倍到这里就不再涨。
 const POLL_INTERVAL_MAX: Duration = Duration::from_millis(10);
 
-/// 下一拍轮询的间隔：每拍翻倍，到上限为止。用 sleep 而不是忙等。
+/// 下一拍轮询的间隔：每拍翻倍，到上限为止（调用方每拍 `thread::sleep`，不忙等）。
 fn next_poll_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(POLL_INTERVAL_MAX)
 }
