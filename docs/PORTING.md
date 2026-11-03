@@ -605,12 +605,19 @@
     `signer exited without reading the request: {stderr}` / `signer stdin write: {err}`）原样保留。
     请求器按同一口径用 `requester` 前缀。
   - **线程收集有宽限**：子进程结束/被终止后，工作线程用 1 s 有界等待收集，不是无限 `join`。
-    正常路径它们随管道 EOF 立即结束；只有逃出进程组/作业的后继进程攥着管道时才可能走满宽限 ——
-    目的是不让调用方被重新锁死。宽限只保证调用方回来，不回收卡在阻塞读写上的线程（std 无法从
-    外部中断它们）；超时路径只等 stderr 一个宽限，不再等写线程。宽限内没送达的流按空输出处理 ——
-    读取错误或管道被容器外的后继进程攥着时，后续会以解码/响应解析错误暴露，不会静默当成功。
-    对超时错误而言，这意味着逃出容器的进程攥着写端时错误文本可能不带 stderr；要补成「宽限到时
-    先交出部分缓冲」属于可观测性增强，需另开票。
+    正常路径它们随管道 EOF 立即结束；会走满宽限的有两种形态：① 逃出进程组/作业的后继进程
+    攥着管道；② 成功路径上自愿驻留、且继承了 stdout/stderr 的后继进程（`release` 不杀它）——
+    审计（#31 评论）用 `cat >/dev/null; ( sleep 2; echo alive > 标记 ) & exit 0` 实测过这一形态：
+    调用方等满宽限，2 s 后 helper 照样写下标记。目的是不让调用方被重新锁死。宽限只保证调用方
+    回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；超时路径只等 stderr 一个宽限，
+    不再等写线程。**宽限内没送达的流按空输出处理**：`spawn_reader` 只在 `read()` 返回 0（EOF）
+    或读错误时才把缓冲送回去，所以宽限到点时已经收到的字节也整块丢掉 —— 签名器「先交回包、
+    再留后台 helper」的写法会被读成空回包（实测报 `requester 返回无法解析`）。后继进程要驻留就
+    必须自己关掉或重定向继承的 stdout/stderr。要补成「宽限到时先交出部分缓冲」属于可观测性增强，
+    需另开票。
+  - **`wait()` 本身没有时限（残余边界 ⑦）**：`SIGKILL` / `TerminateProcess` 对卡在不可中断
+    内核调用里的进程不会即时生效，`child.wait()` 仍会一直等 —— 这条与 `#23` 同形，不是本票引入，
+    但本票的「再补一次 `Child::kill()`」以「信号落得下去」为前提，前提不成立时它不构成等待上界。
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
     stdout/stderr 移入排空线程；主线程持有 `Child` 与进程树容器（Windows 的作业句柄），
     负责终止与 `wait` 收尸。
@@ -625,21 +632,24 @@
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
     等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
-    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 七条 —— 非 0 退出、
-    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的两条：
+    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 八条 —— 非 0 退出、
+    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的三条：
     `sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的后台 helper 后驻留到超时 —— helper 活着的
     唯一证据就是写端没关，超时前写下的 stderr 标记能随 EOF 交回来就说明整棵树已终止（Unix 与
     Windows 同一份用例；Windows 侧「helper 已死」由这条 EOF 推出：写端持有者必须全部消失，没有
     另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。Unix 另有一条从 pid 文件用 `kill(pid, 0)`
-    确认 helper 在超时返回后消失。
+    确认 helper 在超时返回后消失；第三条走成功路径 —— 子进程交完回包就退出，后台 helper 继承着
+    stdout 在 2 s 后写标记，断言调用方回来时它仍活着（钉住 `release`：Windows 上清标志失败会让
+    `Job::drop` 把它带走，这条用例会红）。
     `src/soda/child.rs` 三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
     0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
     全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例 5 s 守卫；计时用例都把调用
     放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
     `cargo test`。排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；
-    进程树由上面两条专项用例覆盖。Windows 侧另有非必需 CI job
-    `windows / fmt, clippy, test`（`windows-latest`，同一组 fmt/clippy/test），Job Object 代码
-    因此至少被编译并由上述用例执行到；它不是必需检查，分支保护仍只认 `fmt / clippy / test`。
+    进程树由上面三条专项用例覆盖。Windows 侧另有非必需 CI job
+    `windows / clippy, test`（`windows-latest`；fmt 只在 Ubuntu 跑，rustfmt 输出不分平台），
+    Job Object 代码因此至少被编译并由上述用例执行到；它不动必需检查的名字
+    （`fmt / clippy / test`），是否必需由分支保护配置决定，本仓无法从代码侧验证。
 
 ## 未移植项
 
