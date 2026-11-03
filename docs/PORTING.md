@@ -521,8 +521,9 @@
   - **终止整棵进程树（票 [`#25`](https://github.com/sodahub-org/libresoda/issues/25)）**：`#23`
     的超时路径只 `kill()` 直接子进程；签名器/请求器作为 launcher 自己拉起的 helper（`ssh`、
     `node`、`sh`、桥接器、浏览器）会继续运行，攥着 stdout/stderr 写端，也会继续持有浏览器会话/
-    设备上下文。现在 spawn 时就把直接子进程放进一个能整体寻址的容器，**所有终止路径**（超时、
-    写 stdin 的非断管错误、`try_wait` 取不到状态、拿不到 stdin）都先终止整个容器再 `wait`：
+    设备上下文。现在 spawn 时就把直接子进程放进一个能整体寻址的容器；**子进程仍在跑、或
+    还要收尸时就直接返回错误的路径**（超时、运行中发现写 stdin 的非断管错误、`try_wait`
+    取不到状态、拿不到 stdin、attach 失败）都先终止整个容器再 `wait`：
     - **Unix**：`CommandExt::process_group(0)` 让子进程自成进程组（组号 = 子进程 pid；std 在
       exec 前 `setpgid`，`spawn` 返回时已生效），终止时 `kill(-pgid, SIGKILL)`。组信号失败
       （组已消失、信号没发出去）时退回 `Child::kill()`，避免 `wait` 等一个还活着的子进程。
@@ -547,9 +548,12 @@
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
       不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行；⑤ 既非 Unix 也非 Windows 的目标
       拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
-      进程树保证只在这两个平台上成立；⑥ `run` 返回 `Ok` 但请求没交全（断管、写线程超宽限）的
-      路径也走成功释放：子进程已经退出，若它留下还活着的 helper，helper 不会被终止 —— 与 Unix
-      一致，错误由上层按退出码/「没读请求」报出，不当作超时处理。
+      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止：`run` 返回 `Ok`
+      但请求没交全（断管、写线程超宽限、写线程没送结果）的路径走成功释放，两个平台都会留下子进程
+      留下的 helper；子进程已退出后才发现写入错误（非断管）的那条直接返回 `Err(Stdin)`、不调用
+      `release`，Unix 上 helper 同样留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它带走。
+      两种情况都由上层按退出码/「没读请求」报出，不当作超时处理；这里也不能补 `kill(-pid)` ——
+      `try_wait` 已经收尸，pid 可能已被复用。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
