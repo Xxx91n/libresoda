@@ -2,13 +2,10 @@
 //!
 //! 同一条最小签名器各跑两遍：一遍走 `CommandSignature::sign`（写 + 排空 + 有上限等待，
 //! `src/soda/child.rs`），一遍走裸 `spawn + write_all + wait_with_output`（票 #23 之前库本来的
-//! 做法，也是这条快路径的下界）。两列之差 = 执行器整条路的开销：三次工作线程的 spawn、
-//! 库里 `sign()` 自己那次 JSON 编码，以及轮询粒度的那半拍 —— 跟 #23 复核留下的那个差值同形
-//! （那两条数也各自含 spawn 与编码），所以能对照着看；但它不是「轮询粒度单独占多少」，
-//! 那一格要读 `POLL_INTERVAL_*` 的退避序列。
+//! 做法，也是这条快路径的下界）。两列之差是执行器整条路的复合开销，不是轮询粒度单独占多少 ——
+//! 这张表怎么读、以及为什么不做成门禁，只写在 `docs/PORTING.md`「计时凭证」一条里。
 //!
-//! **只记录，不判分**：这张表里不设阈值、不判成败，只让读的人自己看量级。口径与「为什么不做成
-//! 门禁」记在 `docs/PORTING.md`「计时凭证」一条；`.github/workflows/ci.yml` 在 Test 之后跑一次。
+//! **只记录，不判分**：这里不设阈值、不判成败，只让读的人自己看量级。
 //!
 //! ```text
 //! CHILD_POLL_ROUNDS  可选；计时轮数，缺省 100（非法按 100，实际取 1..=1000）
@@ -58,8 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clamp(1, MAX_ROUNDS);
 
     let request = sign_request("https://api.qishui.com/x", "POST", &"x".repeat(512));
-    // 两条路径喂同一份字节。注意库里 `sign()` 内部还会再编码一次（signature.rs），那一次算在
-    // 差值里 —— 这张表量的是「走执行器一共贵多少」，不是轮询粒度单独贵多少。
+    // 两条路径喂同一份字节；差值的构成写在 `docs/PORTING.md`「计时凭证」一条里。
     let payload = serde_json::to_vec(&request)?;
     let provider = CommandSignature::new("sh").args(["-c", SIGNER_SCRIPT]);
 

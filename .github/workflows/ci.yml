@@ -51,14 +51,14 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # 票 sodahub-org/libresoda#28：快路径延迟的计时记录。把 `child_poll_probe` 那张「库路径 vs
-      # 裸 spawn」的 p50 差值表打进日志；差值是走执行器的总开销（含三次线程 spawn 与库里那次
-      # JSON 编码），不是轮询粒度单独占多少 —— 口径与「为什么不做成门禁」记在
+      # 票 sodahub-org/libresoda#28：快路径延迟的计时记录 —— 把 `child_poll_probe` 那张
+      # 「库路径 vs 裸 spawn」的 p50 差值表打进日志。表怎么读、为什么不进门禁，只写在
       # `docs/PORTING.md`「计时凭证」一条，这里不复述。
-      # 「不门禁」靠的是末尾那个 `|| echo`：这一步恒退 0，因而不必再写 `continue-on-error`
-      # （写了也永远轮不到，是死开关）。`timeout 300` 兜住「挂住」—— Actions 的 `timeout-minutes`
-      # 只能挂在 job 上，而裸 `wait_with_output` 那一列真卡住时整个 job 会被拖到默认时限；
-      # 它掐的是 cargo 这一层。没跑出表就落一条 ::warning，凭证不至于静默消失。
+      # 这一步恒退 0（末尾那个 `|| echo` 就是「不门禁」的机制，所以不必再写
+      # `continue-on-error`，写了也永远轮不到）。`timeout 300` 兜住「挂住」：Actions 的
+      # `timeout-minutes` 只能挂在 job 上，而裸 `wait_with_output` 那一列真卡住时整个 job
+      # 会被拖到默认时限；它掐的是 cargo 这一层。没跑出表就落一条 ::warning，
+      # 凭证不至于静默消失。
       - name: Child poll timing record
         run: |
           timeout 300 cargo run --locked --example child_poll_probe || \
