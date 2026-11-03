@@ -513,9 +513,24 @@
   （`src/soda/child.rs`），口径如下：
 
   - **顺序**：spawn → 写 stdin 的线程（写完即 drop 写端）+ stdout/stderr 各一个排空线程 →
-    主线程按 `timeout_ms` 轮询 `try_wait`。限时内退出由 `try_wait`（底层 `waitpid(WNOHANG)`）
-    取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr → 返回超时错误。
-    所有路径都不再有无界 `wait_with_output`。
+    主线程按 `timeout_ms` 轮询 `try_wait`（间隔见下一条）。限时内退出由 `try_wait`（底层
+    `waitpid(WNOHANG)`）取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr
+    → 返回超时错误。所有路径都不再有无界 `wait_with_output`。
+  - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
+    间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
+    仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
+    `sign()` 在每一次带签名的请求上都走：`#23` 复核实测同一脚本 `sign()` 197 ms vs 裸
+    `spawn + write_all + wait_with_output` 192 ms，差值正是那半个间隔，而 Linux 上签名器本身只要
+    2–3 ms —— 比例不小。退避后快路径那一拍落到 1 ms 级。
+    - **为什么是退避而不是直接 1–2 ms**：请求器的等待上限默认 240 s，按 1 ms 轮询等于一次等待里
+      打 24 万拍；退避只在开头十几毫秒内多几拍，之后仍是每 10 ms 一拍。
+    - **超时精度与上限不变**：到点判据仍是 `started.elapsed() >= timeout`，与间隔无关；而任何一次
+      真实的超时（用例是 200 ms / 2 s，请求器是 240 s）发生时间隔早已封顶，到点那一拍多吃到的宽限
+      与 `#23` 完全相同（≤ 10 ms）。错误文案一条没改。
+    - **计时凭证**：`examples/child_poll_probe.rs` 跑同一条最小签名器两遍（库路径 vs 裸
+      `spawn + write_all + wait_with_output`），A/B 交替取 p50 差值；`.github/workflows/ci.yml`
+      在 Test 之后跑一次，把表打进日志。那一步是 `continue-on-error`：**只记录、不门禁** —— 数字随
+      runner 的机器与负载变，把「≤ 2 ms」写死进用例等于给某一台 runner 背书（票 #28 的验收也这么要求）。
   - **写入侧也有上限**：`write_all` 在独立线程里跑，所以载荷超过管道容量而签名器既不读也不退出时，
     主线程仍能按时 kill。每次轮询也看一眼写线程的结果：断管仍归因给退出码/stderr；非断管的
     写入错误一旦观察到就先终止 + 收尸，再报 `signer stdin write: {err}`（`#23` 评论指出的第三处
@@ -541,6 +556,10 @@
     `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
     这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
     需要改用 `new`/`timeout_ms`；仓内没有这种用法。
+  - **轮询退避只改间隔，不改判据（票 #28）**：#23 那四条计时用例（两个超时 + 两个排空/大回包）的
+    `recv_timeout` 看门狗与 `elapsed` 断言都不必调阈值 —— 退避不碰「到点」的判据，也不碰超时那一拍
+    的宽限；快路径的额外延迟交给 `examples/child_poll_probe.rs` 记录，不进用例（票 #28 的验收也明确
+    要求别把毫秒数写死在某台机器上）。
   - **SIGPIPE 前提**：`write_all` 断管返回 `Err(BrokenPipe)` 而不是把进程打死，前提是宿主忽略了
     SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
@@ -548,7 +567,9 @@
     等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
     两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 五条 —— 非 0 退出、
     断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记）；`src/soda/child.rs`
-    一条单元用例钉 8 MiB 收集上限（超出字节读走但丢弃）。全部离线，超时用例时限 200 ms–2 s（还有
+    三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
+    0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
+    全部离线，超时用例时限 200 ms–2 s（还有
     1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都把调用放进带 `recv_timeout` 的线程里，
     库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢 `cargo test`。排空用例的探针只用
     shell 内建、不 fork
