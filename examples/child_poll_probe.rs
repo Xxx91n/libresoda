@@ -7,12 +7,11 @@
 //! （那两条数也各自含 spawn 与编码），所以能对照着看；但它不是「轮询粒度单独占多少」，
 //! 那一格要读 `POLL_INTERVAL_*` 的退避序列。
 //!
-//! **只记录，不判分**：这些数字随机器与负载变，把「≤ 2 ms」写死进任何自动门禁等于给某台机器
-//! 背书。这张表只让读的人自己看出量级有没有从 10 ms 落到 1 ms 级。`.github/workflows/ci.yml`
-//! 在 Test 之后跑一次、把表打进日志，那一步 `continue-on-error`，红了不挡合并。
+//! **只记录，不判分**：这张表里不设阈值、不判成败，只让读的人自己看量级。口径与「为什么不做成
+//! 门禁」记在 `docs/PORTING.md`「计时凭证」一条；`.github/workflows/ci.yml` 在 Test 之后跑一次。
 //!
 //! ```text
-//! CHILD_POLL_ROUNDS  可选；计时轮数，缺省 100（非法按 100，实际取 1..=10000）
+//! CHILD_POLL_ROUNDS  可选；计时轮数，缺省 100（非法按 100，实际取 1..=2000）
 //! ```
 //!
 //! 跑法（离线、不碰网络；签名器是 `sh` + `cat`）：
@@ -39,9 +38,9 @@ const WARM_UP_ROUNDS: usize = 5;
 /// 默认计时轮数。
 const DEFAULT_ROUNDS: usize = 100;
 
-/// 轮数上限：`CHILD_POLL_ROUNDS` 是人给的数，不能直接拿去当容量用
-/// （AGENTS.md 内存安全铁律 1）。
-const MAX_ROUNDS: usize = 10_000;
+/// 轮数上限：`CHILD_POLL_ROUNDS` 是人给的数，不能直接拿去当容量用（AGENTS.md 内存安全铁律 1）；
+/// 上限同时保证两列跑完仍落在 CI 那步 `timeout 300` 之内。
+const MAX_ROUNDS: usize = 2_000;
 
 /// 一组样本的分位（单位：微秒）。
 struct Stats {
@@ -58,11 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(DEFAULT_ROUNDS)
         .clamp(1, MAX_ROUNDS);
 
-    let request = sign_request(
-        "https://api.qishui.com/v2/music/detail",
-        "POST",
-        &"x".repeat(512),
-    );
+    let request = sign_request("https://api.qishui.com/x", "POST", &"x".repeat(512));
     // 两条路径喂同一份字节。注意库里 `sign()` 内部还会再编码一次（signature.rs），那一次算在
     // 差值里 —— 这张表量的是「走执行器一共贵多少」，不是轮询粒度单独贵多少。
     let payload = serde_json::to_vec(&request)?;
@@ -88,12 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arch = std::env::consts::ARCH;
     let bytes = payload.len();
     println!("platform: {os} {arch} | rounds: {rounds} | payload: {bytes} bytes");
-    println!("poll: 0.5 ms 起，每拍翻倍，10 ms 封顶");
     println!("{:<34}{:>10}{:>10}{:>10}{:>10}", "path (ms)", "min", "p50", "p90", "mean");
     print_row("CommandSignature::sign", &library);
     print_row("bare spawn+wait_with_output", &bare);
-    let diff = library.p50 as f64 - bare.p50 as f64;
-    println!("p50 diff (library - bare): {diff:+.0} us");
+    let diff = (library.p50 as f64 - bare.p50 as f64) / 1_000.0;
+    println!("p50 diff (library - bare): {diff:+.3} ms");
     println!("记录用：数字随机器变，这里不设阈值、不判成败。");
     Ok(())
 }
