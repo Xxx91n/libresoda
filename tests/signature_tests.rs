@@ -121,6 +121,97 @@ fn command_signature_refuses_output_when_the_request_was_never_written() {
 }
 
 #[test]
+fn command_signature_times_out_when_signer_never_reads_or_exits() {
+    // 载荷撑到 2 MiB（容量出处见上一条用例）：写入在管道满时就会卡住，而签名器既不读
+    // stdin 也不退出。票 #23 要求时限同时盖住写入那一侧，到点 kill + 回收，不能无限等。
+    // `exec` 让 sh 被 sleep 顶替：kill 打到的就是真正活着的那个进程，不留后台孙进程。
+    let provider = CommandSignature::new("sh")
+        .args(["-c", "exec sleep 30"])
+        .timeout_ms(200);
+    let started = std::time::Instant::now();
+    let request = sign_request(
+        "https://api.qishui.com/x",
+        "POST",
+        &"x".repeat(2 * 1024 * 1024),
+    );
+    let error = run_with_watchdog(std::time::Duration::from_secs(3), move || {
+        provider.sign(&request)
+    })
+    .expect_err("签名器不退出就得报超时");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(
+        !text.contains("signer exited"),
+        "超时不能伪装成正常退出：{text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "超时用例拖了 {elapsed:?}"
+    );
+}
+
+/// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
+/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— kill 掉直接子进程后管道写端
+/// 全部关闭，Windows（Git Bash/msys2）与 Unix 都能在超时路径取回已排空的 stderr。
+/// （`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。）
+/// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
+const DRAIN_PROBE_SCRIPT: &str = concat!(
+    "i=0; while [ $i -lt 4096 ]; do ",
+    "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
+    "i=$((i+1)); done; ",
+    "printf drained >&2; ",
+    "while :; do :; done",
+);
+
+/// 把可能永久阻塞的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
+fn run_with_watchdog<T, F>(timeout: std::time::Duration, task: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(task());
+    });
+    rx.recv_timeout(timeout)
+        .expect("调用没有在期限内返回（用例自身挂住了）")
+}
+
+#[test]
+fn command_signature_times_out_while_draining_signer_output() {
+    // 两个方向同时压住：探针固定写 256 KiB（4× 64 KiB 默认管道容量）且从不读 stdin，
+    // 2 MiB 载荷会把写入线程卡在管道上 —— 没有排空线程会堵在 stdout、没有时限会卡在
+    // 写入，任一缺失都走不到 stderr 标记或拿不回错误。到点必须终止 + 回收并交回
+    // 可区分的超时错误。
+    let provider = CommandSignature::new("sh")
+        .args(["-c", DRAIN_PROBE_SCRIPT])
+        .timeout_ms(2_000);
+    let started = std::time::Instant::now();
+    let request = sign_request(
+        "https://api.qishui.com/x",
+        "POST",
+        &"x".repeat(2 * 1024 * 1024),
+    );
+    let error = run_with_watchdog(std::time::Duration::from_secs(5), move || {
+        provider.sign(&request)
+    })
+    .expect_err("写满输出又不退出，也得超时");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(!text.contains("signer exited"), "{text}");
+    assert!(
+        text.contains("drained"),
+        "stdout 排空后子进程才走得到 stderr 标记：{text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "排空用例拖了 {elapsed:?}"
+    );
+}
+
+#[test]
 fn apply_signature_to_url_keeps_existing_query() {
     let url = "https://api.qishui.com/passport/web/check_qrconnect/?aid=386088&token=abc";
     let response = SignResponse {

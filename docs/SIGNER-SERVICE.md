@@ -105,6 +105,12 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 写入被管道缓冲吃掉、签名器一个字节都没读，库这边看不出来，所以这条契约得由签名器自己守住。
 `HttpSignature` 那侧没有这根管道，body 由 HTTP 客户端自己发完。
 
+`CommandSignature::timeout_ms`（默认 5 s）自票
+[`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr
+排空都在独立线程里进行，主线程按这个上限等子进程；到点 `kill` 再 `wait` 回收，报
+`signer timed out after {N} ms`（有 stderr 时补在后面）。所以「签名器关掉 stdin 却永不退出」
+不会再让调用方无限等 —— 超时前缀与上面三条「正常退出」文案可区分。
+
 ## 3. libresoda 侧用法
 
 ```rust

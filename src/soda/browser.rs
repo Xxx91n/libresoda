@@ -7,11 +7,11 @@
 //! 本 crate 通过一个外部命令（`tools/qishui-signer/sign-cli.mjs`）对接本地
 //! 签名服务：stdin 收 JSON、stdout 回 JSON。
 
+use super::child::{self, ChildError};
 use crate::error::{Result, SodaError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// 交给浏览器页面执行的请求。
@@ -120,6 +120,8 @@ pub trait BrowserRequester: Send + Sync {
 pub struct CommandRequester {
     pub program: String,
     pub args: Vec<String>,
+    /// 子进程的等待上限。默认 240 s：签名服务的 fetch 上限是 180 s，再留页面导航余量。
+    pub timeout_ms: u64,
 }
 
 impl CommandRequester {
@@ -127,6 +129,7 @@ impl CommandRequester {
         Self {
             program: program.into(),
             args: Vec::new(),
+            timeout_ms: 240_000,
         }
     }
 
@@ -139,28 +142,56 @@ impl CommandRequester {
         self
     }
 
+    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    fn map_child_error(&self, err: ChildError) -> SodaError {
+        match err {
+            ChildError::Spawn(err) => {
+                SodaError::http(format!("requester spawn {}: {err}", self.program))
+            }
+            ChildError::StdinUnavailable => SodaError::http("requester stdin unavailable"),
+            ChildError::Stdin(err) => SodaError::http(format!("requester stdin write: {err}")),
+            ChildError::Wait(err) => SodaError::http(format!("requester wait: {err}")),
+            ChildError::Timeout { stderr } => {
+                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+                SodaError::http(if stderr.is_empty() {
+                    format!("requester timed out after {} ms", self.timeout_ms)
+                } else {
+                    format!("requester timed out after {} ms: {stderr}", self.timeout_ms)
+                })
+            }
+        }
+    }
+
     /// 跑一次外部 CLI：stdin 喂 JSON，stdout 原样返回。
-    fn exec(&self, payload: &[u8]) -> Result<String> {
-        let mut child = Command::new(&self.program)
+    ///
+    /// 与 `CommandSignature` 同口径（票 #23）：写入/排空/等待同时进行，到点 kill + 回收；
+    /// 断管归因给退出码与 stderr；非 0 退出不再把 stdout 当回包交出去。
+    fn exec(&self, payload: Vec<u8>) -> Result<String> {
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| SodaError::http(format!("requester spawn {}: {err}", self.program)))?;
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| SodaError::http("requester stdin unavailable"))?;
-            stdin
-                .write_all(payload)
-                .map_err(|err| SodaError::http(format!("requester stdin write: {err}")))?;
+            .stderr(Stdio::piped());
+        let output = child::run(&mut command, payload, self.timeout_ms)
+            .map_err(|err| self.map_child_error(err))?;
+        if !output.status.success() {
+            return Err(SodaError::http(format!(
+                "requester exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
-        drop(child.stdin.take());
-        let output = child
-            .wait_with_output()
-            .map_err(|err| SodaError::http(format!("requester wait: {err}")))?;
+        if output.request_write_failed {
+            return Err(SodaError::http(format!(
+                "requester exited without reading the request: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
@@ -169,7 +200,7 @@ impl BrowserRequester for CommandRequester {
     fn request(&self, request: &BrowserRequest) -> Result<BrowserResponse> {
         let payload = serde_json::to_vec(request)
             .map_err(|err| SodaError::json(format!("browser request encode: {err}")))?;
-        let text = self.exec(&payload)?;
+        let text = self.exec(payload)?;
         let parsed: BrowserResponse = serde_json::from_str(text.trim()).map_err(|err| {
             SodaError::json(format!(
                 "requester 返回无法解析: {err}（输出: {}）",
@@ -191,7 +222,7 @@ impl BrowserRequester for CommandRequester {
             return Ok(());
         }
         let payload = serde_json::json!({ "op": "close", "sessionKey": session_key });
-        let text = self.exec(payload.to_string().as_bytes())?;
+        let text = self.exec(payload.to_string().into_bytes())?;
         let parsed: BrowserResponse = serde_json::from_str(text.trim())
             .map_err(|err| SodaError::json(format!("close session 返回无法解析: {err}")))?;
         if !parsed.ok {

@@ -506,10 +506,54 @@
   `tests/signature_tests.rs` 对应用例的注释里，此处不复述，免得两处漂。
   这条分支因而钉得住；而「写入被
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
-  两条如实记着的限制已另开票 [`#23`](https://github.com/sodahub-org/libresoda/issues/23)：
-  `CommandSignature::timeout_ms` 在 `sign()` 里并没有生效，吞掉断管之后子进程
-  若关掉 stdin 却永不退出，`wait_with_output` 会无限等；`browser.rs` 的外部请求器是同一形状的
-  stdin 写入，#13 没扫它，仍会把断管当致命错误报。
+
+* **外部子进程的等待上限（`soda::child::run`，上游无对应）**：实现票
+  [`#23`](https://github.com/sodahub-org/libresoda/issues/23)，收掉上一条如实记着的两条限制。
+  `CommandSignature` 与 `CommandRequester` 现在共用一个 `pub(crate)` 执行器
+  （`src/soda/child.rs`），口径如下：
+
+  - **顺序**：spawn → 写 stdin 的线程（写完即 drop 写端）+ stdout/stderr 各一个排空线程 →
+    主线程按 `timeout_ms` 轮询 `try_wait`。限时内退出由 `try_wait`（底层 `waitpid(WNOHANG)`）
+    取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr → 返回超时错误。
+    所有路径都不再有无界 `wait_with_output`。
+  - **写入侧也有上限**：`write_all` 在独立线程里跑，所以载荷超过管道容量而签名器既不读也不退出时，
+    主线程仍能按时 kill。每次轮询也看一眼写线程的结果：断管仍归因给退出码/stderr；非断管的
+    写入错误一旦观察到就先终止 + 收尸，再报 `signer stdin write: {err}`（`#23` 评论指出的第三处
+    漏收尸，`browser.rs` 同形一并修）。子进程退出时写入仍未结束的，按「请求没交全」处理，
+    不吃掉 #13 的 `signer exited without reading the request`。
+  - **错误分类**：不新增公开变体，仍是 `SodaError::Http`。超时文案为
+    `signer timed out after {timeout_ms} ms`（有 stderr 时补 `: {stderr}`），前缀与
+    `signer exited...` 可区分；三条冻结文案（`signer exited with {退出码}: {stderr}` /
+    `signer exited without reading the request: {stderr}` / `signer stdin write: {err}`）原样保留。
+    请求器按同一口径用 `requester` 前缀。
+  - **线程收集有宽限**：子进程结束/被终止后，工作线程用 1 s 有界等待收集，不是无限 `join`。
+    正常路径它们随管道 EOF 立即结束；只有孙进程攥着管道时才可能走满宽限 —— 目的是不让调用方
+    被重新锁死。宽限只保证调用方回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；
+    超时路径只等 stderr 一个宽限，不再等写线程。宽限内没送达的流按空输出处理 —— 读取错误或
+    管道被孙进程攥着时，后续会以解码/响应解析错误暴露，不会静默当成功。对超时错误而言，这意味着
+    后继进程攥着写端时错误文本可能不带 stderr（测试探针刻意避开这种形态）；要补成「宽限到时先交出
+    部分缓冲」属于可观测性增强，需另开票。
+  - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
+    stdout/stderr 移入排空线程；主线程只持有 `Child` 负责 kill/wait。
+  - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
+    「按对端产出的量无限增长」的来源（AGENTS.md 内存安全铁律 2）；正常签名回包远小于这个数。
+  - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
+    `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
+    这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
+    需要改用 `new`/`timeout_ms`；仓内没有这种用法。
+  - **SIGPIPE 前提**：`write_all` 断管返回 `Err(BrokenPipe)` 而不是把进程打死，前提是宿主忽略了
+    SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
+    将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
+  - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
+    等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
+    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 五条 —— 非 0 退出、
+    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记）；`src/soda/child.rs`
+    一条单元用例钉 8 MiB 收集上限（超出字节读走但丢弃）。全部离线，超时用例时限 200 ms–2 s（还有
+    1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都把调用放进带 `recv_timeout` 的线程里，
+    库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢 `cargo test`。排空用例的探针只用
+    shell 内建、不 fork
+    子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回已排空的
+    stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
 
 ## 未移植项
 

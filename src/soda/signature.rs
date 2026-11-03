@@ -14,11 +14,11 @@
 //!
 //! 详见 `docs/MSSDK-PORTING.md`。
 
+use super::child::{self, ChildError};
 use crate::error::{Result, SodaError};
 use crate::util::now_millis;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -415,6 +415,27 @@ impl CommandSignature {
         self.timeout_ms = timeout_ms;
         self
     }
+
+    /// 把执行器的失败翻成签名器的错误文案。超时前缀 `signer timed out` 与
+    /// `signer exited...` 可区分（三条已冻结的文案见 `docs/PORTING.md`）。
+    fn map_child_error(&self, err: ChildError) -> SodaError {
+        match err {
+            ChildError::Spawn(err) => {
+                SodaError::http(format!("signer spawn {}: {err}", self.program))
+            }
+            ChildError::StdinUnavailable => SodaError::http("signer stdin unavailable"),
+            ChildError::Stdin(err) => SodaError::http(format!("signer stdin write: {err}")),
+            ChildError::Wait(err) => SodaError::http(format!("signer wait: {err}")),
+            ChildError::Timeout { stderr } => {
+                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+                SodaError::http(if stderr.is_empty() {
+                    format!("signer timed out after {} ms", self.timeout_ms)
+                } else {
+                    format!("signer timed out after {} ms: {stderr}", self.timeout_ms)
+                })
+            }
+        }
+    }
 }
 
 impl SignatureProvider for CommandSignature {
@@ -422,34 +443,16 @@ impl SignatureProvider for CommandSignature {
         let payload = serde_json::to_vec(request)
             .map_err(|err| SodaError::json(format!("sign request encode: {err}")))?;
 
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| SodaError::http(format!("signer spawn {}: {err}", self.program)))?;
+            .stderr(Stdio::piped());
+        // 写、排空、等待同时进行；timeout_ms 到点就 kill + 回收（票 #23）。
+        let output = child::run(&mut command, payload, self.timeout_ms)
+            .map_err(|err| self.map_child_error(err))?;
 
-        let mut request_write_failed = false;
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| SodaError::http("signer stdin unavailable"))?;
-            match stdin.write_all(&payload) {
-                Ok(()) => {}
-                // 断管 = 签名器没读 stdin 就退出了；退出码与 stderr 才是原因，交给下面的 wait_with_output。
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                    request_write_failed = true
-                }
-                Err(err) => return Err(SodaError::http(format!("signer stdin write: {err}"))),
-            }
-        }
-        drop(child.stdin.take());
-
-        let output = child
-            .wait_with_output()
-            .map_err(|err| SodaError::http(format!("signer wait: {err}")))?;
         if !output.status.success() {
             return Err(SodaError::http(format!(
                 "signer exited with {}: {}",
@@ -457,7 +460,7 @@ impl SignatureProvider for CommandSignature {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        if request_write_failed {
+        if output.request_write_failed {
             // 请求根本没写进去，它回 0 加合法 JSON 也不是按这次请求算出来的，不能当签名用。
             return Err(SodaError::http(format!(
                 "signer exited without reading the request: {}",
