@@ -1,7 +1,8 @@
 # 最小检查：格式、静态检查（警告视为失败）、全部测试。票 sodahub-org/libresoda#4。
 # 末尾还有一步快路径计时记录（票 #28），不进门禁；口径见 `docs/PORTING.md`「计时凭证」一条。
 # job 名 `fmt / clippy / test` 保持不变：改名等于改分支保护里那个必需检查的名字。
-# 另有非必需 job `windows / fmt, clippy, test`（票 #25，Job Object 代码只能在 Windows 上编译）。
+# 另有非必需 job `windows / clippy, test`（票 #25，Job Object 代码只能在 Windows 上编译；
+# rustfmt 输出不分平台，格式检查只在上面那个必需 job 里跑）。
 #
 # 版本都钉在这个文件里，不写 `rust-toolchain.toml`：后者会改掉每个人本地构建用的工具链，
 # 而这里只该固定 CI 自己的环境。镜像与 action 按提交钉住，同一个运行结果可复现、可追溯。
@@ -69,10 +70,12 @@ jobs:
   # Windows 上编译与执行。与必需的 `fmt / clippy / test` 分开命名 —— 分支保护只认那一个
   # 名字；这个 job 不进必需检查，但失败会在 PR 上显形。
   # 用 `shell: bash`：Git Bash 在 windows runner 上自带，现有离线用例依赖它提供的 `sh`，
-  # 下面三步的 `test` / `awk` 也是 POSIX 写法。
+  # 安装校验两步里的 `test` / `awk` 也是 POSIX 写法。
   windows:
-    name: windows / fmt, clippy, test
+    name: windows / clippy, test
     runs-on: windows-latest
+    # `windows-latest` 按倍数计价；挂住时别一路跑到 Actions 默认时限。
+    timeout-minutes: 20
     env:
       RUST: 1.99.0
     steps:
@@ -83,7 +86,7 @@ jobs:
       - name: Install pinned toolchain
         shell: bash
         run: |
-          rustup toolchain install "$RUST" -c rustfmt -c clippy --profile minimal
+          rustup toolchain install "$RUST" -c clippy --profile minimal
           rustup default "$RUST"
 
       - name: Verify pinned toolchain
@@ -92,9 +95,7 @@ jobs:
           rustc -V && cargo -V && cargo clippy --version
           test "$(rustc -V | awk '{print $2}')" = "$RUST"
 
-      - name: Format check
-        shell: bash
-        run: cargo fmt --all -- --check
+      # 不重复 `cargo fmt --check`：rustfmt 输出不分平台，Ubuntu 那个必需 job 已经在门禁。
 
       - name: Static check
         shell: bash
