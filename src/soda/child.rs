@@ -16,8 +16,22 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 轮询 `try_wait` 的间隔。只决定超时精度；子进程退出后下一拍就能看到。
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// 轮询 `try_wait` 的起始间隔。
+///
+/// 票 #28：固定 10 ms 把退出检测量化到约半个间隔，而 `sign()` 在每次带签名的请求上都走，
+/// Linux 上签名器本身只要 2–3 ms。从 0.5 ms 起退避，快路径的检测误差就落到 1 ms 级。
+const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
+
+/// 轮询 `try_wait` 的间隔上限。
+///
+/// 翻倍到这里就不再涨，所以长等待（请求器默认 240 s）的轮询次数与票 #23 的固定 10 ms 相同；
+/// 超时精度也没变差：到点那一拍吃的仍是最多一个上限的宽限。
+const POLL_INTERVAL_MAX: Duration = Duration::from_millis(10);
+
+/// 下一拍轮询的间隔：每拍翻倍，到上限为止。用 sleep 而不是忙等。
+fn next_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(POLL_INTERVAL_MAX)
+}
 
 /// 子进程结束/被终止后，收集工作线程结果的宽限。
 ///
@@ -82,6 +96,7 @@ pub(crate) fn run(
 
     let timeout = Duration::from_millis(timeout_ms);
     let started = Instant::now();
+    let mut poll_interval = POLL_INTERVAL_START;
     let mut write_error: Option<io::Error> = None;
     let mut write_finished = false;
     let mut write_incomplete = false;
@@ -113,7 +128,8 @@ pub(crate) fn run(
                 if started.elapsed() >= timeout {
                     break None;
                 }
-                thread::sleep(POLL_INTERVAL);
+                thread::sleep(poll_interval);
+                poll_interval = next_poll_interval(poll_interval);
             }
             Err(err) => {
                 // 状态都取不到时也要收尸，不能把子进程扔在那里。
@@ -232,5 +248,39 @@ mod tests {
             total,
             "超出上限的字节也必须读走（排空）"
         );
+    }
+
+    #[test]
+    fn poll_interval_backs_off_from_half_a_ms_to_the_cap() {
+        let mut interval = POLL_INTERVAL_START;
+        let mut seen = Vec::new();
+        while interval < POLL_INTERVAL_MAX {
+            seen.push(interval);
+            interval = next_poll_interval(interval);
+        }
+        seen.push(interval);
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_micros(500),
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                Duration::from_millis(4),
+                Duration::from_millis(8),
+                Duration::from_millis(10),
+            ],
+            "退避序列：票 #28 定的 0.5 ms 起翻倍、10 ms 封顶"
+        );
+    }
+
+    #[test]
+    fn poll_interval_stays_inside_its_bounds() {
+        // 到顶不再涨：长等待的轮询次数（以及超时那一拍的宽限）与票 #23 的固定 10 ms 相同。
+        let mut interval = POLL_INTERVAL_MAX;
+        for _ in 0..32 {
+            interval = next_poll_interval(interval);
+        }
+        assert_eq!(interval, POLL_INTERVAL_MAX, "封顶后不再涨");
+        assert_ne!(interval, Duration::ZERO, "任何一拍都要真的让出线程");
     }
 }
