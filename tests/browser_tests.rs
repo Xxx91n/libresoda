@@ -215,8 +215,8 @@ fn command_requester_kills_helper_process_on_timeout() {
 ///
 /// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper
 /// 应当还活着 —— Windows 上 `release` 清不掉 `KILL_ON_JOB_CLOSE` 的话，`Job::drop` 会把它
-/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价同时钉住：helper 攥着
-/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层只能看到解析失败。
+/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价也一并断言：helper 攥着
+/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层看到的是「返回无法解析」。
 #[test]
 fn command_requester_leaves_resident_descendants_on_success() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -235,11 +235,16 @@ fn command_requester_leaves_resident_descendants_on_success() {
          printf '{{\"ok\":true,\"status\":200,\"body\":\"\"}}'; exit 0"
     );
     let requester = CommandRequester::new("sh").args(["-c", script.as_str()]);
-    let started = Instant::now();
-    // 空回包会让上层解析失败，这条用例关心的是 helper 的生死，不是那个错误。
-    let _ = run_with_watchdog(Duration::from_secs(6), move || {
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
-    });
+    })
+    .expect_err("helper 攥着写端时回包应被宽限丢掉");
+    let text = error.to_string();
+    assert!(
+        text.contains("返回无法解析"),
+        "宽限到点后已收到的输出应被丢掉，只剩解析失败：{text}"
+    );
+    assert!(!text.contains("timed out"), "{text}");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while !marker.exists() {
@@ -250,9 +255,4 @@ fn command_requester_leaves_resident_descendants_on_success() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = std::fs::remove_file(&marker);
-    assert!(
-        started.elapsed() < Duration::from_secs(6),
-        "驻留用例拖了 {:?}",
-        started.elapsed()
-    );
 }
