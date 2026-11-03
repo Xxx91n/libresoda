@@ -168,8 +168,8 @@ impl CommandRequester {
 
     /// 跑一次外部 CLI：stdin 喂 JSON，stdout 原样返回。
     ///
-    /// 与 `CommandSignature` 同口径（票 #23）：写入/排空/等待同时进行，到点 kill + 回收；
-    /// 断管归因给退出码与 stderr；非 0 退出不再把 stdout 当回包交出去。
+    /// 与 `CommandSignature` 同口径（票 #23）：写入/排空/等待同时进行，到点终止整棵子进程树
+    /// 并回收（票 #25）；断管归因给退出码与 stderr；非 0 退出不再把 stdout 当回包交出去。
     fn exec(&self, payload: Vec<u8>) -> Result<String> {
         let mut command = Command::new(&self.program);
         command

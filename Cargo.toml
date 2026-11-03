@@ -32,6 +32,26 @@ futures = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 dirs = "6"
 
+# 进程树终止（票 #25）：`child::run` 到点要终止整棵子进程树，不是只 kill 直接子进程。
+# Unix 走进程组（`CommandExt::process_group` + `kill(-pgid)`），Windows 走 Job Object。
+# 两者都是平台专有 API，所以按 target 分列，别的平台不编译、不引入符号。
+# 两个 crate 在 `Cargo.lock` 里本来就作为传递依赖存在（libc 0.2.189 / windows-sys 0.61.2），
+# 升为直接依赖不改动任何已锁版本，离线可构建。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# feature 依赖关系（0.61.2 源码核对）：`Win32_System_JobObjects` 是模块门；
+# `CreateJobObjectW` 取 `SECURITY_ATTRIBUTES`，故需 `Win32_Security`；
+# `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 内嵌 `IO_COUNTERS`，故需 `Win32_System_Threading`；
+# `HANDLE` / `CloseHandle` / `GetLastError` 在 `Win32_Foundation`。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 serde_json = "1"
 aes = "0.8"

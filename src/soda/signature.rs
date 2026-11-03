@@ -449,7 +449,7 @@ impl SignatureProvider for CommandSignature {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // 写、排空、等待同时进行；timeout_ms 到点就 kill + 回收（票 #23）。
+        // 写、排空、等待同时进行；timeout_ms 到点就终止整棵子进程树并回收（票 #23 / #25）。
         let output = child::run(&mut command, payload, self.timeout_ms)
             .map_err(|err| self.map_child_error(err))?;
 
