@@ -249,7 +249,8 @@ mod tests {
     #[test]
     fn poll_interval_backs_off_from_half_a_ms_to_the_cap() {
         // 拍数写死，不写 `while interval < MAX`：起始那格万一退化成 0，这条要失败而不是挂住
-        // `cargo test`（同一份纪律见 #23 给计时用例加的 recv_timeout 看门狗）。
+        // `cargo test`（同一份纪律见 #23 给计时用例加的 recv_timeout 看门狗）。序列从 1 ms 起，
+        // 也就把「起始那格是 0.5 ms、非零」一起钉住了 —— 0.5 翻倍才是 1。
         let mut interval = POLL_INTERVAL_START;
         let mut seen = Vec::new();
         for _ in 0..6 {
@@ -267,11 +268,6 @@ mod tests {
                 Duration::from_millis(10),
             ],
             "退避序列：翻倍到 10 ms 封顶"
-        );
-        assert_eq!(
-            POLL_INTERVAL_START,
-            Duration::from_micros(500),
-            "起始那格非零，不会退化成忙等"
         );
     }
 
