@@ -16,8 +16,18 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 轮询 `try_wait` 的间隔。只决定超时精度；子进程退出后下一拍就能看到。
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// 轮询 `try_wait` 的起始间隔。只决定退出检测与「到点那一拍」的粒度。
+///
+/// 数值出处与超时口径见 `docs/PORTING.md`「轮询退避」一条（票 #28），这里不复述，免得两处漂。
+const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
+
+/// 轮询 `try_wait` 的间隔上限。翻倍到这里就不再涨。
+const POLL_INTERVAL_MAX: Duration = Duration::from_millis(10);
+
+/// 下一拍轮询的间隔：每拍翻倍，到上限为止（调用方每拍 `thread::sleep`，不忙等）。
+fn next_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(POLL_INTERVAL_MAX)
+}
 
 /// 子进程结束/被终止后，收集工作线程结果的宽限。
 ///
@@ -82,6 +92,7 @@ pub(crate) fn run(
 
     let timeout = Duration::from_millis(timeout_ms);
     let started = Instant::now();
+    let mut poll_interval = POLL_INTERVAL_START;
     let mut write_error: Option<io::Error> = None;
     let mut write_finished = false;
     let mut write_incomplete = false;
@@ -113,7 +124,8 @@ pub(crate) fn run(
                 if started.elapsed() >= timeout {
                     break None;
                 }
-                thread::sleep(POLL_INTERVAL);
+                thread::sleep(poll_interval);
+                poll_interval = next_poll_interval(poll_interval);
             }
             Err(err) => {
                 // 状态都取不到时也要收尸，不能把子进程扔在那里。
@@ -231,6 +243,42 @@ mod tests {
             read.load(Ordering::Relaxed),
             total,
             "超出上限的字节也必须读走（排空）"
+        );
+    }
+
+    #[test]
+    fn poll_interval_backs_off_from_half_a_ms_to_the_cap() {
+        // 拍数写死，不写 `while interval < MAX`：起始那格万一退化成 0，这条要失败而不是挂住
+        // `cargo test`（同一份纪律见 #23 给计时用例加的 recv_timeout 看门狗）。序列从 1 ms 起，
+        // 也就把「起始那格是 0.5 ms、非零」一起钉住了 —— 0.5 翻倍才是 1。
+        let mut interval = POLL_INTERVAL_START;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            interval = next_poll_interval(interval);
+            seen.push(interval);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                Duration::from_millis(4),
+                Duration::from_millis(8),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ],
+            "退避序列：翻倍到 10 ms 封顶"
+        );
+    }
+
+    #[test]
+    fn poll_interval_stops_at_the_cap() {
+        // 正面钉一次「到顶不再涨」：长等待（请求器默认 240 s）之后每拍仍是 10 ms，
+        // 超时那一拍的宽限与 #23 的固定间隔相同。上一条用例尾部那两格 10 ms 是同一件事的侧面。
+        assert_eq!(
+            next_poll_interval(POLL_INTERVAL_MAX),
+            POLL_INTERVAL_MAX,
+            "封顶后不再涨"
         );
     }
 }

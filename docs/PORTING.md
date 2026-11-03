@@ -513,9 +513,48 @@
   （`src/soda/child.rs`），口径如下：
 
   - **顺序**：spawn → 写 stdin 的线程（写完即 drop 写端）+ stdout/stderr 各一个排空线程 →
-    主线程按 `timeout_ms` 轮询 `try_wait`。限时内退出由 `try_wait`（底层 `waitpid(WNOHANG)`）
-    取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr → 返回超时错误。
-    所有路径都不再有无界 `wait_with_output`。
+    主线程按 `timeout_ms` 轮询 `try_wait`（间隔见下一条）。限时内退出由 `try_wait`（底层
+    `waitpid(WNOHANG)`）取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr
+    → 返回超时错误。所有路径都不再有无界 `wait_with_output`。
+  - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
+    间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
+    仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
+    `sign()` 在每一次带签名的请求上都走：`#23` 复核实测同一脚本 `sign()` 197 ms vs 裸
+    `spawn + write_all + wait_with_output` 192 ms，票面把这 ~5 ms 归给「约轮询粒度的一半」；
+    那条差其实是复合的，账记在下面「计时凭证」，这里只当量级参照。票面还记着 Linux 上签名器本身
+    只要 2–3 ms —— 占比不小。退避之后，快路径上最坏的检测误差就是「跨过退出那一拍」的间隔本身：
+    签名器 2–3 ms 退出时那一拍是 2 ms、平均 1 ms 上下，而固定 10 ms 时同一格是 10 ms。
+    - **为什么是退避而不是直接 1–2 ms**：请求器的等待上限默认 240 s，按 1 ms 轮询等于一次等待里
+      打 24 万拍；退避只在开头十几毫秒内多几拍，之后仍是每 10 ms 一拍。
+    - **超时精度与上限不变**：到点判据仍是 `started.elapsed() >= timeout`，位置也没动（在 `try_wait`
+      之后、sleep 之前），所以超时不可能比 #23 更早触发；退避在 15.5 ms 就封顶，任何一次真实超时
+      （用例是 200 ms / 2 s，请求器是 240 s）到点时那一拍都仍是 10 ms，于是**「发现到点」这件事**落在
+      `(timeout, timeout + 10 ms]` —— 与 #23 同一区间（函数真正返回还要再加下面「线程收集有宽限」那条
+      最多 1 s，这一段与间隔无关，改动前后一样）。**区间相同，相位不同**：具体落在区间里的哪一点，
+      取决于每拍 sleep 的累积漂移，本来就不是一条能钉死的毫秒数，改动前后都一样。`#23` 那四条带
+      `recv_timeout` 看门狗的计时用例（两个「不读也不退出」+ 两个「边排空边到点」）断言的都是上界，
+      因而都不必调阈值。错误文案一条没改。
+    - **计时凭证（这张表怎么读，只写在这一条里）**：`examples/child_poll_probe.rs` 跑同一条最小
+      签名器两遍（库路径 vs 裸 `spawn + write_all + wait_with_output`），同一趟里 A/B 交替、预热 5 轮，
+      打印 min/p50/p90/mean 与两列的 p50 差值；`.github/workflows/ci.yml` 在 Test 之后跑一次，把表
+      打进日志（那一步的 `timeout` / `|| echo` 属于 CI 机制，记在它自己的注释里）。
+      **这张表是两条完整路径的端到端对照，不分解，也不构成任何上界**：打印的差值是两列各自
+      `sort_unstable()` 之后取中位数再相减（`library.p50 - bare.p50`），不是同一趟的成对差；
+      被减的那一侧也在干活（`wait_with_output` 把两根管道读干净、判 `status.success()`、再
+      `from_slice` 解析并查一次空签名），而库那一侧反倒把写入与排空跟子进程执行**重叠**掉了 ——
+      加项与减项混在一起，差的符号都不受轮询那一格支配。所以这个数**不能**用来论证
+      「轮询延迟 ≤ 表里的差」，也不能把「读到 ≤ ~2 ms」当成验收判据（这一点由 PR
+      [`#30`](https://github.com/sodahub-org/libresoda/pull/30) 的审查指出，已收回）。
+      它仍答得出票面那个「走执行器比裸 spawn 贵多少」—— 用的正是 #23 那对 197 / 192 的同形量，
+      只是得按端到端对照来读：那一轮 CI 在 ubuntu runner 的 dev profile 下读到 `+0.498 ms`，
+      这是一次读数、不是界；两列各取中位数，噪声足以把 1 ms 量级的差值盖过去、甚至读出负数，
+      而负读数同样不能当「更快」的证据。
+      **轮询粒度只由上面的退避序列回答** —— 那两个常数与用例
+      `poll_interval_backs_off_from_half_a_ms_to_the_cap` 才是「签名器 2–3 ms 退出会被哪一拍抓到」
+      的依据。
+      表在 dev profile 下取，两列同形可比，不与 release 数字互换。
+      **不进门禁**的理由：数字随 runner 的机器与负载变，把「≤ 2 ms」写死进用例等于给某一台 runner
+      背书（票 #28 的验收也这么要求）。
   - **写入侧也有上限**：`write_all` 在独立线程里跑，所以载荷超过管道容量而签名器既不读也不退出时，
     主线程仍能按时 kill。每次轮询也看一眼写线程的结果：断管仍归因给退出码/stderr；非断管的
     写入错误一旦观察到就先终止 + 收尸，再报 `signer stdin write: {err}`（`#23` 评论指出的第三处
@@ -548,12 +587,13 @@
     等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
     两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 五条 —— 非 0 退出、
     断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记）；`src/soda/child.rs`
-    一条单元用例钉 8 MiB 收集上限（超出字节读走但丢弃）。全部离线，超时用例时限 200 ms–2 s（还有
-    1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都把调用放进带 `recv_timeout` 的线程里，
-    库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢 `cargo test`。排空用例的探针只用
-    shell 内建、不 fork
-    子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回已排空的
-    stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
+    三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
+    0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
+    全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都
+    把调用放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
+    `cargo test`。排空用例的探针只用 shell 内建、不 fork 子进程 —— kill 直接子进程后管道写端全关，
+    Windows（Git Bash/msys2）与 Unix 都能取回已排空的 stderr；`exec sleep` / `cat` 会留下继承管道的
+    后继进程，Windows 上 kill 后拿不到 EOF。
 
 ## 未移植项
 
