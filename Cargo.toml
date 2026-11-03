@@ -43,8 +43,9 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # feature 依赖关系（0.61.2 源码核对）：`Win32_System_JobObjects` 是模块门；
 # `CreateJobObjectW` 取 `SECURITY_ATTRIBUTES`，故需 `Win32_Security`；
-# `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 内嵌 `IO_COUNTERS`，故需 `Win32_System_Threading`；
-# `HANDLE` / `CloseHandle` / `GetLastError` 在 `Win32_Foundation`。
+# `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 内嵌 `IO_COUNTERS`，故需 `Win32_System_Threading`。
+# `HANDLE` / `CloseHandle` 由 `Win32_System` → `Win32` → `Win32_Foundation` 隐含带进来，
+# 显式列出当保险 —— 0.61.2 上删掉这一项也能编译（#31 审计用 --no-default-features 逐项验证过）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
