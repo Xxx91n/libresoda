@@ -16,16 +16,13 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 轮询 `try_wait` 的起始间隔。
+/// 轮询 `try_wait` 的起始间隔。只决定退出检测的粒度。
 ///
-/// 票 #28：固定 10 ms 把退出检测量化到约半个间隔，而 `sign()` 在每次带签名的请求上都走，
-/// Linux 上签名器本身只要 2–3 ms。从 0.5 ms 起退避，快路径的检测误差就落到 1 ms 级。
+/// 数值出处与超时口径见 `docs/PORTING.md`「轮询退避」一条（票 #28），这里不复述，免得两处漂。
 const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
 
-/// 轮询 `try_wait` 的间隔上限。
-///
-/// 翻倍到这里就不再涨，所以长等待（请求器默认 240 s）的轮询次数与票 #23 的固定 10 ms 相同；
-/// 超时精度也没变差：到点那一拍吃的仍是最多一个上限的宽限。
+/// 轮询 `try_wait` 的间隔上限。翻倍到这里就不再涨，
+/// 所以超时的精度与上限都停在 #23 那一档。
 const POLL_INTERVAL_MAX: Duration = Duration::from_millis(10);
 
 /// 下一拍轮询的间隔：每拍翻倍，到上限为止。用 sleep 而不是忙等。
@@ -274,13 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn poll_interval_stays_inside_its_bounds() {
-        // 到顶不再涨：长等待的轮询次数（以及超时那一拍的宽限）与票 #23 的固定 10 ms 相同。
+    fn poll_interval_stops_at_the_cap() {
+        // 到顶不再涨：长等待（请求器默认 240 s）之后每拍仍是 10 ms，超时那一拍的宽限
+        // 与 #23 的固定间隔相同。上一条用例钉住起始那格是 0.5 ms —— 非零，所以不会退化成忙等。
         let mut interval = POLL_INTERVAL_MAX;
         for _ in 0..32 {
             interval = next_poll_interval(interval);
         }
         assert_eq!(interval, POLL_INTERVAL_MAX, "封顶后不再涨");
-        assert_ne!(interval, Duration::ZERO, "任何一拍都要真的让出线程");
     }
 }
