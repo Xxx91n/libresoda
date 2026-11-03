@@ -152,9 +152,8 @@ fn command_signature_times_out_when_signer_never_reads_or_exits() {
 }
 
 /// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
-/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— kill 掉直接子进程后管道写端
-/// 全部关闭，Windows（Git Bash/msys2）与 Unix 都能在超时路径取回已排空的 stderr。
-/// （`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。）
+/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— 它测的是「写入 / 排空与直接子进程
+/// 的关系」；拉起 helper 的进程树用例在 `tests/browser_tests.rs`。
 /// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
 const DRAIN_PROBE_SCRIPT: &str = concat!(
     "i=0; while [ $i -lt 4096 ]; do ",

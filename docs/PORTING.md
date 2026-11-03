@@ -508,14 +508,55 @@
   管道缓冲吃掉、签名器一个字节都没读」那一半库这边检测不到，只能靠签名器守契约。
 
 * **外部子进程的等待上限（`soda::child::run`，上游无对应）**：实现票
-  [`#23`](https://github.com/sodahub-org/libresoda/issues/23)，收掉上一条如实记着的两条限制。
+  [`#23`](https://github.com/sodahub-org/libresoda/issues/23)，收掉上一条如实记着的两条限制；
+  票 [`#25`](https://github.com/sodahub-org/libresoda/issues/25) 再把所有终止路径从「只 kill 直接
+  子进程」改成「终止整棵进程树」。
   `CommandSignature` 与 `CommandRequester` 现在共用一个 `pub(crate)` 执行器
   （`src/soda/child.rs`），口径如下：
 
   - **顺序**：spawn → 写 stdin 的线程（写完即 drop 写端）+ stdout/stderr 各一个排空线程 →
     主线程按 `timeout_ms` 轮询 `try_wait`（间隔见下一条）。限时内退出由 `try_wait`（底层
-    `waitpid(WNOHANG)`）取到状态并完成回收；到点则 `kill()` → `wait()` 收尸 → 收已排空的 stderr
-    → 返回超时错误。所有路径都不再有无界 `wait_with_output`。
+    `waitpid(WNOHANG)`）取到状态并完成回收；到点则终止整棵子树（见下一条）→ `wait()` 收尸 →
+    收已排空的 stderr → 返回超时错误。所有路径都不再有无界 `wait_with_output`。
+  - **终止整棵进程树（票 [`#25`](https://github.com/sodahub-org/libresoda/issues/25)）**：`#23`
+    的超时路径只 `kill()` 直接子进程；签名器/请求器作为 launcher 自己拉起的 helper（`ssh`、
+    `node`、`sh`、桥接器、浏览器）会继续运行，攥着 stdout/stderr 写端，也会继续持有浏览器会话/
+    设备上下文。现在 spawn 时就把直接子进程放进一个能整体寻址的容器；**子进程仍在跑、或
+    还要收尸时就直接返回错误的路径**（超时、运行中发现写 stdin 的非断管错误、`try_wait`
+    取不到状态、拿不到 stdin、attach 失败）都先终止整个容器再 `wait`：
+    - **Unix**：`CommandExt::process_group(0)` 让子进程自成进程组（组号 = 子进程 pid；std 在
+      exec 前 `setpgid`，`spawn` 返回时已生效），终止时 `kill(-pgid, SIGKILL)`。组信号失败
+      （组已消失、信号没发出去）时退回 `Child::kill()`，避免 `wait` 等一个还活着的子进程。
+      这里用 `libc` 只为这一个系统调用 —— std 没有「给别的进程发信号」的入口。
+    - **Windows**：spawn 前 `CreateJobObjectW` 建作业，spawn 后 `AssignProcessToJobObject` 把
+      直接子进程放进去；子进程此后创建的进程自动继承作业成员资格。终止用 `TerminateJobObject`，
+      再补一次 `Child::kill()` —— 前者对空作业也返回成功，不能拿它判断直接子进程是否已终止
+      （作业没挂上时就是空的）。
+      作业挂 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，用于宿主进程异常退出时兜底（句柄随进程关闭，
+      作业里的残留进程一并终止）；**成功路径先清掉这个标志再关句柄**，与 Unix 一样不杀选择继续
+      驻留的后继进程。错误路径不清这个标志（包括子进程已退出后才发现写入错误、直接返回的那条），
+      句柄带着它关闭，残留进程随作业终止；清标志失败时也按同一方向收场（多杀，不漏杀）。
+      作业建不出来（spawn 之前）与子进程放不进去（spawn 之后，文案里的步骤名会比实际早一格）
+      都按现有 `Spawn` 报错，后者还要终止子进程 —— 票面要求不新增公开错误变体，但不降级成
+      「只杀直接子进程」却对外声称能兜住整棵树。两个 crate（`libc` / `windows-sys`）
+      本来就以传递依赖在 `Cargo.lock` 里（0.2.189 / 0.61.2），升为按 target 的直接依赖没有改动
+      任何已锁版本。
+    - **残余边界**：① Windows 的 `CreateProcess` 与 `AssignProcessToJobObject` 之间有窗口，
+      这段里创建的后继进程不在作业里；② 子进程自己 `setsid()` / 双重 fork 守护化（Unix）能逃出
+      进程组，Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
+      进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
+      ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
+      不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行；⑤ 既非 Unix 也非 Windows 的目标
+      拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
+      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止，三条路径的收场
+      各不相同：`run` 返回 `Ok` 但请求没交全（断管、写线程超宽限、写线程没送结果）的走成功释放，
+      两个平台都留下 helper（Windows 清标志失败时例外），上层报退出码/「没读请求」；`run` 返回
+      `Ok` 且请求交全、但驻留 helper 攥着 stdout/stderr 的也走成功释放，宽限到点丢掉已收到的输出，
+      上层报 requester 的「返回无法解析」或 signer 的 `sign response decode: {err}`；子进程已退出后
+      才发现写入错误（非断管）的那条直接返回 `Err(Stdin)`、
+      不调用 `release`，Unix 上 helper 留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它
+      带走，上层报 `stdin write: {err}`。三种情况都不当作超时；这里也不能补 `kill(-pid)` ——
+      `try_wait` 已经收尸，pid 可能已被复用。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
@@ -566,14 +607,22 @@
     `signer exited without reading the request: {stderr}` / `signer stdin write: {err}`）原样保留。
     请求器按同一口径用 `requester` 前缀。
   - **线程收集有宽限**：子进程结束/被终止后，工作线程用 1 s 有界等待收集，不是无限 `join`。
-    正常路径它们随管道 EOF 立即结束；只有孙进程攥着管道时才可能走满宽限 —— 目的是不让调用方
-    被重新锁死。宽限只保证调用方回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；
-    超时路径只等 stderr 一个宽限，不再等写线程。宽限内没送达的流按空输出处理 —— 读取错误或
-    管道被孙进程攥着时，后续会以解码/响应解析错误暴露，不会静默当成功。对超时错误而言，这意味着
-    后继进程攥着写端时错误文本可能不带 stderr（测试探针刻意避开这种形态）；要补成「宽限到时先交出
-    部分缓冲」属于可观测性增强，需另开票。
+    正常路径它们随管道 EOF 立即结束；会走满宽限的有两种形态：① 逃出进程组/作业的后继进程
+    攥着管道；② 成功路径上自愿驻留、且继承了 stdout/stderr 的后继进程（`release` 不杀它）——
+    审计（#31 评论）用 `cat >/dev/null; ( sleep 2; echo alive > 标记 ) & exit 0` 实测过这一形态：
+    调用方等满宽限，2 s 后 helper 照样写下标记。目的是不让调用方被重新锁死。宽限只保证调用方
+    回来，不回收卡在阻塞读写上的线程（std 无法从外部中断它们）；超时路径只等 stderr 一个宽限，
+    不再等写线程。**宽限内没送达的流按空输出处理**：`spawn_reader` 只在 `read()` 返回 0（EOF）
+    或读错误时才把缓冲送回去，所以宽限到点时已经收到的字节也整块丢掉 —— 签名器「先交回包、
+    再留后台 helper」的写法会被读成空回包（实测报 `requester 返回无法解析`）。后继进程要驻留就
+    必须自己关掉或重定向继承的 stdout/stderr。要补成「宽限到时先交出部分缓冲」属于可观测性增强，
+    需另开票。
+  - **`wait()` 本身没有时限（残余边界 ⑦）**：`SIGKILL` / `TerminateProcess` 对卡在不可中断
+    内核调用里的进程不会即时生效，`child.wait()` 仍会一直等 —— 这条与 `#23` 同形，不是本票引入，
+    但本票的「再补一次 `Child::kill()`」以「信号落得下去」为前提，前提不成立时它不构成等待上界。
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
-    stdout/stderr 移入排空线程；主线程只持有 `Child` 负责 kill/wait。
+    stdout/stderr 移入排空线程；主线程持有 `Child` 与进程树容器（Windows 的作业句柄），
+    负责终止与 `wait` 收尸。
   - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
     「按对端产出的量无限增长」的来源（AGENTS.md 内存安全铁律 2）；正常签名回包远小于这个数。
   - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
@@ -585,15 +634,25 @@
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
     等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
-    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 五条 —— 非 0 退出、
-    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记）；`src/soda/child.rs`
-    三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
+    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 八条 —— 非 0 退出、
+    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的三条：
+    `sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的后台 helper 后驻留到超时 —— helper 活着的
+    唯一证据就是写端没关，超时前写下的 stderr 标记能随 EOF 交回来就说明整棵树已终止（Unix 与
+    Windows 同一份用例；Windows 侧「helper 已死」由这条 EOF 推出：写端持有者必须全部消失，没有
+    另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。Unix 另有一条从 pid 文件用 `kill(pid, 0)`
+    确认 helper 在超时返回后消失；第三条走成功路径 —— 子进程交完回包就退出，后台 helper 继承着
+    stdout 在 2 s 后写标记，断言调用方回来时它仍活着（钉住 `release`：Windows 上清标志失败会让
+    `Job::drop` 把它带走，这条用例会红）。
+    `src/soda/child.rs` 三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
     0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
-    全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都
-    把调用放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
-    `cargo test`。排空用例的探针只用 shell 内建、不 fork 子进程 —— kill 直接子进程后管道写端全关，
-    Windows（Git Bash/msys2）与 Unix 都能取回已排空的 stderr；`exec sleep` / `cat` 会留下继承管道的
-    后继进程，Windows 上 kill 后拿不到 EOF。
+    全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s，
+    驻留用例用 5 s 看门狗；计时用例都把调用
+    放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
+    `cargo test`。排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；
+    进程树由上面三条专项用例覆盖。Windows 侧另有非必需 CI job
+    `windows / clippy, test`（`windows-latest`；fmt 只在 Ubuntu 跑，rustfmt 输出不分平台），
+    Job Object 代码因此至少被编译并由上述用例执行到；它不动必需检查的名字
+    （`fmt / clippy / test`），是否必需由分支保护配置决定，本仓无法从代码侧验证。
 
 ## 未移植项
 

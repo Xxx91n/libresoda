@@ -5,13 +5,13 @@
 //! `write_all` + `wait_with_output`：写入可能被管道容量卡死，等待则完全没有上限。
 //!
 //! 这里把三件事同时做起来 —— 写（独立线程）、排空（stdout/stderr 各一个线程）、
-//! 等待（主线程按 `timeout_ms` 轮询 `try_wait`）—— 到点就 `kill` + `wait` 收尸。
+//! 等待（主线程按 `timeout_ms` 轮询 `try_wait`）—— 到点就终止整棵子进程树再 `wait` 收尸。
 //!
-//! 口径（顺序、错误分类、句柄归属、SIGPIPE 前提）记在 `docs/PORTING.md`
+//! 口径（顺序、进程树终止、错误分类、句柄归属、SIGPIPE 前提）记在 `docs/PORTING.md`
 //! 「外部子进程的等待上限」一节，不在这里复述，免得两处漂。
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ fn next_poll_interval(current: Duration) -> Duration {
 
 /// 子进程结束/被终止后，收集工作线程结果的宽限。
 ///
-/// 正常路径它们在管道 EOF 上立刻结束；孙进程攥着管道时才可能走满。宽限只保证
+/// 正常路径它们在管道 EOF 上立刻结束；逃出进程组/作业的后继进程攥着管道时才可能走满。宽限只保证
 /// 调用方回来，不负责回收卡在阻塞写/读上的线程（std 无法从外部中断它们）。
 const THREAD_GRACE: Duration = Duration::from_secs(1);
 
@@ -59,7 +59,7 @@ pub(crate) enum ChildError {
     /// 非断管的写入错误（断管走 [`ChildOutput::request_write_failed`]）。
     Stdin(std::io::Error),
     Wait(std::io::Error),
-    /// 到点仍未退出；已 kill 并 wait 回收，`stderr` 是终止前已排空的部分。
+    /// 到点仍未退出；已终止整棵树并 wait 回收，`stderr` 是终止前已排空的部分。
     Timeout {
         stderr: Vec<u8>,
     },
@@ -71,11 +71,18 @@ pub(crate) fn run(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> Result<ChildOutput, ChildError> {
+    // 先把容器准备好，再 spawn：Unix 是进程组（spawn 时生效），Windows 是作业句柄。
+    // 容器建不出来就不跑 —— 宁可不启动，也不假装能兜住整棵树。
+    let tree = tree::prepare(command).map_err(ChildError::Spawn)?;
     let mut child = command.spawn().map_err(ChildError::Spawn)?;
+    if let Err(err) = tree::attach(&tree, &child) {
+        // 放不进作业就没有整棵树可谈：终止并报 spawn 失败，不降级成「只杀直接子进程」。
+        let _ = terminate(&tree, &mut child);
+        return Err(ChildError::Spawn(err));
+    }
     let Some(mut stdin) = child.stdin.take() else {
         // 拿不到 stdin 也不能把已经起来的子进程扔在那里。
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = terminate(&tree, &mut child);
         return Err(ChildError::StdinUnavailable);
     };
     let stdout = child.stdout.take().map(spawn_reader);
@@ -101,8 +108,7 @@ pub(crate) fn run(
             match write_rx.try_recv() {
                 Ok(Some(err)) if err.kind() != ErrorKind::BrokenPipe => {
                     // 写入本身失败（不是断管）：先终止并收尸，再把它报出去。
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = terminate(&tree, &mut child);
                     return Err(ChildError::Stdin(err));
                 }
                 Ok(Some(err)) => {
@@ -129,17 +135,15 @@ pub(crate) fn run(
             }
             Err(err) => {
                 // 状态都取不到时也要收尸，不能把子进程扔在那里。
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate(&tree, &mut child);
                 return Err(ChildError::Wait(err));
             }
         }
     };
 
     let Some(status) = exit_status else {
-        // 到点：先终止，再收尸（wait 不能省，否则留僵尸）。
-        let _ = child.kill();
-        if let Err(err) = child.wait() {
+        // 到点：先终止整棵树，再收尸（wait 不能省，否则留僵尸）。
+        if let Err(err) = terminate(&tree, &mut child) {
             return Err(ChildError::Wait(err));
         }
         let stderr = collect(stderr, Instant::now() + THREAD_GRACE).unwrap_or_default();
@@ -160,6 +164,10 @@ pub(crate) fn run(
     }
     let stdout = collect(stdout, grace_deadline).unwrap_or_default();
     let stderr = collect(stderr, grace_deadline).unwrap_or_default();
+
+    // 成功路径不杀愿意继续驻留的后继进程：Windows 侧先清掉 `KILL_ON_JOB_CLOSE` 再关句柄，
+    // 与 Unix 进程组（不打信号就不动组里的进程）对齐。
+    tree::release(&tree);
 
     Ok(ChildOutput {
         status,
@@ -198,6 +206,164 @@ fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
     let receiver = receiver?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     receiver.recv_timeout(remaining).ok()
+}
+
+/// 终止整棵子树并收尸。所有终止路径共用：只打直接子进程会漏掉继承管道的 helper。
+fn terminate(tree: &tree::Job, child: &mut Child) -> io::Result<()> {
+    tree::kill(tree, child);
+    child.wait().map(|_| ())
+}
+
+/// 进程树容器（票 #25）：spawn 时把直接子进程放进一个能整体寻址的结构，
+/// 终止时对结构下手，而不是只打直接子进程。
+///
+/// 平台口径、依赖与残余边界见 `docs/PORTING.md`「外部子进程的等待上限」。
+#[cfg(unix)]
+mod tree {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+
+    /// Unix 上没有额外句柄要持有：容器就是子进程自己所在的进程组。
+    pub(super) struct Job;
+
+    /// spawn 前调用：子进程自成进程组（组号 = 它自己的 pid）。
+    pub(super) fn prepare(command: &mut Command) -> io::Result<Job> {
+        command.process_group(0);
+        Ok(Job)
+    }
+
+    /// Unix 侧没有「加入容器」这一步：`process_group` 在 exec 前已生效，spawn 返回即成立。
+    pub(super) fn attach(_job: &Job, _child: &Child) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 对整组发 SIGKILL；直接子进程由调用方 `wait` 收尸。
+    pub(super) fn kill(_job: &Job, child: &mut Child) {
+        let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+            let _ = child.kill();
+            return;
+        };
+        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。负 pid 表示整个进程组，
+        // 组号就是 spawn 时 `process_group(0)` 让子进程自领的 pid。
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+            // 组已消失或信号没发出去：退回只打直接子进程，免得 `wait` 等一个还活着的子进程。
+            let _ = child.kill();
+        }
+    }
+
+    /// 成功路径没有容器要拆：进程组随成员退出自然消失，不打信号就什么也不做。
+    pub(super) fn release(_job: &Job) {}
+}
+
+#[cfg(windows)]
+mod tree {
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// 作业句柄。关句柄即销毁作业；`KILL_ON_JOB_CLOSE` 在成功路径已先清掉。
+    pub(super) struct Job(HANDLE);
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: 句柄来自 `CreateJobObjectW`，只在这里关闭一次。
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn set_limits(job: HANDLE, flags: u32) -> io::Result<()> {
+        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: flags,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: `info` 与 `JobObjectExtendedLimitInformation` 对应，长度取自身大小。
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// spawn 前建作业并挂上 `KILL_ON_JOB_CLOSE`：宿主进程异常退出时句柄随进程关闭，
+    /// 作业里的残留进程一并终止。
+    pub(super) fn prepare(_command: &mut Command) -> io::Result<Job> {
+        // SAFETY: 匿名作业、默认安全属性；失败返回空句柄。
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = Job(handle);
+        set_limits(job.0, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+        Ok(job)
+    }
+
+    /// spawn 后把直接子进程放进作业；它此后创建的进程自动继承作业成员资格。
+    pub(super) fn attach(job: &Job, child: &Child) -> io::Result<()> {
+        // SAFETY: 进程句柄由 `Child` 持有，调用期间有效；`CreateProcess` 给的句柄带
+        // `PROCESS_SET_QUOTA | PROCESS_TERMINATE`，正是作业分配所需权限。
+        let ok = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// 终止作业里的全部进程；直接子进程由调用方 `wait` 收尸。
+    pub(super) fn kill(job: &Job, child: &mut Child) {
+        // SAFETY: 句柄有效；退出码只是记录用。
+        let _ = unsafe { TerminateJobObject(job.0, 1) };
+        // `TerminateJobObject` 对空作业也返回成功 —— 子进程没挂进作业时（attach 失败路径）
+        // 它什么也没杀。不能拿返回值判断直接子进程的死活，总是再终止一次，`wait` 才不会无界。
+        let _ = child.kill();
+    }
+
+    /// 成功路径先清掉 `KILL_ON_JOB_CLOSE` 再关句柄：与 Unix 一样，不杀选择继续驻留的
+    /// 后继进程。改限制不会终止作业里已有的进程。
+    pub(super) fn release(job: &Job) {
+        let _ = set_limits(job.0, 0);
+    }
+}
+
+/// 其它平台没有进程组/作业：保持「只终止直接子进程」的降级行为。
+#[cfg(not(any(unix, windows)))]
+mod tree {
+    use std::io;
+    use std::process::{Child, Command};
+
+    pub(super) struct Job;
+
+    pub(super) fn prepare(_command: &mut Command) -> io::Result<Job> {
+        Ok(Job)
+    }
+
+    pub(super) fn attach(_job: &Job, _child: &Child) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn kill(_job: &Job, child: &mut Child) {
+        let _ = child.kill();
+    }
+
+    pub(super) fn release(_job: &Job) {}
 }
 
 #[cfg(test)]

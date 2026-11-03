@@ -81,8 +81,8 @@ fn command_requester_drains_and_parses_large_response() {
 }
 
 /// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
-/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— kill 掉直接子进程后管道写端
-/// 全部关闭，Windows（Git Bash/msys2）与 Unix 都能在超时路径取回已排空的 stderr。
+/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— 它测的是「写入 / 排空与直接子进程
+/// 的关系」，进程树另有专项用例（见下方 `command_requester_kills_descendants_that_hold_the_pipe`）。
 /// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
 const DRAIN_PROBE_SCRIPT: &str = concat!(
     "i=0; while [ $i -lt 4096 ]; do ",
@@ -128,4 +128,131 @@ fn command_requester_times_out_when_child_never_exits() {
     assert!(text.contains("requester timed out"), "{text}");
     assert!(!text.contains("requester exited"), "{text}");
     assert!(elapsed < Duration::from_secs(3), "超时用例拖了 {elapsed:?}");
+}
+
+/// 票 #25：直接子进程拉起一个继承 stdout/stderr 的后台 helper，自己驻留到超时。
+///
+/// helper 活着的唯一证据就是写端没关：只 kill 直接子进程时排空线程等不到 EOF，1 s 宽限
+/// 走满后 stderr 按空输出处理；整棵树被终止时两个写端都关掉，探针在超时前写下的标记才能
+/// 随 EOF 交回来。`sh -c` 是非交互 shell，没有 job control，后台任务留在同一进程组里。
+#[test]
+fn command_requester_kills_descendants_that_hold_the_pipe() {
+    const TREE_PROBE_SCRIPT: &str = "sleep 30 & printf tree-drained >&2; while :; do :; done";
+    let requester = CommandRequester::new("sh")
+        .args(["-c", TREE_PROBE_SCRIPT])
+        .timeout_ms(500);
+    let started = Instant::now();
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 攥着管道也不能跳过超时终止");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("requester timed out"), "{text}");
+    assert!(!text.contains("requester exited"), "{text}");
+    assert!(
+        text.contains("tree-drained"),
+        "整棵树终止后读线程才拿得到 EOF 与 stderr：{text}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "进程树用例拖了 {elapsed:?}"
+    );
+}
+
+/// 票 #25 的字面验收：超时后 helper 不再存活。只看 EOF 也能推出写端持有者已消失，
+/// 这里再从 pid 直接确认一次。Unix pid 文件内容是这个 shell 的 `$!`（helper 的 pid），
+/// 路径放临时目录、每次用例唯一，不写仓库。
+#[cfg(unix)]
+#[test]
+fn command_requester_kills_helper_process_on_timeout() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let pid_file = std::env::temp_dir().join(format!(
+        "libresoda-child-tree-{}-{}.pid",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let script = format!(
+        "sleep 30 & echo $! > '{}'; while :; do :; done",
+        pid_file.display()
+    );
+    let requester = CommandRequester::new("sh")
+        .args(["-c", script.as_str()])
+        .timeout_ms(1_000);
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 不退出也得超时");
+    assert!(error.to_string().contains("requester timed out"), "{error}");
+
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("探针应把 helper 的 pid 写出来")
+        .trim()
+        .parse()
+        .expect("pid 应是整数");
+    let _ = std::fs::remove_file(&pid_file);
+
+    // 组信号之后 helper 可能先变成僵尸再被 init 收走，`kill(pid, 0)` 在这段里仍返回 0；
+    // 给 2 s 让内核完成回收，超时还没消失才算残留。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "超时返回后 helper {pid} 仍然存活"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。
+///
+/// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper
+/// 应当还活着 —— Windows 上 `release` 清不掉 `KILL_ON_JOB_CLOSE` 的话，`Job::drop` 会把它
+/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价也一并断言：helper 攥着
+/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层看到的是「返回无法解析」。
+#[test]
+fn command_requester_leaves_resident_descendants_on_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let marker = std::env::temp_dir().join(format!(
+        "libresoda-child-resident-{}-{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&marker);
+    // Git Bash 认正斜杠；`display()` 在 Windows 上给的是反斜杠。
+    let marker_arg = marker.display().to_string().replace('\\', "/");
+    let script = format!(
+        "cat >/dev/null; ( sleep 2; printf alive > '{marker_arg}' ) & \
+         printf '{{\"ok\":true,\"status\":200,\"body\":\"\"}}'; exit 0"
+    );
+    let requester = CommandRequester::new("sh").args(["-c", script.as_str()]);
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 攥着写端时回包应被宽限丢掉");
+    let text = error.to_string();
+    assert!(
+        text.contains("返回无法解析"),
+        "宽限到点后已收到的输出应被丢掉，只剩解析失败：{text}"
+    );
+    assert!(!text.contains("timed out"), "{text}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "成功路径把驻留的 helper 杀掉了（标记没有落盘）"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_file(&marker);
 }

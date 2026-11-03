@@ -107,9 +107,18 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 `CommandSignature::timeout_ms`（默认 5 s）自票
 [`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr
-排空都在独立线程里进行，主线程按这个上限等子进程；到点 `kill` 再 `wait` 回收，报
-`signer timed out after {N} ms`（有 stderr 时补在后面）。所以「签名器关掉 stdin 却永不退出」
-不会再让调用方无限等 —— 超时前缀与上面三条「正常退出」文案可区分。
+排空都在独立线程里进行，主线程按这个上限等子进程；到点终止整棵子进程树（Unix 进程组 /
+Windows Job Object，票 [`#25`](https://github.com/sodahub-org/libresoda/issues/25)）再
+`wait` 回收，报 `signer timed out after {N} ms`（有 stderr 时补在后面）。所以「签名器关掉
+stdin 却永不退出」不会再让调用方无限等 —— 超时前缀与上面三条「正常退出」文案可区分。
+
+签名器自己拉起的 helper 也在这棵树里，超时会一起终止；成功返回时库不杀它们（错误路径的收场
+见 `docs/PORTING.md` 的残余边界 ⑥）。要让后台进程常驻，必须让它**关掉或重定向继承的
+stdout/stderr**：库只在管道 EOF（或读错误）时才交回输出，helper 攥着写端会让调用方等满 1 s
+宽限，并丢掉已经收到的回包（表现为解析失败）。
+
+Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户可见的代价 —— 宿主被中断时它不会
+跟着收到 SIGINT，需要调用方自己收尾。
 
 ## 3. libresoda 侧用法
 
