@@ -21,8 +21,7 @@ use std::time::{Duration, Instant};
 /// 数值出处与超时口径见 `docs/PORTING.md`「轮询退避」一条（票 #28），这里不复述，免得两处漂。
 const POLL_INTERVAL_START: Duration = Duration::from_micros(500);
 
-/// 轮询 `try_wait` 的间隔上限。翻倍到这里就不再涨，
-/// 所以超时的精度与上限都停在 #23 那一档。
+/// 轮询 `try_wait` 的间隔上限。翻倍到这里就不再涨。
 const POLL_INTERVAL_MAX: Duration = Duration::from_millis(10);
 
 /// 下一拍轮询的间隔：每拍翻倍，到上限为止。用 sleep 而不是忙等。
@@ -278,12 +277,12 @@ mod tests {
 
     #[test]
     fn poll_interval_stops_at_the_cap() {
-        // 到顶不再涨：长等待（请求器默认 240 s）之后每拍仍是 10 ms，超时那一拍的宽限
-        // 与 #23 的固定间隔相同。
-        let mut interval = POLL_INTERVAL_MAX;
-        for _ in 0..32 {
-            interval = next_poll_interval(interval);
-        }
-        assert_eq!(interval, POLL_INTERVAL_MAX, "封顶后不再涨");
+        // 正面钉一次「到顶不再涨」：长等待（请求器默认 240 s）之后每拍仍是 10 ms，
+        // 超时那一拍的宽限与 #23 的固定间隔相同。上一条用例尾部那两格 10 ms 是同一件事的侧面。
+        assert_eq!(
+            next_poll_interval(POLL_INTERVAL_MAX),
+            POLL_INTERVAL_MAX,
+            "封顶后不再涨"
+        );
     }
 }

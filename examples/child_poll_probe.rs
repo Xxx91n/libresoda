@@ -11,7 +11,7 @@
 //! 门禁」记在 `docs/PORTING.md`「计时凭证」一条；`.github/workflows/ci.yml` 在 Test 之后跑一次。
 //!
 //! ```text
-//! CHILD_POLL_ROUNDS  可选；计时轮数，缺省 100（非法按 100，实际取 1..=2000）
+//! CHILD_POLL_ROUNDS  可选；计时轮数，缺省 100（非法按 100，实际取 1..=1000）
 //! ```
 //!
 //! 跑法（离线、不碰网络；签名器是 `sh` + `cat`）：
@@ -38,9 +38,9 @@ const WARM_UP_ROUNDS: usize = 5;
 /// 默认计时轮数。
 const DEFAULT_ROUNDS: usize = 100;
 
-/// 轮数上限：`CHILD_POLL_ROUNDS` 是人给的数，不能直接拿去当容量用（AGENTS.md 内存安全铁律 1）；
-/// 上限同时保证两列跑完仍落在 CI 那步 `timeout 300` 之内。
-const MAX_ROUNDS: usize = 2_000;
+/// 轮数上限：`CHILD_POLL_ROUNDS` 是人给的数，不能直接拿去当容量用（AGENTS.md 内存安全铁律 1）。
+/// CI 不设这个变量，跑的是缺省那 100 轮。
+const MAX_ROUNDS: usize = 1_000;
 
 /// 一组样本的分位（单位：微秒）。
 struct Stats {
@@ -83,7 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arch = std::env::consts::ARCH;
     let bytes = payload.len();
     println!("platform: {os} {arch} | rounds: {rounds} | payload: {bytes} bytes");
-    println!("{:<34}{:>10}{:>10}{:>10}{:>10}", "path (ms)", "min", "p50", "p90", "mean");
+    println!(
+        "{:<34}{:>10}{:>10}{:>10}{:>10}",
+        "path (ms)", "min", "p50", "p90", "mean"
+    );
     print_row("CommandSignature::sign", &library);
     print_row("bare spawn+wait_with_output", &bare);
     let diff = (library.p50 as f64 - bare.p50 as f64) / 1_000.0;
