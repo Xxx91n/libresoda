@@ -1,6 +1,6 @@
 # 最小检查：格式、静态检查（警告视为失败）、全部测试。票 sodahub-org/libresoda#4。
-# 后面还有一步快路径计时记录（票 #28），那是 `continue-on-error` 的记录、不是门禁；
-# job 名 `fmt / clippy / test` 保持不变，改名等于改分支保护里那个必需检查的名字。
+# 末尾还有一步快路径计时记录（票 #28），不进门禁，理由写在那一步的注释里。
+# job 名 `fmt / clippy / test` 保持不变：改名等于改分支保护里那个必需检查的名字。
 #
 # 版本都钉在这个文件里，不写 `rust-toolchain.toml`：后者会改掉每个人本地构建用的工具链，
 # 而这里只该固定 CI 自己的环境。镜像与 action 按提交钉住，同一个运行结果可复现、可追溯。
@@ -51,12 +51,15 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # 票 sodahub-org/libresoda#28：快路径延迟的计时记录。把 `child_poll_probe` 那张
-      # 「库路径 vs 裸 spawn」的差值表打进日志，供票的验收第 1 条（额外延迟 ≤ ~2 ms）留凭证。
-      # `continue-on-error`：计时随 runner 的机器与负载变，这张表只作记录、不作门禁 ——
-      # 把阈值写死在这里等于给某一台 runner 背书。探针本身离线，不碰网络。
-      # 外面套一层 `timeout`：Actions 的 `timeout-minutes` 只能挂在 job 上，而 `continue-on-error`
-      # 挡的是「红」，挡不住「挂」——裸 `wait_with_output` 那一列真卡住时会把整个 job 拖到默认上限。
+      # 票 sodahub-org/libresoda#28：快路径延迟的计时记录。把 `child_poll_probe` 那张「库路径 vs
+      # 裸 spawn」的 p50 差值表打进日志。读它要认清楚：差值是走执行器的总开销（含三次线程 spawn
+      # 与库里那次 JSON 编码），不是轮询粒度单独占多少 —— 口径与「为什么不做成门禁」都记在
+      # `docs/PORTING.md`「计时凭证」一条，这里不复述。
+      # 外面套一层 `timeout` 兜住「挂住」：Actions 的 `timeout-minutes` 只能挂在 job 上，而
+      # `continue-on-error` 挡得住红、挡不住挂 —— 裸 `wait_with_output` 那一列真卡住时，
+      # 整个 job 会被拖到默认时限。没跑出表时用 `::warning` 留一行痕迹，免得凭证静默消失。
       - name: Child poll timing record
         continue-on-error: true
-        run: timeout 300 cargo run --locked --example child_poll_probe
+        run: |
+          timeout 300 cargo run --locked --example child_poll_probe || \
+            echo '::warning::本次没有交出计时表（timeout 300 到点，或非 0 退出）'

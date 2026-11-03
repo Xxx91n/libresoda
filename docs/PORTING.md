@@ -520,14 +520,16 @@
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
     `sign()` 在每一次带签名的请求上都走：`#23` 复核实测同一脚本 `sign()` 197 ms vs 裸
-    `spawn + write_all + wait_with_output` 192 ms，差值正是那半个间隔，而 Linux 上签名器本身只要
+    `spawn + write_all + wait_with_output` 192 ms，差值约是那半拍（#23 的原话是「一半左右」，
+    那两条数也各自含线程 spawn 与编码，见下面「计时凭证」），而 Linux 上签名器本身只要
     2–3 ms —— 比例不小。退避之后，快路径上最坏的检测误差就是「跨过退出那一拍」的间隔本身：签名器
     2–3 ms 退出时那一拍是 2 ms，平均在 1 ms 上下，比固定 10 ms 时低一个量级。
     - **为什么是退避而不是直接 1–2 ms**：请求器的等待上限默认 240 s，按 1 ms 轮询等于一次等待里
       打 24 万拍；退避只在开头十几毫秒内多几拍，之后仍是每 10 ms 一拍。
     - **超时精度与上限不变**：到点判据仍是 `started.elapsed() >= timeout`，与间隔无关；而任何一次
       真实的超时（用例是 200 ms / 2 s，请求器是 240 s）发生时间隔早已封顶，到点那一拍多吃到的宽限
-      与 `#23` 完全相同（≤ 10 ms）。错误文案一条没改。
+      与 `#23` 完全相同（≤ 10 ms）。`#23` 那四条带 `recv_timeout` 看门狗的计时用例（两个「不读也不
+      退出」+ 两个「边排空边到点」）因而都不必调阈值。错误文案一条没改。
     - **计时凭证**：`examples/child_poll_probe.rs` 跑同一条最小签名器两遍（库路径 vs 裸
       `spawn + write_all + wait_with_output`），同一趟里 A/B 交替、取 p50 差值；
       `.github/workflows/ci.yml` 在 Test 之后跑一次，把表打进日志。读这张表要认清楚：两列之差是
@@ -561,10 +563,6 @@
     `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
     这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
     需要改用 `new`/`timeout_ms`；仓内没有这种用法。
-  - **轮询退避只改间隔，不改判据（票 #28）**：#23 那四条带 `recv_timeout` 看门狗的计时用例
-    （两个「不读也不退出」+ 两个「边排空边到点」）都不必调阈值 —— 退避不碰「到点」的判据，也不碰
-    超时那一拍的宽限；快路径的额外延迟交给 `examples/child_poll_probe.rs` 记录，不进用例
-    （票 #28 的验收也明确要求别把毫秒数写死在某台机器上）。
   - **SIGPIPE 前提**：`write_all` 断管返回 `Err(BrokenPipe)` 而不是把进程打死，前提是宿主忽略了
     SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
@@ -575,11 +573,10 @@
     三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
     0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
     全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例 5 s 守卫；四个计时用例都
-    把调用放进带 `recv_timeout` 的线程里，
-    库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢 `cargo test`。排空用例的探针只用
-    shell 内建、不 fork
-    子进程 —— kill 直接子进程后管道写端全关，Windows（Git Bash/msys2）与 Unix 都能取回已排空的
-    stderr；`exec sleep` / `cat` 会留下继承管道的后继进程，Windows 上 kill 后拿不到 EOF。
+    把调用放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
+    `cargo test`。排空用例的探针只用 shell 内建、不 fork 子进程 —— kill 直接子进程后管道写端全关，
+    Windows（Git Bash/msys2）与 Unix 都能取回已排空的 stderr；`exec sleep` / `cat` 会留下继承管道的
+    后继进程，Windows 上 kill 后拿不到 EOF。
 
 ## 未移植项
 
