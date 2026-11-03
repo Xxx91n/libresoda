@@ -550,10 +550,11 @@
       拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
       进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止：`run` 返回 `Ok`
       但请求没交全（断管、写线程超宽限、写线程没送结果）的路径走成功释放，两个平台都会留下子进程
-      留下的 helper；子进程已退出后才发现写入错误（非断管）的那条直接返回 `Err(Stdin)`、不调用
-      `release`，Unix 上 helper 同样留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它带走。
-      两种情况都由上层按退出码/「没读请求」报出，不当作超时处理；这里也不能补 `kill(-pid)` ——
-      `try_wait` 已经收尸，pid 可能已被复用。
+      留下的 helper（Windows 上清标志失败时例外，见上一条）；子进程已退出后才发现写入错误（非断管）
+      的那条直接返回 `Err(Stdin)`、不调用 `release`，Unix 上 helper 同样留下，Windows 上句柄带着
+      `KILL_ON_JOB_CLOSE` 关闭会把它带走。两种情况都不当作超时：前者由上层按退出码/「没读请求」
+      报出，后者报 `stdin write: {err}`。这里也不能补 `kill(-pid)` —— `try_wait` 已经收尸，
+      pid 可能已被复用。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
