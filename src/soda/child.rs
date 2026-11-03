@@ -330,10 +330,10 @@ mod tree {
     /// 终止作业里的全部进程；直接子进程由调用方 `wait` 收尸。
     pub(super) fn kill(job: &Job, child: &mut Child) {
         // SAFETY: 句柄有效；退出码只是记录用。
-        if unsafe { TerminateJobObject(job.0, 1) } == 0 {
-            // 作业终止失败时退回只打直接子进程，免得 `wait` 等一个还活着的子进程。
-            let _ = child.kill();
-        }
+        let _ = unsafe { TerminateJobObject(job.0, 1) };
+        // `TerminateJobObject` 对空作业也返回成功 —— 子进程没挂进作业时（attach 失败路径）
+        // 它什么也没杀。不能拿返回值判断直接子进程的死活，总是再终止一次，`wait` 才不会无界。
+        let _ = child.kill();
     }
 
     /// 成功路径先清掉 `KILL_ON_JOB_CLOSE` 再关句柄：与 Unix 一样，不杀选择继续驻留的

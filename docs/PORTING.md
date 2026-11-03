@@ -528,7 +528,9 @@
       （组已消失、信号没发出去）时退回 `Child::kill()`，避免 `wait` 等一个还活着的子进程。
       这里用 `libc` 只为这一个系统调用 —— std 没有「给别的进程发信号」的入口。
     - **Windows**：spawn 前 `CreateJobObjectW` 建作业，spawn 后 `AssignProcessToJobObject` 把
-      直接子进程放进去；子进程此后创建的进程自动继承作业成员资格。终止用 `TerminateJobObject`。
+      直接子进程放进去；子进程此后创建的进程自动继承作业成员资格。终止用 `TerminateJobObject`，
+      再补一次 `Child::kill()` —— 前者对空作业也返回成功，不能拿它判断直接子进程是否已终止
+      （作业没挂上时就是空的）。
       作业挂 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，用于宿主进程异常退出时兜底（句柄随进程关闭，
       作业里的残留进程一并终止）；**成功路径先清掉这个标志再关句柄**，与 Unix 一样不杀选择继续
       驻留的后继进程。作业建不出来、或子进程放不进去，都按 `Spawn` 报错并终止子进程 —— 宁可不跑，
@@ -540,7 +542,9 @@
       进程组，Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
       进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
-      不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行。
+      不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行；⑤ 既非 Unix 也非 Windows 的目标
+      拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
+      进程树保证只在这两个平台上成立。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
@@ -614,7 +618,9 @@
     断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的两条：
     `sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的后台 helper 后驻留到超时 —— helper 活着的
     唯一证据就是写端没关，超时前写下的 stderr 标记能随 EOF 交回来就说明整棵树已终止（Unix 与
-    Windows 同一份用例）；Unix 另有一条从 pid 文件用 `kill(pid, 0)` 确认 helper 在超时返回后消失。
+    Windows 同一份用例；Windows 侧「helper 已死」由这条 EOF 推出：写端持有者必须全部消失，没有
+    另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。Unix 另有一条从 pid 文件用 `kill(pid, 0)`
+    确认 helper 在超时返回后消失。
     `src/soda/child.rs` 三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
     0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
     全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例 5 s 守卫；计时用例都把调用
