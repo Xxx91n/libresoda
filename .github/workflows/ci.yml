@@ -48,3 +48,11 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      # 票 sodahub-org/libresoda#28：快路径轮询粒度的计时记录。把 `child_poll_probe` 那张
+      # 「库路径 vs 裸 spawn」的延迟差表打进日志，供票的验收第 1 条（额外延迟 ≤ ~2 ms）留凭证。
+      # `continue-on-error`：计时随 runner 的机器与负载变，这张表只作记录、不作门禁 ——
+      # 把阈值写死在这里等于给某一台 runner 背书。探针本身离线，不碰网络。
+      - name: Child poll timing record
+        continue-on-error: true
+        run: cargo run --locked --example child_poll_probe
