@@ -249,31 +249,37 @@ mod tests {
 
     #[test]
     fn poll_interval_backs_off_from_half_a_ms_to_the_cap() {
+        // 拍数写死，不写 `while interval < MAX`：起始那格万一退化成 0，这条要失败而不是挂住
+        // `cargo test`（同一份纪律见 #23 给计时用例加的 recv_timeout 看门狗）。
         let mut interval = POLL_INTERVAL_START;
         let mut seen = Vec::new();
-        while interval < POLL_INTERVAL_MAX {
-            seen.push(interval);
+        for _ in 0..6 {
             interval = next_poll_interval(interval);
+            seen.push(interval);
         }
-        seen.push(interval);
         assert_eq!(
             seen,
             vec![
-                Duration::from_micros(500),
                 Duration::from_millis(1),
                 Duration::from_millis(2),
                 Duration::from_millis(4),
                 Duration::from_millis(8),
                 Duration::from_millis(10),
+                Duration::from_millis(10),
             ],
-            "退避序列：票 #28 定的 0.5 ms 起翻倍、10 ms 封顶"
+            "退避序列：翻倍到 10 ms 封顶"
+        );
+        assert_eq!(
+            POLL_INTERVAL_START,
+            Duration::from_micros(500),
+            "起始那格非零，不会退化成忙等"
         );
     }
 
     #[test]
     fn poll_interval_stops_at_the_cap() {
         // 到顶不再涨：长等待（请求器默认 240 s）之后每拍仍是 10 ms，超时那一拍的宽限
-        // 与 #23 的固定间隔相同。上一条用例钉住起始那格是 0.5 ms —— 非零，所以不会退化成忙等。
+        // 与 #23 的固定间隔相同。
         let mut interval = POLL_INTERVAL_MAX;
         for _ in 0..32 {
             interval = next_poll_interval(interval);
