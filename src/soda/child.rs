@@ -71,6 +71,20 @@ pub(crate) fn run(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> Result<ChildOutput, ChildError> {
+    run_with_attach(command, payload, timeout_ms, tree::attach)
+}
+
+/// `run` 的本体。`attach` 作为参数传入，用例才能稳定造出 attach 失败来钉**调用点**
+/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）；生产路径永远传 `tree::attach`。
+fn run_with_attach<A>(
+    command: &mut Command,
+    payload: Vec<u8>,
+    timeout_ms: u64,
+    attach: A,
+) -> Result<ChildOutput, ChildError>
+where
+    A: FnOnce(&tree::Job, &Child) -> io::Result<()>,
+{
     // 先把容器准备好，再 spawn：Unix 是进程组（spawn 时生效），Windows 是作业句柄。
     // 容器建不出来就不跑 —— 宁可不启动，也不假装能兜住整棵树。
     let tree = tree::prepare(command).map_err(ChildError::Spawn)?;
@@ -79,7 +93,7 @@ pub(crate) fn run(
     // 那不是 spawn 失败，而是子进程正常起来了又很快退出（快退的签名器/请求器会撞上）。
     // 真放不进作业、子进程又还活着，就没有整棵树可谈：终止并按 spawn 失败报出去，
     // 不降级成「只杀直接子进程」。判定与终止都在 `attach_or_abort` 里，用例直接钉它。
-    attach_or_abort(&tree, tree::attach(&tree, &child), &mut child).map_err(ChildError::Spawn)?;
+    attach_or_abort(&tree, attach(&tree, &child), &mut child).map_err(ChildError::Spawn)?;
     let Some(mut stdin) = child.stdin.take() else {
         // 拿不到 stdin 也不能把已经起来的子进程扔在那里。
         let _ = terminate(&tree, &mut child);
@@ -572,6 +586,24 @@ mod tests {
             "致命路径必须先终止并收尸"
         );
         super::tree::release(&job);
+    }
+
+    /// 端到端钉住 `run` 对 attach 收场的**消费**：attach 失败而子进程还活着时必须报 `Spawn`。
+    ///
+    /// 只钉 `attach_or_abort` 的话，`run` 里把返回值吞掉（`let _ = ...`）仍能全绿；这条用例
+    /// 会走到 `StdinUnavailable` 而不是 `Spawn`，把「吞掉」和「反转」两个变异都钉死。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn run_reports_spawn_when_attach_fails_and_child_is_alive() {
+        let mut command = quiet(live_command());
+        let error = super::run_with_attach(&mut command, Vec::new(), 5_000, |_, _| {
+            Err(io::Error::from_raw_os_error(5))
+        })
+        .expect_err("attach 失败且子进程还活着必须报错");
+        assert!(
+            matches!(error, ChildError::Spawn(ref err) if err.raw_os_error() == Some(5)),
+            "应报 Spawn（错误 5）"
+        );
     }
 
     /// 票 #32 的前提与判据一起钉住（Windows）：对已退出的进程 `AssignProcessToJobObject`
