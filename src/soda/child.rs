@@ -474,13 +474,13 @@ mod tests {
     #[cfg(any(unix, windows))]
     fn probe_command(script: &str) -> Command {
         #[cfg(unix)]
-        let mut command = {
+        let command = {
             let mut command = Command::new("sh");
             command.args(["-c", script]);
             command
         };
         #[cfg(windows)]
-        let mut command = {
+        let command = {
             let mut command = Command::new("cmd");
             command.args(["/c", script]);
             command
