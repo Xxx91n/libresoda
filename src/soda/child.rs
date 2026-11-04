@@ -599,7 +599,9 @@ mod tests {
         let error = super::run_with_attach(&mut command, Vec::new(), 5_000, |_, _| {
             Err(io::Error::from_raw_os_error(5))
         })
-        .expect_err("attach 失败且子进程还活着必须报错");
+        // `ChildOutput` 没有 `Debug`，不能用 `expect_err`（它要打印 Ok 值）。
+        .err()
+        .expect("attach 失败且子进程还活着必须报错");
         assert!(
             matches!(error, ChildError::Spawn(ref err) if err.raw_os_error() == Some(5)),
             "应报 Spawn（错误 5）"
