@@ -71,15 +71,29 @@ pub(crate) fn run(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> Result<ChildOutput, ChildError> {
+    run_with_attach(command, payload, timeout_ms, tree::attach)
+}
+
+/// `run` 的本体。`attach` 作为参数传入，用例才能稳定造出 attach 失败来钉**调用点**
+/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）；生产路径永远传 `tree::attach`。
+fn run_with_attach<A>(
+    command: &mut Command,
+    payload: Vec<u8>,
+    timeout_ms: u64,
+    attach: A,
+) -> Result<ChildOutput, ChildError>
+where
+    A: FnOnce(&tree::Job, &Child) -> io::Result<()>,
+{
     // 先把容器准备好，再 spawn：Unix 是进程组（spawn 时生效），Windows 是作业句柄。
     // 容器建不出来就不跑 —— 宁可不启动，也不假装能兜住整棵树。
     let tree = tree::prepare(command).map_err(ChildError::Spawn)?;
     let mut child = command.spawn().map_err(ChildError::Spawn)?;
-    if let Err(err) = tree::attach(&tree, &child) {
-        // 放不进作业就没有整棵树可谈：终止并报 spawn 失败，不降级成「只杀直接子进程」。
-        let _ = terminate(&tree, &mut child);
-        return Err(ChildError::Spawn(err));
-    }
+    // Windows 上对一个已经结束的进程 `AssignProcessToJobObject` 会回 `ERROR_ACCESS_DENIED`：
+    // 那不是 spawn 失败，而是子进程正常起来了又很快退出（快退的签名器/请求器会撞上）。
+    // 真放不进作业、子进程又还活着，就没有整棵树可谈：终止并按 spawn 失败报出去，
+    // 不降级成「只杀直接子进程」。判定与终止都在 `attach_or_abort` 里，用例直接钉它。
+    attach_or_abort(&tree, attach(&tree, &child), &mut child).map_err(ChildError::Spawn)?;
     let Some(mut stdin) = child.stdin.take() else {
         // 拿不到 stdin 也不能把已经起来的子进程扔在那里。
         let _ = terminate(&tree, &mut child);
@@ -177,6 +191,41 @@ pub(crate) fn run(
     })
 }
 
+/// attach 的收场：`Ok(())` = 可以继续收集；`Err(err)` = 子进程没进容器且还活着，已终止并要按
+/// `Spawn` 报出去。
+///
+/// 判据用 `try_wait`，不是 `ERROR_ACCESS_DENIED`（错误 5）本身：错误 5 还有别的因由（作业时限、
+/// 活动进程上限、安全限制、作业正在终止等），按错误码分支会误判。Windows 用例
+/// `windows_attach_on_exited_child_is_denied_but_not_fatal` 钉的是「已退出的进程确实回 5」，
+/// 不是「回 5 就等于已退出」。
+///
+/// **非致命分支会回收子进程**（Unix 的 `try_wait` 就是 `waitpid(WNOHANG)`）：返回后 pid 可能已被
+/// 复用，不得再对它做任何基于 pid 的信号操作。这只在 Unix 上要紧 —— Windows 的 `tree::kill` 走
+/// `TerminateJobObject` + `Child::kill()`，从不构造 `-pid`。今天 Unix 的 `tree::attach` 恒成功、
+/// 走不到这里；将来若 Unix attach 变成可失败，先处理这个副作用（Unix 可改用 `kill(pid, 0)` 探活，
+/// 它不回收；Windows 的 `try_wait` 不释放 pid）。
+///
+/// `attach` 以算好的结果传入，用例才能稳定造出「attach 失败」而不必伪造 Win32 调用；顺带把
+/// 「继续 / 终止并报错」这个分支本身纳入被测面，而不只是被测谓词。
+fn attach_or_abort(
+    tree: &tree::Job,
+    attach: io::Result<()>,
+    child: &mut Child,
+) -> Result<(), io::Error> {
+    let err = match attach {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        // 取不到状态就不知道它死没死，没有理由当作正常启动。
+        _ => {
+            let _ = terminate(tree, child);
+            Err(err)
+        }
+    }
+}
+
 fn spawn_reader<R>(mut pipe: R) -> Receiver<Vec<u8>>
 where
     R: Read + Send + 'static,
@@ -238,18 +287,19 @@ mod tree {
         Ok(())
     }
 
-    /// 对整组发 SIGKILL；直接子进程由调用方 `wait` 收尸。
+    /// 对整组发 SIGKILL，再单独打直接子进程一次；直接子进程由调用方 `wait` 收尸。
     pub(super) fn kill(_job: &Job, child: &mut Child) {
-        let Ok(pid) = libc::pid_t::try_from(child.id()) else {
-            let _ = child.kill();
-            return;
-        };
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。负 pid 表示整个进程组，
-        // 组号就是 spawn 时 `process_group(0)` 让子进程自领的 pid。
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-            // 组已消失或信号没发出去：退回只打直接子进程，免得 `wait` 等一个还活着的子进程。
-            let _ = child.kill();
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。负 pid 表示整个进程组，
+            // 组号就是 spawn 时 `process_group(0)` 让子进程自领的 pid。
+            //
+            // 返回 0 只说明「组里至少有一个进程收到了信号」，不等于直接子进程已死：
+            // 它可以 `setpgid` 挪去别的组、留一个 helper 在原组，组杀照样报成功。所以
+            // 不能拿返回值当「直接子进程已死」，总是再单独打它一次，`wait` 才不会等一个
+            // 还活着的子进程。此刻还没有任何调用方 `wait` 过，pid 不会被回收后指到别人身上。
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
+        let _ = child.kill();
     }
 
     /// 成功路径没有容器要拆：进程组随成员退出自然消失，不打信号就什么也不做。
@@ -446,5 +496,136 @@ mod tests {
             POLL_INTERVAL_MAX,
             "封顶后不再涨"
         );
+    }
+
+    /// 按平台拼一个探针 `Command`；脚本写法分平台（Windows 上没有 `sh`）。
+    #[cfg(any(unix, windows))]
+    fn probe_command(script: &str) -> Command {
+        #[cfg(unix)]
+        let command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        #[cfg(windows)]
+        let command = {
+            let mut command = Command::new("cmd");
+            command.args(["/c", script]);
+            command
+        };
+        quiet(command)
+    }
+
+    /// 探针不碰终端：stdio 全空。
+    #[cfg(any(unix, windows))]
+    fn quiet(mut command: Command) -> Command {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    /// 长驻探针程序：直接起目标进程（不经 shell），`kill()` 打到的就是它本身。
+    #[cfg(unix)]
+    fn live_command() -> Command {
+        let mut command = Command::new("sleep");
+        command.args(["30"]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn live_command() -> Command {
+        let mut command = Command::new("ping");
+        command.args(["-n", "30", "127.0.0.1"]);
+        command
+    }
+
+    /// 等到子进程退出：用 `try_wait` 收尸，与 `run` 的判断走同一入口。
+    #[cfg(any(unix, windows))]
+    fn wait_until_exited(child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait 应成功").is_none() {
+            assert!(Instant::now() < deadline, "退出探针没有在期限内退出");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 票 #32：attach 失败而子进程已退出 → 继续收集（不终止、不报 `Spawn`）。
+    ///
+    /// Windows 上的出错窗口是「spawn 之后、attach 之前子进程就退出了」，窗口本身没法稳定构造；
+    /// 这里把窗口的**结果**造出来喂给 `run` 用的同一个收场函数，在三个 `try_wait` 回值里钉住
+    /// 「已退出 → 继续」这一格。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn attach_or_abort_continues_when_child_already_exited() {
+        let mut command = probe_command("exit 0");
+        let job = super::tree::prepare(&mut command).expect("容器应能建出来");
+        let mut child = command.spawn().expect("探针应能启动");
+        wait_until_exited(&mut child);
+        assert!(
+            super::attach_or_abort(&job, Err(io::Error::from_raw_os_error(5)), &mut child).is_ok(),
+            "已退出的子进程不该被当成 spawn 失败"
+        );
+        super::tree::release(&job);
+    }
+
+    /// 反向钉子：还活着的子进程放不进容器，必须终止并报错，而不是静默降级成「只杀直接子进程」。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn attach_or_abort_kills_live_child_and_reports() {
+        let mut command = quiet(live_command());
+        let job = super::tree::prepare(&mut command).expect("容器应能建出来");
+        let mut child = command.spawn().expect("探针应能启动");
+        assert!(
+            super::attach_or_abort(&job, Err(io::Error::from_raw_os_error(5)), &mut child).is_err(),
+            "还活着的子进程 attach 失败必须报 Spawn"
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "致命路径必须先终止并收尸"
+        );
+        super::tree::release(&job);
+    }
+
+    /// 端到端钉住 `run` 对 attach 收场的**消费**：attach 失败而子进程还活着时必须报 `Spawn`。
+    ///
+    /// 只钉 `attach_or_abort` 的话，`run` 里把返回值吞掉（`let _ = ...`）仍能全绿；这条用例
+    /// 会走到 `StdinUnavailable` 而不是 `Spawn`，把「吞掉」和「反转」两个变异都钉死。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn run_reports_spawn_when_attach_fails_and_child_is_alive() {
+        let mut command = quiet(live_command());
+        let error = super::run_with_attach(&mut command, Vec::new(), 5_000, |_, _| {
+            Err(io::Error::from_raw_os_error(5))
+        })
+        // `ChildOutput` 没有 `Debug`，不能用 `expect_err`（它要打印 Ok 值）。
+        .err()
+        .expect("attach 失败且子进程还活着必须报错");
+        assert!(
+            matches!(error, ChildError::Spawn(ref err) if err.raw_os_error() == Some(5)),
+            "应报 Spawn（错误 5）"
+        );
+    }
+
+    /// 票 #32 的前提与判据一起钉住（Windows）：对已退出的进程 `AssignProcessToJobObject`
+    /// 真的会失败（`ERROR_ACCESS_DENIED` = 5），而 `run` 的分类不把它当 `Spawn`。
+    ///
+    /// 竞态窗口本身（spawn 之后、attach 之前恰好退出）没法稳定构造；这里把窗口的**结果**
+    /// 直接造出来：先等子进程退出（`try_wait` 收尸、句柄仍由 `Child` 持有），再真调一次 attach。
+    #[cfg(windows)]
+    #[test]
+    fn windows_attach_on_exited_child_is_denied_but_not_fatal() {
+        let mut command = probe_command("exit 0");
+        let job = super::tree::prepare(&mut command).expect("作业应能建出来");
+        let mut child = command.spawn().expect("探针应能启动");
+        wait_until_exited(&mut child);
+        let err = super::tree::attach(&job, &child).expect_err("对已退出的进程 attach 应失败");
+        assert_eq!(err.raw_os_error(), Some(5), "ERROR_ACCESS_DENIED: {err}");
+        assert!(
+            super::attach_or_abort(&job, Err(err), &mut child).is_ok(),
+            "已退出的子进程不该被当成 spawn 失败"
+        );
+        super::tree::release(&job);
     }
 }

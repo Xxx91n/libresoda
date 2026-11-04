@@ -211,6 +211,82 @@ fn command_requester_kills_helper_process_on_timeout() {
     }
 }
 
+/// 票 #32 的验收：组杀「成功」不等于直接子进程已死。
+///
+/// 直接子进程（库用 `process_group(0)` 让它自领一组）先 fork 一个留在原组的 helper，再
+/// `setpgid` 把自己挪进父进程的组。此后 `kill(-原组, SIGKILL)` 只打到 helper，返回 0；
+/// 只看返回值就会跳过直接子进程，`terminate()` 的 `wait()` 便一直等到它自然退出。用例靠
+/// 6 s 看门狗把这个无界等待变成失败：修复前 `request()` 不返回，修复后正常报超时。
+///
+/// 用 `python3` 是因为 `sh` 没有 `setpgid` 内建；脚本里不 fork 别的 shell，helper 就是
+/// python 自己 fork 出来的那个。只在 Unix 上跑（`kill(pid, 0)` 与 `setpgid` 都是 Unix 语义）。
+#[cfg(unix)]
+#[test]
+fn command_requester_kills_child_that_escaped_the_process_group() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // argv: ["-c", 脚本, pid 文件]。`fork` 出来的 helper 留在原组睡到被组杀带走。
+    const ESCAPE_SCRIPT: &str = r#"
+import os, sys, time
+if os.fork() == 0:
+    time.sleep(60)
+    os._exit(0)
+os.setpgid(0, os.getpgid(os.getppid()))
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+sys.stderr.write("escaped %d\n" % os.getpgrp())
+sys.stderr.flush()
+time.sleep(60)
+"#;
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let pid_file = std::env::temp_dir().join(format!(
+        "libresoda-child-escape-{}-{}.pid",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+    let pid_arg = pid_file.display().to_string();
+    let requester = CommandRequester::new("python3")
+        .args(["-c", ESCAPE_SCRIPT, pid_arg.as_str()])
+        .timeout_ms(1_500);
+    let started = Instant::now();
+    let error = run_with_watchdog(Duration::from_secs(6), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("直接子进程逃出原组也不能跳过超时终止");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("requester timed out"), "{text}");
+    assert!(
+        text.contains("escaped"),
+        "要证明它真的走到了移组之后：{text}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "移组用例拖了 {elapsed:?}");
+
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("探针应把直接子进程的 pid 写出来")
+        .trim()
+        .parse()
+        .expect("pid 应是整数");
+    let _ = std::fs::remove_file(&pid_file);
+
+    // 组杀只带走了 helper；直接子进程要靠补打的 `Child::kill()` 才会消失。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "逃出原组的直接子进程 {pid} 仍然存活"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。
 ///
 /// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper

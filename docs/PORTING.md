@@ -523,10 +523,13 @@
     `node`、`sh`、桥接器、浏览器）会继续运行，攥着 stdout/stderr 写端，也会继续持有浏览器会话/
     设备上下文。现在 spawn 时就把直接子进程放进一个能整体寻址的容器；**子进程仍在跑、或
     还要收尸时就直接返回错误的路径**（超时、运行中发现写 stdin 的非断管错误、`try_wait`
-    取不到状态、拿不到 stdin、attach 失败）都先终止整个容器再 `wait`：
+    取不到状态、拿不到 stdin、attach 失败且子进程仍在跑）都先终止整个容器再 `wait`：
     - **Unix**：`CommandExt::process_group(0)` 让子进程自成进程组（组号 = 子进程 pid；std 在
-      exec 前 `setpgid`，`spawn` 返回时已生效），终止时 `kill(-pgid, SIGKILL)`。组信号失败
-      （组已消失、信号没发出去）时退回 `Child::kill()`，避免 `wait` 等一个还活着的子进程。
+      exec 前 `setpgid`，`spawn` 返回时已生效），终止时先 `kill(-pgid, SIGKILL)` 打整组，再
+      **无条件**补一次 `Child::kill()`（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）。
+      组信号返回 0 只说明组里至少有一个进程收到了信号，不等于直接子进程已死 —— 它可以
+      `setpgid` 挪去别的组、留一个 helper 在原组，组杀照样「成功」；只看返回值就会跳过直接子进程，
+      接着 `wait` 一个还活着的子进程。此刻还没有任何调用点 `wait` 过，pid 不会被复用后指到别的进程上。
       这里用 `libc` 只为这一个系统调用 —— std 没有「给别的进程发信号」的入口。
     - **Windows**：spawn 前 `CreateJobObjectW` 建作业，spawn 后 `AssignProcessToJobObject` 把
       直接子进程放进去；子进程此后创建的进程自动继承作业成员资格。终止用 `TerminateJobObject`，
@@ -536,27 +539,59 @@
       作业里的残留进程一并终止）；**成功路径先清掉这个标志再关句柄**，与 Unix 一样不杀选择继续
       驻留的后继进程。错误路径不清这个标志（包括子进程已退出后才发现写入错误、直接返回的那条），
       句柄带着它关闭，残留进程随作业终止；清标志失败时也按同一方向收场（多杀，不漏杀）。
-      作业建不出来（spawn 之前）与子进程放不进去（spawn 之后，文案里的步骤名会比实际早一格）
-      都按现有 `Spawn` 报错，后者还要终止子进程 —— 票面要求不新增公开错误变体，但不降级成
-      「只杀直接子进程」却对外声称能兜住整棵树。两个 crate（`libc` / `windows-sys`）
+      作业建不出来（spawn 之前）按现有 `Spawn` 报错；子进程放不进去（spawn 之后，文案里的步骤名
+      会比实际早一格）先看它是不是已经退出（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）：
+      对已结束的进程 `AssignProcessToJobObject` 回 `ERROR_ACCESS_DENIED`（错误 5），那是「起来了又
+      很快退出」而不是启动失败 —— `try_wait` 见到 `Ok(Some(_))` 就继续走收集、按退出码/stderr 归因；
+      否则终止子进程并报 `Spawn`。判据只看 `try_wait`，**不要**改写成
+      `raw_os_error() == Some(5)`：错误 5 还有别的因由（作业时限、活动进程上限、安全限制、
+      作业正在终止等），按错误码分支会误伤。票面要求不新增公开错误变体，但不降级成「只杀直接子进程」
+      却对外声称能兜住整棵树。两个 crate（`libc` / `windows-sys`）
       本来就以传递依赖在 `Cargo.lock` 里（0.2.189 / 0.61.2），升为按 target 的直接依赖没有改动
       任何已锁版本。
     - **残余边界**：① Windows 的 `CreateProcess` 与 `AssignProcessToJobObject` 之间有窗口，
-      这段里创建的后继进程不在作业里；② 子进程自己 `setsid()` / 双重 fork 守护化（Unix）能逃出
-      进程组，Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
+      这段里创建的后继进程不在作业里；② Unix 上直接子进程**只要还是组长**就不能用 `setsid()`
+      逃出进程组 —— `process_group(0)` 先让它成为组长，`setsid()` 会以 `EPERM` 失败（对外部
+      签名器/请求器是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组 —— 票
+      [`#32`](https://github.com/sodahub-org/libresoda/issues/32) 的无条件补 `Child::kill()`
+      只覆盖「helper 留在原组」这个子形状（组杀照样「成功」，必须再单打直接子进程；WSL2 实测
+      直接子进程死、helper 死）。**先移组再 fork** 的反向形状不在本票覆盖内：helper 落进新组，
+      原组杀返回 `ESRCH`，补打只杀直接子进程，helper 仍活着并攥着管道 —— 等待仍有界（本票的
+      修复目标达成），但「终止整棵树」没达成，收场同残余边界 ③。要补父向枚举
+      （`/proc/<pid>/task/<tid>/children`），**目前还没有票覆盖这个形状**（补之前按 ③ 的收场处理）；
+      补的时候记住两条：它只在子进程还活着的终止路径（超时、非断管写错、`StdinUnavailable`）有效，
+      `run` 返回 `Ok` 后中间进程已退出的双重 fork 抓不到；它是 Unix 专有，Windows 仍靠作业。
+      另一条是直接子进程 fork 出的子进程
+      `setsid`（它继承原组、但已不是组长，`setsid` 会成功；经典的双重 fork 守护化是同一件事的
+      加强版）。两条路还能叠加：先 `setpgid` 挪走、自己不再是组长之后，同一个直接子进程调
+      `setsid()` 也会成功。
+      Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
       进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
       不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行；⑤ 既非 Unix 也非 Windows 的目标
       拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
-      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止，三条路径的收场
+      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止，各条路径的收场
       各不相同：`run` 返回 `Ok` 但请求没交全（断管、写线程超宽限、写线程没送结果）的走成功释放，
       两个平台都留下 helper（Windows 清标志失败时例外），上层报退出码/「没读请求」；`run` 返回
       `Ok` 且请求交全、但驻留 helper 攥着 stdout/stderr 的也走成功释放，宽限到点丢掉已收到的输出，
       上层报 requester 的「返回无法解析」或 signer 的 `sign response decode: {err}`；子进程已退出后
       才发现写入错误（非断管）的那条直接返回 `Err(Stdin)`、
       不调用 `release`，Unix 上 helper 留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它
-      带走，上层报 `stdin write: {err}`。三种情况都不当作超时；这里也不能补 `kill(-pid)` ——
-      `try_wait` 已经收尸，pid 可能已被复用。
+      带走，上层报 `stdin write: {err}`；还有一条入口不同、收场同第一种的：attach 失败而
+      `try_wait` 发现子进程已退出（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）
+      —— 不调 `terminate`，照普通成功路径走 `release`（Windows 一样清掉 `KILL_ON_JOB_CLOSE`；
+      stdin 按约定接管道，所以不会走 `StdinUnavailable` 那条），
+      spawn 与 attach 之间创建的后继进程留在外面（残余边界 ①）。这些情况都不当作超时；
+      这里也不能补 `kill(-pid)` —— `try_wait` 已经收尸，pid 可能已被复用。
+  - **`setsid` 不再是可用的 detach 手段（Unix，票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）**：
+    `process_group(0)` 已让直接子进程成为进程组组长，它自己再调用 `setsid()` 会收到 `EPERM`
+    （`Operation not permitted`）—— 相对 `#25` 之前是行为变化。依赖 `setsid()` 把自己脱离终端/
+    进程组的 launcher（外部签名器、请求器）会在这一步收到 `EPERM`：把它当致命错误的按退出码/
+    stderr 报出来（`signer exited with ...` / `requester exited with ...`）；忽略它继续跑的能工作，
+    但不再脱离原进程组。要 detach 就得 fork 出子进程、在
+    **子进程**里 `setsid()`（它那时不是组长），并关掉或重定向继承的 stdout/stderr，否则会撞上「线程收集
+    有宽限」那条。宿主被 Ctrl-C 中断时直接子进程也不会跟着收到 SIGINT（组信号只发给终端的
+    进程组，见残余边界 ④）。面向使用者的说明在 `docs/SIGNER-SERVICE.md` §2.2。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
     间隔从 `POLL_INTERVAL_START`（0.5 ms）起每拍翻倍，到 `POLL_INTERVAL_MAX`（10 ms）封顶，
     仍然每拍 `thread::sleep`，不是忙等。固定 10 ms 把「子进程退出」这件事量化到约半个间隔，而
@@ -634,7 +669,7 @@
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
     等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
-    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 八条 —— 非 0 退出、
+    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 九条 —— 非 0 退出、
     断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的三条：
     `sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的后台 helper 后驻留到超时 —— helper 活着的
     唯一证据就是写端没关，超时前写下的 stderr 标记能随 EOF 交回来就说明整棵树已终止（Unix 与
@@ -642,14 +677,24 @@
     另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。Unix 另有一条从 pid 文件用 `kill(pid, 0)`
     确认 helper 在超时返回后消失；第三条走成功路径 —— 子进程交完回包就退出，后台 helper 继承着
     stdout 在 2 s 后写标记，断言调用方回来时它仍活着（钉住 `release`：Windows 上清标志失败会让
-    `Job::drop` 把它带走，这条用例会红）。
-    `src/soda/child.rs` 三条单元用例 —— 钉 8 MiB 收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列
-    0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍的宽限仍与 `#23` 一致）。
+    `Job::drop` 把它带走，这条用例会红）。票 #32 再加一条（Unix）：python3 直接子进程先 fork 一个
+    留在原组的 helper，再 `setpgid` 把自己挪进测试进程的组 —— 组杀只打到 helper 却照样返回 0；
+    修复前 `terminate()` 的 `wait()` 会一直等到它自然退出（6 s 看门狗把无界等待变成失败），修复后
+    正常报超时，并从 pid 文件用 `kill(pid, 0)` 确认直接子进程已消失。`python3` 是这条用例额外要的
+    解释器（`sh` 没有 `setpgid` 内建），只在 Unix 上跑。
+    `src/soda/child.rs` 七条单元用例（其中一条只在 Windows 上编译）—— 钉 8 MiB 收集上限（超出字节
+    读走但丢弃）、钉票 #28 的退避序列 0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍
+    的宽限仍与 `#23` 一致），以及票 #32 的四条 attach 收场：已退出的子进程不算 `Spawn` 失败、还活着的
+    子进程 attach 失败必须报 `Spawn`（并断言已终止收尸）、`run` 端到端在 attach 失败且子进程活着时
+    必须报 `Spawn`（钉调用点：吞掉返回值会走到 `StdinUnavailable`），Windows 上再真调一次
+    `AssignProcessToJobObject`（对已退出的进程）钉住「确实回错误 5、且收场为非致命」—— 竞态窗口
+    没法稳定构造，钉的是窗口的结果；判定与终止一起放在 `attach_or_abort`，用例直接喂 attach 结果，
+    不伪造 Win32 调用。
     全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s，
-    驻留用例用 5 s 看门狗；计时用例都把调用
-    放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–5 s 内失败而不是挂住，不拖慢
+    驻留用例用 5 s 看门狗、移组用例用 6 s；计时用例都把调用
+    放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–6 s 内失败而不是挂住，不拖慢
     `cargo test`。排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；
-    进程树由上面三条专项用例覆盖。Windows 侧另有非必需 CI job
+    进程树由上面四条专项用例覆盖。Windows 侧另有非必需 CI job
     `windows / clippy, test`（`windows-latest`；fmt 只在 Ubuntu 跑，rustfmt 输出不分平台），
     Job Object 代码因此至少被编译并由上述用例执行到；它不动必需检查的名字
     （`fmt / clippy / test`），是否必需由分支保护配置决定，本仓无法从代码侧验证。
