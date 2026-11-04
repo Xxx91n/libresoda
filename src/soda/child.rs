@@ -238,18 +238,19 @@ mod tree {
         Ok(())
     }
 
-    /// 对整组发 SIGKILL；直接子进程由调用方 `wait` 收尸。
+    /// 对整组发 SIGKILL，再单独打直接子进程一次；直接子进程由调用方 `wait` 收尸。
     pub(super) fn kill(_job: &Job, child: &mut Child) {
-        let Ok(pid) = libc::pid_t::try_from(child.id()) else {
-            let _ = child.kill();
-            return;
-        };
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。负 pid 表示整个进程组，
-        // 组号就是 spawn 时 `process_group(0)` 让子进程自领的 pid。
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-            // 组已消失或信号没发出去：退回只打直接子进程，免得 `wait` 等一个还活着的子进程。
-            let _ = child.kill();
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。负 pid 表示整个进程组，
+            // 组号就是 spawn 时 `process_group(0)` 让子进程自领的 pid。
+            //
+            // 返回 0 只说明「组里至少有一个进程收到了信号」，不等于直接子进程已死：
+            // 它可以 `setpgid` 挪去别的组、留一个 helper 在原组，组杀照样报成功。所以
+            // 不能拿返回值当「直接子进程已死」，总是再单独打它一次，`wait` 才不会等一个
+            // 还活着的子进程。此刻还没有任何调用方 `wait` 过，pid 不会被回收后指到别人身上。
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
+        let _ = child.kill();
     }
 
     /// 成功路径没有容器要拆：进程组随成员退出自然消失，不打信号就什么也不做。
