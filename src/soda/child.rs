@@ -463,9 +463,9 @@ mod tests {
         );
     }
 
-    /// 起一个探针子进程；脚本写法按平台分（Windows 上没有 `sh`）。
+    /// 按平台拼一个探针 `Command`；脚本写法分平台（Windows 上没有 `sh`）。
     #[cfg(any(unix, windows))]
-    fn probe_child(script: &str) -> Child {
+    fn probe_command(script: &str) -> Command {
         #[cfg(unix)]
         let mut command = {
             let mut command = Command::new("sh");
@@ -481,9 +481,23 @@ mod tests {
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("探针应能启动")
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[cfg(any(unix, windows))]
+    fn probe_child(script: &str) -> Child {
+        probe_command(script).spawn().expect("探针应能启动")
+    }
+
+    /// 等到子进程退出：用 `try_wait` 收尸，与 `run` 的判断走同一入口。
+    #[cfg(any(unix, windows))]
+    fn wait_until_exited(child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait 应成功").is_none() {
+            assert!(Instant::now() < deadline, "退出探针没有在期限内退出");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// 票 #32：attach 失败时子进程已退出 → 不按 `Spawn` 处理。
@@ -495,11 +509,7 @@ mod tests {
     #[test]
     fn attach_failure_after_exit_is_not_fatal() {
         let mut child = probe_child("exit 0");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while child.try_wait().expect("try_wait 应成功").is_none() {
-            assert!(Instant::now() < deadline, "退出探针没有在期限内退出");
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_exited(&mut child);
         assert!(
             !attach_failure_is_fatal(&mut child),
             "已退出的子进程不该被当成 spawn 失败"
@@ -532,15 +542,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_attach_on_exited_child_is_denied_but_not_fatal() {
-        let mut command = Command::new("cmd");
-        command.args(["/c", "exit 0"]);
+        let mut command = probe_command("exit 0");
         let job = super::tree::prepare(&mut command).expect("作业应能建出来");
         let mut child = command.spawn().expect("探针应能启动");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while child.try_wait().expect("try_wait 应成功").is_none() {
-            assert!(Instant::now() < deadline, "退出探针没有在期限内退出");
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_exited(&mut child);
         let err = super::tree::attach(&job, &child).expect_err("对已退出的进程 attach 应失败");
         assert_eq!(err.raw_os_error(), Some(5), "ERROR_ACCESS_DENIED: {err}");
         assert!(
