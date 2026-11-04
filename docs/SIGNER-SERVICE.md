@@ -120,6 +120,14 @@ stdout/stderr**：库只在管道 EOF（或读错误）时才交回输出，help
 Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户可见的代价 —— 宿主被中断时它不会
 跟着收到 SIGINT，需要调用方自己收尾。
 
+同一件事的另一面（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）：库在 spawn
+时已经让直接子进程成为进程组组长，**launcher 自己调用 `setsid()` 会收到 `EPERM`**
+（`Operation not permitted`）—— 相对票 #25 之前是行为变化。用 `setsid()` 做 detach 的签名器
+（以及同样走这条执行器的请求器 launcher）会在启动阶段失败，按退出码/stderr 报出来
+（`signer exited with ...` / `requester exited with ...`），拿不到签名。要 detach 就 fork 出
+子进程、在**子进程**里 `setsid()`（它那时不是组长），并让它关掉或重定向继承的 stdout/stderr，
+否则会撞上下面的 1 s 宽限。
+
 ## 3. libresoda 侧用法
 
 ```rust
