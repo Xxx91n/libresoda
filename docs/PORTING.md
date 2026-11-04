@@ -548,12 +548,13 @@
       本来就以传递依赖在 `Cargo.lock` 里（0.2.189 / 0.61.2），升为按 target 的直接依赖没有改动
       任何已锁版本。
     - **残余边界**：① Windows 的 `CreateProcess` 与 `AssignProcessToJobObject` 之间有窗口，
-      这段里创建的后继进程不在作业里；② Unix 上直接子进程**不能**用 `setsid()` 逃出进程组 ——
-      `process_group(0)` 已经让它成为组长，`setsid()` 会以 `EPERM` 失败（对外部签名器/请求器
-      是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组（留一个 helper 在原组，
-      组杀照样「成功」；票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32) 用无条件补
-      `Child::kill()` 收掉），或由直接子进程 fork 出的子进程 `setsid`（它继承原组、但已不是组长，
-      `setsid` 会成功；经典的双重 fork 守护化是同一件事的加强版）。
+      这段里创建的后继进程不在作业里；② Unix 上直接子进程**只要还是组长**就不能用 `setsid()`
+      逃出进程组 —— `process_group(0)` 先让它成为组长，`setsid()` 会以 `EPERM` 失败（对外部
+      签名器/请求器是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组（留一个
+      helper 在原组，组杀照样「成功」；票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)
+      用无条件补 `Child::kill()` 收掉），或由直接子进程 fork 出的子进程 `setsid`（它继承原组、
+      但已不是组长，`setsid` 会成功；经典的双重 fork 守护化是同一件事的加强版）。两条路还能叠加：
+      先 `setpgid` 挪走、自己不再是组长之后，同一个直接子进程调 `setsid()` 也会成功。
       Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
       进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
@@ -578,7 +579,7 @@
     进程组的 launcher（外部签名器、请求器）会在这一步收到 `EPERM`：把它当致命错误的按退出码/
     stderr 报出来（`signer exited with ...` / `requester exited with ...`）；忽略它继续跑的能工作，
     但不再脱离原进程组。要 detach 就得 fork 出子进程、在
-    **子进程**里 `setsid()`（它那时不是组长），并重定向继承的 stdout/stderr，否则会撞上「线程收集
+    **子进程**里 `setsid()`（它那时不是组长），并关掉或重定向继承的 stdout/stderr，否则会撞上「线程收集
     有宽限」那条。宿主被 Ctrl-C 中断时直接子进程也不会跟着收到 SIGINT（组信号只发给终端的
     进程组，见残余边界 ④）。面向使用者的说明在 `docs/SIGNER-SERVICE.md` §2.2。
   - **轮询退避（票 [`#28`](https://github.com/sodahub-org/libresoda/issues/28)）**：`try_wait` 的
