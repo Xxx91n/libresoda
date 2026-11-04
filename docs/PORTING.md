@@ -558,20 +558,24 @@
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
       不再收到终端的 Ctrl-C 组信号，子进程会变成孤儿继续运行；⑤ 既非 Unix 也非 Windows 的目标
       拿不到进程组/作业，只有 `#[cfg(not(any(unix, windows)))]` 的降级实现（只终止直接子进程），
-      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止，三条路径的收场
+      进程树保证只在这两个平台上成立；⑥ 子进程已经退出后，容器不再按组终止，各条路径的收场
       各不相同：`run` 返回 `Ok` 但请求没交全（断管、写线程超宽限、写线程没送结果）的走成功释放，
       两个平台都留下 helper（Windows 清标志失败时例外），上层报退出码/「没读请求」；`run` 返回
       `Ok` 且请求交全、但驻留 helper 攥着 stdout/stderr 的也走成功释放，宽限到点丢掉已收到的输出，
       上层报 requester 的「返回无法解析」或 signer 的 `sign response decode: {err}`；子进程已退出后
       才发现写入错误（非断管）的那条直接返回 `Err(Stdin)`、
       不调用 `release`，Unix 上 helper 留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它
-      带走，上层报 `stdin write: {err}`。三种情况都不当作超时；这里也不能补 `kill(-pid)` ——
-      `try_wait` 已经收尸，pid 可能已被复用。
+      带走，上层报 `stdin write: {err}`；还有一条入口不同、收场同第一种的：attach 失败而
+      `try_wait` 发现子进程已退出（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）
+      —— 不调 `terminate`，照普通成功路径走 `release`（Windows 一样清掉 `KILL_ON_JOB_CLOSE`），
+      spawn 与 attach 之间创建的后继进程留在外面（残余边界 ①）。这些情况都不当作超时；
+      这里也不能补 `kill(-pid)` —— `try_wait` 已经收尸，pid 可能已被复用。
   - **`setsid` 不再是可用的 detach 手段（Unix，票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）**：
     `process_group(0)` 已让直接子进程成为进程组组长，它自己再调用 `setsid()` 会收到 `EPERM`
     （`Operation not permitted`）—— 相对 `#25` 之前是行为变化。依赖 `setsid()` 把自己脱离终端/
-    进程组的 launcher（外部签名器、请求器）会在启动阶段失败，按退出码/stderr 报出来
-    （`signer exited with ...` / `requester exited with ...`）。要 detach 就得 fork 出子进程、在
+    进程组的 launcher（外部签名器、请求器）会在这一步收到 `EPERM`：把它当致命错误的按退出码/
+    stderr 报出来（`signer exited with ...` / `requester exited with ...`）；忽略它继续跑的能工作，
+    但不再脱离原进程组。要 detach 就得 fork 出子进程、在
     **子进程**里 `setsid()`（它那时不是组长），并重定向继承的 stdout/stderr，否则会撞上「线程收集
     有宽限」那条。宿主被 Ctrl-C 中断时直接子进程也不会跟着收到 SIGINT（组信号只发给终端的
     进程组，见残余边界 ④）。面向使用者的说明在 `docs/SIGNER-SERVICE.md` §2.2。
