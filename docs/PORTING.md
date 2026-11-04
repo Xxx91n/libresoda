@@ -552,7 +552,8 @@
       `process_group(0)` 已经让它成为组长，`setsid()` 会以 `EPERM` 失败（对外部签名器/请求器
       是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组（留一个 helper 在原组，
       组杀照样「成功」；票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32) 用无条件补
-      `Child::kill()` 收掉），或双重 fork 后由**孙进程** `setsid`（那时它不在原组里、也不再是组长）；
+      `Child::kill()` 收掉），或由直接子进程 fork 出的子进程 `setsid`（它继承原组、但已不是组长，
+      `setsid` 会成功；经典的双重 fork 守护化是同一件事的加强版）。
       Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
       进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
@@ -567,7 +568,8 @@
       不调用 `release`，Unix 上 helper 留下，Windows 上句柄带着 `KILL_ON_JOB_CLOSE` 关闭会把它
       带走，上层报 `stdin write: {err}`；还有一条入口不同、收场同第一种的：attach 失败而
       `try_wait` 发现子进程已退出（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）
-      —— 不调 `terminate`，照普通成功路径走 `release`（Windows 一样清掉 `KILL_ON_JOB_CLOSE`），
+      —— 不调 `terminate`，照普通成功路径走 `release`（Windows 一样清掉 `KILL_ON_JOB_CLOSE`；
+      stdin 按约定接管道，所以不会走 `StdinUnavailable` 那条），
       spawn 与 attach 之间创建的后继进程留在外面（残余边界 ①）。这些情况都不当作超时；
       这里也不能补 `kill(-pid)` —— `try_wait` 已经收尸，pid 可能已被复用。
   - **`setsid` 不再是可用的 detach 手段（Unix，票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）**：
