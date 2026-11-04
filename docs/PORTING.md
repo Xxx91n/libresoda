@@ -543,18 +543,25 @@
       会比实际早一格）先看它是不是已经退出（票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)）：
       对已结束的进程 `AssignProcessToJobObject` 回 `ERROR_ACCESS_DENIED`（错误 5），那是「起来了又
       很快退出」而不是启动失败 —— `try_wait` 见到 `Ok(Some(_))` 就继续走收集、按退出码/stderr 归因；
-      否则终止子进程并报 `Spawn`。票面要求不新增公开错误变体，但不降级成「只杀直接子进程」
+      否则终止子进程并报 `Spawn`。判据只看 `try_wait`，**不要**改写成
+      `raw_os_error() == Some(5)`：错误 5 还有别的因由（MSDN 只记了「已在别的作业里」这类），
+      按错误码分支会误伤。票面要求不新增公开错误变体，但不降级成「只杀直接子进程」
       却对外声称能兜住整棵树。两个 crate（`libc` / `windows-sys`）
       本来就以传递依赖在 `Cargo.lock` 里（0.2.189 / 0.61.2），升为按 target 的直接依赖没有改动
       任何已锁版本。
     - **残余边界**：① Windows 的 `CreateProcess` 与 `AssignProcessToJobObject` 之间有窗口，
       这段里创建的后继进程不在作业里；② Unix 上直接子进程**只要还是组长**就不能用 `setsid()`
       逃出进程组 —— `process_group(0)` 先让它成为组长，`setsid()` 会以 `EPERM` 失败（对外部
-      签名器/请求器是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组（留一个
-      helper 在原组，组杀照样「成功」；票 [`#32`](https://github.com/sodahub-org/libresoda/issues/32)
-      用无条件补 `Child::kill()` 收掉），或由直接子进程 fork 出的子进程 `setsid`（它继承原组、
-      但已不是组长，`setsid` 会成功；经典的双重 fork 守护化是同一件事的加强版）。两条路还能叠加：
-      先 `setpgid` 挪走、自己不再是组长之后，同一个直接子进程调 `setsid()` 也会成功。
+      签名器/请求器是行为变化，见下一条）。能逃的是：直接子进程 `setpgid` 到别的组 —— 票
+      [`#32`](https://github.com/sodahub-org/libresoda/issues/32) 的无条件补 `Child::kill()`
+      只覆盖「helper 留在原组」这个子形状（组杀照样「成功」，必须再单打直接子进程；WSL2 实测
+      直接子进程死、helper 死）。**先移组再 fork** 的反向形状不在本票覆盖内：helper 落进新组，
+      原组杀返回 `ESRCH`，补打只杀直接子进程，helper 仍活着并攥着管道 —— 等待仍有界（本票的
+      修复目标达成），但「终止整棵树」没达成，收场同残余边界 ③，要补父向枚举
+      （`/proc/<pid>/task/<tid>/children`）另开票。另一条是直接子进程 fork 出的子进程
+      `setsid`（它继承原组、但已不是组长，`setsid` 会成功；经典的双重 fork 守护化是同一件事的
+      加强版）。两条路还能叠加：先 `setpgid` 挪走、自己不再是组长之后，同一个直接子进程调
+      `setsid()` 也会成功。
       Windows 侧本实现没开 `BREAKAWAY_OK`，默认不允许从作业里 breakaway；③ 逃出容器的
       进程仍可能攥着管道，此时读线程走满 1 s 宽限、stderr 可能缺失（见「线程收集有宽限」）；
       ④ 宿主进程被直接杀死时只有 Windows 有内核兜底（`KILL_ON_JOB_CLOSE`）；Unix 上新进程组
