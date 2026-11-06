@@ -71,19 +71,32 @@ pub(crate) fn run(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> Result<ChildOutput, ChildError> {
-    run_with_attach(command, payload, timeout_ms, tree::attach)
+    run_with(command, payload, timeout_ms, tree::attach, write_stdin)
 }
 
-/// `run` 的本体。`attach` 作为参数传入，用例才能稳定造出 attach 失败来钉**调用点**
-/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）；生产路径永远传 `tree::attach`。
-fn run_with_attach<A>(
+/// 把载荷写进子进程 stdin 的生产实现。
+///
+/// 作为参数传给 `run_with`，用例才能注入一个**非断管**的写入错误（票 #29）：真实管道在
+/// 上游只会回 `EPIPE`（`SIGPIPE` 被忽略时映射成 `BrokenPipe`），这条分支到达不了。
+fn write_stdin(stdin: &mut std::process::ChildStdin, payload: Vec<u8>) -> io::Result<()> {
+    stdin.write_all(&payload)
+}
+
+/// `run` 的本体：attach 与 stdin 写入都可注入。
+///
+/// 两者都只服务分类边界上的用例 —— attach 失败、非断管写入错误；生产路径永远传
+/// `tree::attach` 与 `write_stdin`。attach 要能注入，用例才能稳定造出失败来钉**调用点**
+/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）。
+fn run_with<A, W>(
     command: &mut Command,
     payload: Vec<u8>,
     timeout_ms: u64,
     attach: A,
+    write: W,
 ) -> Result<ChildOutput, ChildError>
 where
     A: FnOnce(&tree::Job, &Child) -> io::Result<()>,
+    W: FnOnce(&mut std::process::ChildStdin, Vec<u8>) -> io::Result<()> + Send + 'static,
 {
     // 先把容器准备好，再 spawn：Unix 是进程组（spawn 时生效），Windows 是作业句柄。
     // 容器建不出来就不跑 —— 宁可不启动，也不假装能兜住整棵树。
@@ -105,7 +118,7 @@ where
     let (write_tx, write_rx) = mpsc::channel();
     thread::spawn(move || {
         // None = 写完；Some(err) = 写到一半失败。断管是预期内的一种。
-        let result = stdin.write_all(&payload).err();
+        let result = write(&mut stdin, payload).err();
         // 写端必须在这里关掉：子进程靠 EOF 判断「请求读完了」。
         drop(stdin);
         let _ = write_tx.send(result);
@@ -516,6 +529,16 @@ mod tests {
         quiet(command)
     }
 
+    /// 按生产路径给三个流接管道：`run_with` 要能取到 stdin/stdout/stderr。
+    #[cfg(any(unix, windows))]
+    fn piped(mut command: Command) -> Command {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
     /// 探针不碰终端：stdio 全空。
     #[cfg(any(unix, windows))]
     fn quiet(mut command: Command) -> Command {
@@ -596,9 +619,13 @@ mod tests {
     #[test]
     fn run_reports_spawn_when_attach_fails_and_child_is_alive() {
         let mut command = quiet(live_command());
-        let error = super::run_with_attach(&mut command, Vec::new(), 5_000, |_, _| {
-            Err(io::Error::from_raw_os_error(5))
-        })
+        let error = super::run_with(
+            &mut command,
+            Vec::new(),
+            5_000,
+            |_, _| Err(io::Error::from_raw_os_error(5)),
+            super::write_stdin,
+        )
         // `ChildOutput` 没有 `Debug`，不能用 `expect_err`（它要打印 Ok 值）。
         .err()
         .expect("attach 失败且子进程还活着必须报错");
@@ -606,6 +633,116 @@ mod tests {
             matches!(error, ChildError::Spawn(ref err) if err.raw_os_error() == Some(5)),
             "应报 Spawn（错误 5）"
         );
+    }
+
+    /// 票 #29：非断管写入错误的分类与收尸。
+    ///
+    /// 真实管道到不了这条分支：读端关闭时 `write` 只回 `EPIPE`（`SIGPIPE` 已忽略时是
+    /// `BrokenPipe`），所以用 `run_with` 的写入参数注入一个别的错误。断言分类是 `Stdin`
+    /// （上层据此翻成 `signer|requester stdin write: {err}`），并且原始错误原样带上去。
+    /// 本用例只钉分类与原始错误；收尸不在这里断言 —— `run_with` 在返回前调用共享的
+    /// `terminate`，终止与回收由 `attach_or_abort_kills_live_child_and_reports` 和进程树
+    /// 用例覆盖（注入的写入错误会在观察到的下一拍立即返回，不等待子进程自然退出）。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn run_reports_non_broken_pipe_write_error_as_stdin() {
+        let mut command = piped(live_command());
+        let error = super::run_with(
+            &mut command,
+            vec![b'x'; 8],
+            5_000,
+            super::tree::attach,
+            |_, _| Err(io::Error::other("injected write failure")),
+        )
+        .err()
+        .expect("非断管写入错误必须报 Err(Stdin)");
+        match error {
+            ChildError::Stdin(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+                assert!(
+                    err.to_string().contains("injected write failure"),
+                    "原始错误要原样向上：{err}"
+                );
+            }
+            _ => panic!("非断管写入错误必须归到 Stdin，而不是其它分类"),
+        }
+    }
+
+    /// 票 #29 / #23：非断管写入错误在返回前必须终止并回收子进程。
+    ///
+    /// 上一条只钉分类；这条让注入的写入错误等探针写出自己的 pid 后再返回，随后用
+    /// `kill(pid, 0)` 确认它已经消失 —— 把「早退路径漏收尸」钉在调用点上。只在 Unix 上跑：
+    /// `kill(pid, 0)` 是 Unix 语义；Windows 的 Job Object 终止由进程树用例覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn run_reaps_child_when_stdin_write_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid_file = std::env::temp_dir().join(format!(
+            "libresoda-child-stdin-{}-{}.pid",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]);
+        let mut command = piped(command);
+
+        // 写线程等到探针把 pid 落盘再注入错误：避免「错误先到、shell 还没启动」时
+        // 用例拿到一个根本不存在的 pid。
+        let seen = pid_file.clone();
+        let error = super::run_with(
+            &mut command,
+            Vec::new(),
+            5_000,
+            super::tree::attach,
+            move |_, _| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if std::fs::read_to_string(&seen).is_ok_and(|text| text.ends_with('\n')) {
+                        return Err(io::Error::other("injected write failure"));
+                    }
+                    // 不在写线程里 panic：那条路径不会把消息交回调用方。超时也按写入错误
+                    // 返回，由下面的文案断言把「探针没写出 pid」和真正的注入错误分开。
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("probe did not write pid"));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .err()
+        .expect("非断管写入错误必须报 Err(Stdin)");
+        match error {
+            ChildError::Stdin(err) => assert!(
+                err.to_string().contains("injected write failure"),
+                "注入的写入错误应原样向上：{err}"
+            ),
+            _ => panic!("非断管写入错误必须归到 Stdin，而不是其它分类"),
+        }
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("探针应把 pid 写出来")
+            .trim()
+            .parse()
+            .expect("pid 应是整数");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "写入错误返回后子进程 {pid} 仍然存活（早退路径漏了收尸）"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// 票 #32 的前提与判据一起钉住（Windows）：对已退出的进程 `AssignProcessToJobObject`
