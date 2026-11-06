@@ -639,7 +639,8 @@ mod tests {
     /// 分类到文案的边界，避免冻结文案被改写却没人发现。
     #[test]
     fn stdin_write_error_keeps_the_frozen_text() {
-        let provider = CommandSignature::new("signer");
+        // program 不参与文案；用中性名字避免把前缀误读成来自 program。
+        let provider = CommandSignature::new("unused");
         let error = provider.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "signer stdin write: boom");
     }

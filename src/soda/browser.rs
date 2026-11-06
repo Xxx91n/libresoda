@@ -244,7 +244,8 @@ mod tests {
     /// 边界；`ChildError::Stdin` 的产生侧由 `child.rs` 的同名用例钉住。
     #[test]
     fn stdin_write_error_keeps_the_frozen_text() {
-        let requester = CommandRequester::new("requester");
+        // program 不参与文案；用中性名字避免把前缀误读成来自 program。
+        let requester = CommandRequester::new("unused");
         let error = requester.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "requester stdin write: boom");
     }

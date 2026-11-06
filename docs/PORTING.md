@@ -673,7 +673,9 @@
     128 KiB 合法回包的成功路径（`command_signature_drains_large_response`，证明 stdout 被并发
     排空：没有读线程时子进程写满约 64 KiB 就阻塞，只能等到超时）。探针标记放在大块输出之前、
     驻留改用 `sleep`：慢机/抢核下不再因为「256 KiB 还没写完」而在时限前没打标记，也不再占满
-    一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。
+    一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。旧用例在同一条里同时压住
+    2 MiB 写入与 256 KiB stdout；现在拆成「写入阻塞」（2 MiB + 不读 stdin 的超时用例）与
+    「stdout 排空」（128 KiB 成功用例）两个方向，各自有证据。
     `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、超时（2 s，同样标记先行 + `exec sleep`）、
     128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
     后台 helper 后驻留到超时 —— helper 活着的唯一证据就是写端没关，探针写下的 stderr 标记能随
@@ -699,11 +701,12 @@
     全部离线，超时用例时限 200 ms–3 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s / 10 s，
     驻留用例用 5 s 看门狗、移组用例用 8 s；计时用例都把调用放进带 `recv_timeout` 的线程里，
     库一旦退回无限等待就是 3–8 s 内失败而不是挂住，不拖慢 `cargo test`。票 #29 把两条进程树
-    用例的时限从 500 ms / 1 s 放宽到 2 s，并给 pid 文件读取加了 2 s 有界重试：启动 `sh`、fork
-    helper、写 pid/标记原先都要挤在半秒里，抢核时会先超时、失败原因变成「标记/pid 没写出来」。
-    超时探针只用 shell 内建、不 fork 子进程，测的是写入/等待与直接子进程的关系；成功路径的
-    排空用例用 `cat` 读干净 stdin（它在回包前退出，不参与排空断言）。进程树由上面四条专项
-    用例覆盖。
+    用例的时限从 500 ms / 1 s / 1.5 s 放宽到 2 s / 2 s / 3 s，并给 pid 文件读取加了 2 s 有界
+    重试：启动 `sh`/python、fork helper、写 pid/标记原先都要挤在 1.5 s 内，抢核时会先超时、
+    失败原因变成「标记/pid 没写出来」。`RESIDENT_PROBE_SCRIPT` 只用 shell 内建、不 fork 子进程，
+    测的是写入/等待与直接子进程的关系；进程树探针里的 `sleep 30 &` 正是被测的 helper（fork 是
+    它的语义），成功路径的排空用例用 `cat` 读干净 stdin（它在回包前退出，不参与排空断言）。
+    进程树由上面四条专项用例覆盖。
   - **`signer stdin write: {err}` 的可测边界（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29)）**：
     真实管道到不了这个分类 —— 读端关闭时 `write` 只回 `EPIPE`（Rust 默认忽略 SIGPIPE，映射成
     `ErrorKind::BrokenPipe`，走「断管归因给退出码/stderr」那条），其它非断管写入错误没有稳定、
