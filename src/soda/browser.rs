@@ -235,3 +235,17 @@ impl BrowserRequester for CommandRequester {
         "command-requester"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 票 #29：请求器侧的同一文案。真实管道同样到不了非断管写入错误，这里钉分类到文案的
+    /// 边界；`ChildError::Stdin` 的产生侧由 `child.rs` 的同名用例钉住。
+    #[test]
+    fn stdin_write_error_keeps_the_frozen_text() {
+        let requester = CommandRequester::new("requester");
+        let error = requester.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
+        assert_eq!(error.to_string(), "requester stdin write: boom");
+    }
+}

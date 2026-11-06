@@ -667,34 +667,50 @@
   - **SIGPIPE 前提**：`write_all` 断管返回 `Err(BrokenPipe)` 而不是把进程打死，前提是宿主忽略了
     SIGPIPE（Rust runtime 默认 `SIG_IGN`）。本仓的 Rust 消费方恒成立；库内不改信号处理。
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
-  - **测试**：`tests/signature_tests.rs` 两条 —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与
-    等待侧同时到点）、2 MiB 载荷 + 直接子进程写固定 256 KiB stdout 后再打 stderr 标记（写入与排空
-    两个方向同时压住，只有排空 stdout 才走得到标记）；`tests/browser_tests.rs` 九条 —— 非 0 退出、
-    断管归因、超时、排空（128 KiB 回包完整解析 + 256 KiB 输出超时后带回标记），以及票 #25 的三条：
-    `sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的后台 helper 后驻留到超时 —— helper 活着的
-    唯一证据就是写端没关，超时前写下的 stderr 标记能随 EOF 交回来就说明整棵树已终止（Unix 与
-    Windows 同一份用例；Windows 侧「helper 已死」由这条 EOF 推出：写端持有者必须全部消失，没有
-    另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。Unix 另有一条从 pid 文件用 `kill(pid, 0)`
-    确认 helper 在超时返回后消失；第三条走成功路径 —— 子进程交完回包就退出，后台 helper 继承着
-    stdout 在 2 s 后写标记，断言调用方回来时它仍活着（钉住 `release`：Windows 上清标志失败会让
-    `Job::drop` 把它带走，这条用例会红）。票 #32 再加一条（Unix）：python3 直接子进程先 fork 一个
-    留在原组的 helper，再 `setpgid` 把自己挪进测试进程的组 —— 组杀只打到 helper 却照样返回 0；
-    修复前 `terminate()` 的 `wait()` 会一直等到它自然退出（6 s 看门狗把无界等待变成失败），修复后
-    正常报超时，并从 pid 文件用 `kill(pid, 0)` 确认直接子进程已消失。`python3` 是这条用例额外要的
-    解释器（`sh` 没有 `setpgid` 内建），只在 Unix 上跑。
-    `src/soda/child.rs` 七条单元用例（其中一条只在 Windows 上编译）—— 钉 8 MiB 收集上限（超出字节
+  - **测试（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29) 收口余量与忙等）**：
+    `tests/signature_tests.rs` —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与等待侧同时到点，
+    200 ms）；2 MiB 载荷 + 探针先打 stderr 标记再 `exec sleep 30`（1 s，超时错误要带回标记）；
+    128 KiB 合法回包的成功路径（`command_signature_drains_large_response`，证明 stdout 被并发
+    排空：没有读线程时子进程写满约 64 KiB 就阻塞，只能等到超时）。探针标记放在大块输出之前、
+    驻留改用 `sleep`：慢机/抢核下不再因为「256 KiB 还没写完」而在时限前没打标记，也不再占满
+    一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。
+    `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、超时（1 s，同样标记先行 + `exec sleep`）、
+    128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
+    后台 helper 后驻留到超时 —— helper 活着的唯一证据就是写端没关，探针写下的 stderr 标记能随
+    EOF 交回来就说明整棵树已终止（Unix 与 Windows 同一份用例；Windows 侧「helper 已死」由这条
+    EOF 推出：写端持有者必须全部消失，没有另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。
+    Unix 另有一条从 pid 文件用 `kill(pid, 0)` 确认 helper 在超时返回后消失；第三条走成功路径 ——
+    子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记，断言调用方回来时它仍活着
+    （钉住 `release`：Windows 上清标志失败会让 `Job::drop` 把它带走，这条用例会红）。票 #32 再加
+    一条（Unix）：python3 直接子进程先 fork 一个留在原组的 helper，再 `setpgid` 把自己挪进测试
+    进程的组 —— 组杀只打到 helper 却照样返回 0；修复前 `terminate()` 的 `wait()` 会一直等到它
+    自然退出（8 s 看门狗把无界等待变成失败），修复后正常报超时，并从 pid 文件用 `kill(pid, 0)`
+    确认直接子进程已消失。`python3` 是这条用例额外要的解释器（`sh` 没有 `setpgid` 内建），只在
+    Unix 上跑。
+    `src/soda/child.rs` 八条单元用例（其中一条只在 Windows 上编译）—— 钉 8 MiB 收集上限（超出字节
     读走但丢弃）、钉票 #28 的退避序列 0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍
-    的宽限仍与 `#23` 一致），以及票 #32 的四条 attach 收场：已退出的子进程不算 `Spawn` 失败、还活着的
-    子进程 attach 失败必须报 `Spawn`（并断言已终止收尸）、`run` 端到端在 attach 失败且子进程活着时
-    必须报 `Spawn`（钉调用点：吞掉返回值会走到 `StdinUnavailable`），Windows 上再真调一次
-    `AssignProcessToJobObject`（对已退出的进程）钉住「确实回错误 5、且收场为非致命」—— 竞态窗口
-    没法稳定构造，钉的是窗口的结果；判定与终止一起放在 `attach_or_abort`，用例直接喂 attach 结果，
-    不伪造 Win32 调用。
-    全部离线，超时用例时限 200 ms–2 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s，
-    驻留用例用 5 s 看门狗、移组用例用 6 s；计时用例都把调用
-    放进带 `recv_timeout` 的线程里，库一旦退回无限等待就是 3–6 s 内失败而不是挂住，不拖慢
-    `cargo test`。排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；
-    进程树由上面四条专项用例覆盖。Windows 侧另有非必需 CI job
+    的宽限仍与 `#23` 一致）、票 #29 注入一个非断管写入错误钉 `ChildError::Stdin`，以及票 #32 的四条
+    attach 收场：已退出的子进程不算 `Spawn` 失败、还活着的子进程 attach 失败必须报 `Spawn`（并断言
+    已终止收尸）、`run` 端到端在 attach 失败且子进程活着时必须报 `Spawn`（钉调用点：吞掉返回值会
+    走到 `StdinUnavailable`），Windows 上再真调一次 `AssignProcessToJobObject`（对已退出的进程）
+    钉住「确实回错误 5、且收场为非致命」—— 竞态窗口没法稳定构造，钉的是窗口的结果；判定与终止
+    一起放在 `attach_or_abort`，用例直接喂 attach 结果，不伪造 Win32 调用。
+    全部离线，超时用例时限 200 ms–3 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s / 10 s，
+    驻留用例用 4–5 s 看门狗、移组用例用 8 s；计时用例都把调用放进带 `recv_timeout` 的线程里，
+    库一旦退回无限等待就是 3–8 s 内失败而不是挂住，不拖慢 `cargo test`。票 #29 把两条进程树
+    用例的时限从 500 ms / 1 s 放宽到 2 s，并给 pid 文件读取加了 2 s 有界重试：启动 `sh`、fork
+    helper、写 pid/标记原先都要挤在半秒里，抢核时会先超时、失败原因变成「标记/pid 没写出来」。
+    排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；进程树由上面
+    四条专项用例覆盖。
+  - **`signer stdin write: {err}` 的可测边界（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29)）**：
+    真实管道到不了这个分类 —— 读端关闭时 `write` 只回 `EPIPE`（Rust 默认忽略 SIGPIPE，映射成
+    `ErrorKind::BrokenPipe`，走「断管归因给退出码/stderr」那条），其它非断管写入错误没有稳定、
+    跨平台的构造办法。因此用两层 seam 钉住：(1) `child::run_with` 的写入参数由用例注入
+    `io::Error::other("injected write failure")`，断言分类为 `ChildError::Stdin` 且原始错误原样
+    向上（`run_reports_non_broken_pipe_write_error_as_stdin`）；(2) `signature` / `browser` 各一条
+    单元用例直接喂 `ChildError::Stdin`，断言冻结文案 `signer|requester stdin write: {err}` 原样
+    保留。端到端能走到的是它的反面：现有断管与提前退出用例断言 `stdin write` **不出现**，防止
+    分类漂移。Windows 侧另有非必需 CI job
     `windows / clippy, test`（`windows-latest`；fmt 只在 Ubuntu 跑，rustfmt 输出不分平台），
     Job Object 代码因此至少被编译并由上述用例执行到；它不动必需检查的名字
     （`fmt / clippy / test`），是否必需由分支保护配置决定，本仓无法从代码侧验证。
