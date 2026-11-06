@@ -529,14 +529,20 @@ mod tests {
 
     #[test]
     fn collect_stream_returns_partial_buffer_when_grace_expires() {
+        let started = Instant::now();
         let collected = collect_stream(
             Some(spawn_reader(MarkerThenStall { sent: false })),
             Instant::now() + Duration::from_millis(500),
         );
+        let elapsed = started.elapsed();
         assert_eq!(
             collected,
             b"marker".to_vec(),
             "宽限到点也要交出已读到的字节"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "宽限到点就该返回，不能等到 2 s 的 EOF：{elapsed:?}"
         );
     }
 

@@ -705,7 +705,8 @@
     断言 `requester timed out` 里带得出 `marker-before-timeout`。
     `src/soda/child.rs` 十一条单元用例（其中一条只在 Windows 上编译、两条只在 Unix 上跑）—— 钉 8 MiB
     收集上限（超出字节读走但丢弃）、钉票 #26 的两条：宽限到点交出已读到的部分（读线程故意拖过
-    宽限才给 EOF）、写线程被 helper 攥住时 stdout/stderr 仍各自拿到宽限（旧实现两者都是 0 ms；
+    宽限才给 EOF，并断言 1.5 s 内返回 —— 等 EOF 的实现要到 2 s 才回）、写线程被 helper 攥住时
+    stdout/stderr 仍各自拿到宽限（旧实现两者都是 0 ms；
     这条用 python3 fork 出继承 stdin 的 helper，标记延迟由宽限常数推出 —— POSIX 会把非交互
     shell 后台列表的 stdin 接到 `/dev/null`，那样写线程根本卡不住）；钉票 #28 的退避序列 0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」
     （所以超时那一拍宽限仍与 `#23` 一致）、票 #29 注入一个非断管写入错误钉 `ChildError::Stdin`
