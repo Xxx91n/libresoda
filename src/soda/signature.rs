@@ -318,10 +318,7 @@ impl HttpSignature {
                 .get("error")
                 .and_then(|error| error.as_str())
                 .unwrap_or("签名服务返回失败");
-            let code = value
-                .get("code")
-                .and_then(|code| code.as_str())
-                .unwrap_or_default();
+            let code = json_code(&value);
             let retry_after = json_u64(&value, "retry_after_seconds");
             // 服务端要求鉴权时给出可操作的提示（libmssdk 会回 ok:false + code=unauthorized）
             let unauthorized = code.eq_ignore_ascii_case("unauthorized")
@@ -406,12 +403,26 @@ const SIGNER_ERROR_HEADERS: &[&str] = &[
     "allow",
 ];
 
-/// 错误文案里的 URL 只留到 path：查询参数可能带签名服务的 token。
+/// 错误文案里的 URL 去掉可能带凭据的部分：userinfo、查询参数与 fragment。
 fn redact_url_for_error(url: &str) -> String {
-    match url.split_once('?') {
-        Some((base, _)) => format!("{base}?<redacted>"),
-        None => url.to_string(),
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    let base = &url[..cut];
+    let mut redacted = base.to_string();
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = match rest.find('/') {
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, ""),
+        };
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            redacted = format!("{scheme}://<redacted>@{host}{path}");
+        }
     }
+    if url.contains('?') {
+        redacted.push_str("?<redacted>");
+    } else if url.contains('#') {
+        redacted.push_str("#<redacted>");
+    }
+    redacted
 }
 
 /// 非 2xx 的签名服务回包 → 一条能区分故障种类的错误文案。
@@ -459,6 +470,15 @@ fn truncate_for_error(text: &str, max_chars: usize) -> String {
     let mut kept: String = text.chars().take(max_chars).collect();
     kept.push_str("...(truncated)");
     kept
+}
+
+/// 原因码：契约里是字符串，但数字形式也收（如 `{"code":429}`）。
+fn json_code(value: &serde_json::Value) -> String {
+    match value.get("code") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// 从回包里读一个非负整数，兼容数字与数字字符串。
@@ -808,6 +828,22 @@ mod tests {
         fn name(&self) -> &'static str {
             "broken"
         }
+    }
+
+    #[test]
+    fn error_url_redacts_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url_for_error("http://token@host:1/sign?x=1#frag"),
+            "http://<redacted>@host:1/sign?<redacted>"
+        );
+        assert_eq!(
+            redact_url_for_error("http://host:1/sign"),
+            "http://host:1/sign"
+        );
+        assert_eq!(
+            redact_url_for_error("http://host:1/sign#frag"),
+            "http://host:1/sign#<redacted>"
+        );
     }
 
     #[test]

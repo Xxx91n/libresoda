@@ -23,7 +23,7 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
     let track_id = song_track_id(song);
     let cached = cached_download_info(song);
     if !track_id.is_empty() {
-        return prefer_cached(resolve_download_info(soda, &track_id, None), cached);
+        return resolve_with_cache_fallback(resolve_download_info(soda, &track_id, None), cached);
     }
     if let Some(cached) = cached {
         if !cached.url.is_empty() {
@@ -38,7 +38,7 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
 /// 签名器故障不是"这一首拿不到"：即便手里有旧地址也要让调用方看见，否则上层无法
 /// 把签名服务故障与曲目权益区分开（#36 / sodam #103）。其余错误沿用旧回退 ——
 /// 手里有可用地址就先返回它。
-fn prefer_cached(
+fn resolve_with_cache_fallback(
     resolved: Result<DownloadInfo>,
     cached: Option<DownloadInfo>,
 ) -> Result<DownloadInfo> {
@@ -496,7 +496,7 @@ mod tests {
             url: "https://cdn.example/cached.m4a".to_string(),
             ..Default::default()
         };
-        let error = prefer_cached(
+        let error = resolve_with_cache_fallback(
             Err(SodaError::http("signer error: connect to signer refused")),
             Some(cached),
         )
@@ -510,7 +510,7 @@ mod tests {
             url: "https://cdn.example/cached.m4a".to_string(),
             ..Default::default()
         };
-        let info = prefer_cached(
+        let info = resolve_with_cache_fallback(
             Err(SodaError::http(
                 "http request failed: status 500 (https://api.qishui.com/x)",
             )),
@@ -530,7 +530,7 @@ mod tests {
             url: "https://cdn.example/fresh.m4a".to_string(),
             ..Default::default()
         };
-        let info = prefer_cached(Ok(resolved), Some(cached)).expect("成功解析");
+        let info = resolve_with_cache_fallback(Ok(resolved), Some(cached)).expect("成功解析");
         assert_eq!(info.url, "https://cdn.example/fresh.m4a");
     }
 

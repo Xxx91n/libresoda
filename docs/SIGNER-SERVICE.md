@@ -125,8 +125,9 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 响应体最多保留 4096 个字符（超过时截断并标
 `...(truncated)`）、每个头值最多 200 字符；回包体在读取时另有 1 MiB 硬上限。
 **非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接报签名故障，
-不拿截断的 JSON 当签名。`CapturedSignature` 回空仍按「未签名」处理（它是用户显式
-回填的静态值，不是远程/子进程签名器）。
+不拿截断的 JSON 当签名。`2xx + {"ok":false}` 的等待时长从回包体读
+（libmssdk 要求头/体各写一份；2xx 分支只拿得到体）。`CapturedSignature` 回空仍按
+「未签名」处理（它是用户显式回填的静态值，不是远程/子进程签名器）。
 
 `HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
 普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型
@@ -138,10 +139,13 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 签名器故障时这些调用都会报错，而不是悄悄改发未签名请求。
 
 `get_download_info` 的取流回退边界：非签名故障仍按旧规则回退到 web 试听（以及手里的
-旧地址）；签名故障直接返回 `Err`，**不**因为 web 侧有预览流或手里有旧地址就返回 `Ok`。
+旧地址）；签名故障直接返回 `Err`，**不**因为 web 侧有预览流、有完整但非无损的流，
+或手里有旧地址就返回 `Ok` —— 这些路径一旦回退，签名故障就又看不见了。
 `fetch_song_detail`（`Parse` / 详情主入口）同样把签名故障上抛；非签名取流失败仍只
-影响「有没有补上更好的地址」，不阻断元数据。`check_stream_access` 仍返回诊断报告，但
-新增机器可读的 `signer_failed: bool`，`app_error` 继续保留原文。
+影响「有没有补上更好的地址」，不阻断元数据。`is_vip_account` 的探测回退在签名故障时
+返回 `Err`，不再把账号误判成非会员。`check_stream_access` 仍返回诊断报告，但新增机器
+可读的 `signer_failed: bool`，`app_error` 继续保留原文；`hint` 不拼回包原文，只说
+「签名器调用失败」并指向 `app_error`。
 
 `CommandSignature::timeout_ms`（默认 5 s）自票
 [`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr

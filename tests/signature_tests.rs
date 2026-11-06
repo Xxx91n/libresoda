@@ -431,6 +431,11 @@ fn http_signature_ok_false_keeps_code_and_retry_after() {
         error.to_string().contains("[retry_after_seconds=2]"),
         "{error}"
     );
+
+    // 原因码写成数字时也要能读。
+    let error = HttpSignature::parse_response(br#"{"ok":false,"error":"busy","code":429}"#)
+        .expect_err("ok:false 是签名故障");
+    assert!(error.to_string().contains("[code=429]"), "{error}");
 }
 
 #[test]

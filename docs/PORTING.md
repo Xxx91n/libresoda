@@ -726,7 +726,10 @@
     调用方同样能判出签名故障）。`HttpSignature` / `CommandSignature` 回**空签名**
     改为 `signer error: empty signature response`：配了远程或子进程签名器却等于没签，
     不能悄悄改发未签名请求（`NoopSignature` 与自定义 no-op 仍按未签名继续）。
-    前缀补写保留原错误变体（`Json` 仍是 `Json`）。`CommandSignature` 的解码/编码失败
+    前缀补写只保留 `Json` 变体；`Api` / `InvalidInput` / `Io` 等统一成 `Http` ——
+    `Api` 的 Display 会带 `status_code=` 前缀，无法满足「以 `signer` 开头」的判定。
+    `ok:false` 的等待时长从回包体读（libmssdk 头/体各写一份；2xx 分支只拿到体）。
+    `CommandSignature` 的解码/编码失败
     文案由 `sign request encode` / `sign response decode` 改成
     `signer request encode` / `signer response decode`（与 `HttpSignature::parse_response`
     对齐，sodam 的失败分类按 `signer` 判定）。
@@ -734,8 +737,12 @@
     都保证这一点；不用「包含 signer」是为了不把引用了签名器地址的普通 HTTP 错误误判成
     服务故障）。`SodaError` 的形状**没改**（仍不新增变体）；结构化错误类型
     （状态码/头/体作为字段）不在本票范围，等有消费方时另开票。
+  - **签名故障优先于所有回退**：即使 web 侧有完整（但非无损）的流、或手里有旧缓存地址，
+    App 端点签名失败也返回 `Err`。只报「web 侧只有试听」会漏掉这些路径，上层就无法把
+    签名服务故障与曲目权益分开（sodam #103 的预取暂停也依赖它）。因此
+    `is_vip_account` 的探测回退在签名故障时返回 `Err`，而不是把账号误判成非会员。
   - `download::resolve_download_info`：App 端点返回签名故障时直接 `Err`，不再因为 web
-    侧有预览流就返回 `Ok`；`get_download_info` 的 `prefer_cached` 也不再拿旧缓存把签名
+    侧有预览流就返回 `Ok`；`get_download_info` 的 `resolve_with_cache_fallback` 也不再拿旧缓存把签名
     故障盖掉。非签名故障（例如 PC 端点 500）仍按旧规则回退到 web 试听（`Ok + is_preview`）
     或手里的旧地址。「签名成功但服务端只给试听」保持 `Ok + is_preview`，不误判成故障。
     取数函数做成 `resolve_download_info_with` 的闭包参数，离线用例可注入 App 端点结果
@@ -744,7 +751,9 @@
     仍保持上游的可选补全语义（返回元数据）。
   - `StreamAccessReport` 新增公开字段 `signer_failed: bool`（结构体级
     `#[serde(default)]` 已覆盖它）：`app_error` 继续保留原文，但签名故障不再只是文案
-    备注；`build_hint` 优先给出「签名器调用失败（不是曲目权益问题）」。这是**对外
+    备注；`build_hint` 优先给出「签名器调用失败（不是曲目权益问题）」，且**不**把
+    `app_error` 原文拼进这条可直接展示的文案（它可能带上完整回包体），细节留给字段。
+    这是**对外
     结构体加字段** —— 外部用结构体字面量且不带 `..Default::default()` 的代码需要补
     字段；该结构体本来就以 `Default` 为构造入口，仓内与 sodam 都不受影响（票 #36 要求
     把签名故障从纯文案提升为可判分支，这是最小改法）。

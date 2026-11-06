@@ -230,14 +230,10 @@ where
 fn build_hint(report: &StreamAccessReport) -> String {
     // 签名服务故障优先于「试听」的所有解释：它要停、要修，和曲目权益不是一件事。
     if report.signer_failed {
-        return format!(
-            "签名器调用失败（不是曲目权益问题）：{}；修好签名器后会重新走 App 端点",
-            if report.app_error.is_empty() {
-                "（无错误信息）"
-            } else {
-                report.app_error.as_str()
-            }
-        );
+        // 不把 `app_error` 原文拼进这条「可直接展示」的结论：它可能带上
+        // 4 KiB 的签名服务回包体。细节留给 `app_error` 字段。
+        return "签名器调用失败（不是曲目权益问题）；详情见 app_error，修好签名器后会重新走 App 端点"
+            .to_string();
     }
     if report.best.is_none() {
         return "没有解析到任何播放流，请检查曲目 ID 与网络".to_string();
@@ -384,7 +380,8 @@ mod tests {
         };
         let hint = build_hint(&report);
         assert!(hint.contains("签名器调用失败"), "{hint}");
-        assert!(hint.contains("connect to signer refused"), "{hint}");
+        assert!(hint.contains("app_error"), "{hint}");
+        assert!(!hint.contains("connect to signer refused"), "{hint}");
         assert!(
             !hint.contains("仅限会员"),
             "签名故障不能写成会员权益问题：{hint}"
