@@ -287,12 +287,51 @@ time.sleep(60)
     }
 }
 
+/// 票 #26 的验收：标记先写、写端被一个逃出进程组的 helper 攥住，超时错误仍要带出标记。
+///
+/// helper 在 `os.fork()` 出来的子进程里 `setsid()`（它不是组长，能成功），随后继承着
+/// stderr 睡 4 s；直接子进程在原地睡 60 s。超时组杀只带走直接子进程，helper 的写端让读线程
+/// 等不到 EOF —— 旧实现整段缓冲被丢，`requester timed out` 后面没有标记；现在宽限到点交出
+/// 已收到的部分，标记随错误一起回来。只跑 Unix（`setsid` 与 `fork` 都是 Unix 语义）。
+#[cfg(unix)]
+#[test]
+fn command_requester_delivers_stderr_before_escaped_helper_holds_the_pipe() {
+    const STALL_PROBE_SCRIPT: &str = r#"
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    time.sleep(4)
+    os._exit(0)
+sys.stderr.write("marker-before-timeout\n")
+sys.stderr.flush()
+time.sleep(60)
+"#;
+    let requester = CommandRequester::new("python3")
+        .args(["-c", STALL_PROBE_SCRIPT])
+        .timeout_ms(1_500);
+    let started = Instant::now();
+    let error = run_with_watchdog(Duration::from_secs(6), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 攥着 stderr 也不能跳过超时终止");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("requester timed out"), "{text}");
+    assert!(
+        text.contains("marker-before-timeout"),
+        "宽限到点应交出已收到的 stderr：{text}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "标记用例拖了 {elapsed:?}");
+}
+
 /// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。
 ///
 /// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper
 /// 应当还活着 —— Windows 上 `release` 清不掉 `KILL_ON_JOB_CLOSE` 的话，`Job::drop` 会把它
-/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价也一并断言：helper 攥着
-/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层看到的是「返回无法解析」。
+/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。
+///
+/// 票 #26 改了口径：helper 攥着写端时读线程等不到 EOF，但宽限到点会交出**已收到**的回包，
+/// 所以这次请求成功 —— 代价是等满宽限（每个流 1 s），不再把回包整块丢掉。
 #[test]
 fn command_requester_leaves_resident_descendants_on_success() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -311,16 +350,12 @@ fn command_requester_leaves_resident_descendants_on_success() {
          printf '{{\"ok\":true,\"status\":200,\"body\":\"\"}}'; exit 0"
     );
     let requester = CommandRequester::new("sh").args(["-c", script.as_str()]);
-    let error = run_with_watchdog(Duration::from_secs(5), move || {
+    let response = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
-    .expect_err("helper 攥着写端时回包应被宽限丢掉");
-    let text = error.to_string();
-    assert!(
-        text.contains("返回无法解析"),
-        "宽限到点后已收到的输出应被丢掉，只剩解析失败：{text}"
-    );
-    assert!(!text.contains("timed out"), "{text}");
+    .expect("helper 攥着写端时已收到的回包应被交出");
+    assert!(response.ok, "回包应能完整解析");
+    assert_eq!(response.status, 200);
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while !marker.exists() {

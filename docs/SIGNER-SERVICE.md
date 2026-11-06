@@ -113,9 +113,10 @@ Windows Job Object，票 [`#25`](https://github.com/sodahub-org/libresoda/issues
 stdin 却永不退出」不会再让调用方无限等 —— 超时前缀与上面三条「正常退出」文案可区分。
 
 签名器自己拉起的 helper 也在这棵树里，超时会一起终止；成功返回时库不杀它们（错误路径的收场
-见 `docs/PORTING.md` 的残余边界 ⑥）。要让后台进程常驻，必须让它**关掉或重定向继承的
-stdout/stderr**：库只在管道 EOF（或读错误）时才交回输出，helper 攥着写端会让调用方等满 1 s
-宽限，并丢掉已经收到的回包（表现为解析失败）。
+见 `docs/PORTING.md` 的残余边界 ⑥）。要让后台进程常驻，最好让它**关掉或重定向继承的
+stdout/stderr**：helper 攥着写端时读线程等不到 EOF，调用方要等满 1 s 宽限才拿回**已经收到的**
+输出（票 [`#26`](https://github.com/sodahub-org/libresoda/issues/26) 起不再整块丢掉；此前表现
+为解析失败）。
 
 Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户可见的代价 —— 宿主被中断时它不会
 跟着收到 SIGINT，需要调用方自己收尾。
