@@ -276,6 +276,10 @@ fn collect_stream(receiver: Option<Receiver<Vec<u8>>>, deadline: Instant) -> Vec
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    debug_assert!(
+        collected.len() <= MAX_CAPTURE_BYTES,
+        "发送方应已夹紧上限（见 reader_caps_capture_and_keeps_draining）"
+    );
     collected
 }
 
@@ -500,8 +504,8 @@ mod tests {
     impl Read for MarkerThenStall {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
-                // 这条用例的截止时间是 100 ms，这里拖到 300 ms：收集方必须在 EOF 之前返回。
-                thread::sleep(Duration::from_millis(300));
+                // 这条用例的截止时间是 500 ms，这里拖到 2 s：收集方必须在 EOF 之前返回。
+                thread::sleep(Duration::from_secs(2));
                 return Ok(0);
             }
             self.sent = true;
@@ -514,7 +518,7 @@ mod tests {
     fn collect_stream_returns_partial_buffer_when_grace_expires() {
         let collected = collect_stream(
             Some(spawn_reader(MarkerThenStall { sent: false })),
-            Instant::now() + Duration::from_millis(100),
+            Instant::now() + Duration::from_millis(500),
         );
         assert_eq!(
             collected,

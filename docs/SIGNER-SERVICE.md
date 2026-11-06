@@ -115,8 +115,8 @@ stdin 却永不退出」不会再让调用方无限等 —— 超时前缀与上
 签名器自己拉起的 helper 也在这棵树里，超时会一起终止；成功返回时库不杀它们（错误路径的收场
 见 `docs/PORTING.md` 的残余边界 ⑥）。要让后台进程常驻，最好让它**关掉或重定向继承的
 stdout/stderr**：helper 攥着写端时读线程等不到 EOF，调用方要等满对应流的 1 s 宽限才拿回
-**已经收到的**输出（票 [`#26`](https://github.com/sodahub-org/libresoda/issues/26) 起不再整块
-丢掉；此前表现为解析失败）。
+**已经收到的**输出（两条流同时被攥住就是 2 s；票
+[`#26`](https://github.com/sodahub-org/libresoda/issues/26) 起不再整块丢掉，此前表现为解析失败）。
 
 Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户可见的代价 —— 宿主被中断时它不会
 跟着收到 SIGINT，需要调用方自己收尾。

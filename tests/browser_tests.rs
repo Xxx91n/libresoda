@@ -132,10 +132,12 @@ fn command_requester_times_out_when_child_never_exits() {
 
 /// 票 #25：直接子进程拉起一个继承 stdout/stderr 的后台 helper，自己驻留到超时。
 ///
-/// helper 活着的唯一证据就是写端没关：只 kill 直接子进程时排空线程等不到 EOF，1 s 宽限
-/// 到点只交出已读到的部分（旧实现直接按空输出处理）；整棵树被终止时两个写端都关掉，探针在
-/// 超时前写下的标记才能随 EOF（或宽限到点）交回来。`sh -c` 是非交互 shell，没有 job
-/// control，后台任务留在同一进程组里。
+/// helper 活着的唯一证据就是写端没关：整棵树被终止时两个写端都关掉，读线程立刻拿到 EOF，
+/// 探针在超时前写下的标记随之交回；只杀直接子进程时 helper 继续攥着写端，排空线程要走满 1 s
+/// 宽限才交出已读到的部分。**「标记存在」本身不再证明树已终止**（票 #26 起宽限到点也会交回）
+/// —— 判据变成返回时间：时限 500 ms 加一个宽限约 1.5 s，标记随 EOF 回来时调用方应在 1 s 内
+/// 返回，用满宽限说明写端仍被攥着。`sh -c` 是非交互 shell，没有 job control，后台任务留在
+/// 同一进程组里。
 #[test]
 fn command_requester_kills_descendants_that_hold_the_pipe() {
     const TREE_PROBE_SCRIPT: &str = "sleep 30 & printf tree-drained >&2; while :; do :; done";
@@ -153,11 +155,11 @@ fn command_requester_kills_descendants_that_hold_the_pipe() {
     assert!(!text.contains("requester exited"), "{text}");
     assert!(
         text.contains("tree-drained"),
-        "整棵树终止后读线程才拿得到 EOF 与 stderr：{text}"
+        "超时前写下的标记应随 EOF 或宽限交回：{text}"
     );
     assert!(
-        elapsed < Duration::from_secs(4),
-        "进程树用例拖了 {elapsed:?}"
+        elapsed < Duration::from_secs(1),
+        "标记随 EOF 交回 ≈ 树已终止；用满宽限说明写端仍被攥着：{elapsed:?}"
     );
 }
 
