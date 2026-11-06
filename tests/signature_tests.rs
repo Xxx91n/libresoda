@@ -584,6 +584,108 @@ fn non_2xx_oversized_body_keeps_status_and_marks_truncation() {
 }
 
 #[test]
+fn non_2xx_body_redacts_echoed_url_query_token() {
+    // 反代/网关的错误页常回显请求行：body 里的完整 URL 带着签名服务 token，
+    // 不能跟着错误文案进日志（票 #38）。回显的 URL 与配置地址无关，钉的是 body 脱敏。
+    let url = spawn_http_once(
+        "502 Bad Gateway",
+        "Retry-After: 2\r\n",
+        "upstream rejected: GET http://Signer.Host:8899/sign?token=secret-token&x=1 failed; code=BUSY",
+    );
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("非 2xx 是签名故障");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 502"),
+        "状态码与稳定前缀都要在：{text}"
+    );
+    assert!(
+        !text.contains("secret-token"),
+        "body 回显的 URL token 不能进错误文案：{text}"
+    );
+    assert!(
+        text.contains("Signer.Host"),
+        "URL 的 host 要保留，便于定位：{text}"
+    );
+    assert!(
+        text.contains("code=BUSY"),
+        "body 的其他内容仍要可读：{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 2"),
+        "处置相关头不能被丢掉：{text}"
+    );
+}
+
+#[test]
+fn non_2xx_body_redacts_bearer_and_bare_token() {
+    // 网关回显请求头/表单参数时，body 里会出现 URL 之外的裸令牌（票 #38 兜底）。
+    let url = spawn_http_once(
+        "401 Unauthorized",
+        "",
+        "echo: Authorization: BEARER eyJupper.secret.jwt\r\nauthorization: bearer eyJlower.secret.jwt\r\nToken=bare-secret-value; code=BAD_TOKEN",
+    );
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("非 2xx 是签名故障");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 401"),
+        "{text}"
+    );
+    assert!(!text.contains("eyJupper.secret.jwt"), "{text}");
+    assert!(!text.contains("eyJlower.secret.jwt"), "{text}");
+    assert!(!text.contains("bare-secret-value"), "{text}");
+    assert!(
+        text.contains("code=BAD_TOKEN"),
+        "body 的其他内容仍要可读：{text}"
+    );
+    assert!(text.contains("<redacted>"), "要显示令牌已脱敏：{text}");
+}
+
+#[test]
+fn non_2xx_oversized_body_redacts_before_truncation() {
+    // 票 #38：先脱敏再截断。令牌落在前 4096 字符里、body 远超上限时，
+    // 截断后的错误文案仍不能带 token，且状态码/处置头/截断标记都在。
+    let body: &'static str = Box::leak(
+        format!(
+            "{}http://host/sign?token=Zz9urlSecret Bearer Zz9bearerSecret {}",
+            "x".repeat(4000),
+            "y".repeat(10000)
+        )
+        .into_boxed_str(),
+    );
+    let url = spawn_http_once("500 Internal Server Error", "Retry-After: 3\r\n", body);
+    let error = HttpSignature::new(url)
+        .timeout_ms(5_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("5xx 是签名故障");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 500"),
+        "超长响应体不能把状态码弄丢：{text}"
+    );
+    assert!(!text.contains("Zz9urlSecret"), "{text}");
+    assert!(!text.contains("Zz9bearerSecret"), "{text}");
+    assert!(
+        text.contains("http://host/sign?<redacted>"),
+        "URL 要在截断前就脱敏：{text}"
+    );
+    assert!(text.contains("Bearer <redacted>"), "{text}");
+    assert!(
+        text.contains("...(truncated)"),
+        "要标明响应体被截断：{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 3"),
+        "处置相关头不能被丢掉：{text}"
+    );
+}
+
+#[test]
 fn pc_track_v2_surfaces_remote_signer_5xx_details() {
     let url = spawn_http_once(
         "503 Service Unavailable",
