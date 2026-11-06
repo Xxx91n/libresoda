@@ -702,20 +702,26 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     if std::fs::read_to_string(&seen).is_ok_and(|text| text.ends_with('\n')) {
-                        break;
+                        return Err(io::Error::other("injected write failure"));
                     }
-                    assert!(Instant::now() < deadline, "探针没有写出 pid");
+                    // 不在写线程里 panic：那条路径不会把消息交回调用方。超时也按写入错误
+                    // 返回，由下面的文案断言把「探针没写出 pid」和真正的注入错误分开。
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("probe did not write pid"));
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(io::Error::other("injected write failure"))
             },
         )
         .err()
         .expect("非断管写入错误必须报 Err(Stdin)");
-        assert!(
-            matches!(error, ChildError::Stdin(_)),
-            "非断管写入错误应报 Stdin"
-        );
+        match error {
+            ChildError::Stdin(err) => assert!(
+                err.to_string().contains("injected write failure"),
+                "注入的写入错误应原样向上：{err}"
+            ),
+            _ => panic!("非断管写入错误必须归到 Stdin，而不是其它分类"),
+        }
 
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("探针应把 pid 写出来")

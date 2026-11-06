@@ -225,10 +225,13 @@ fn command_signature_drains_large_response() {
     let provider = CommandSignature::new("sh")
         .args(["-c", LARGE_RESPONSE_SCRIPT])
         // 上限只是失败路径的兜底；成功路径约 0.5 s 返回，不受这个大数拖累。
-        .timeout_ms(10_000);
-    let response = provider
-        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
-        .expect("大回包应能解析");
+        .timeout_ms(5_000);
+    let request = sign_request("https://api.qishui.com/x", "POST", "{}");
+    // 库内时限之外再加一层看门狗：库若退回无限等待，这里是失败而不是挂住 `cargo test`。
+    let response = run_with_watchdog(std::time::Duration::from_secs(8), move || {
+        provider.sign(&request)
+    })
+    .expect("大回包应能解析");
     assert_eq!(response.ms_token.len(), 2048 * 64);
 }
 
