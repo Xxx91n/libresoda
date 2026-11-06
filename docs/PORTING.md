@@ -824,13 +824,15 @@
   `redact_bare_credentials` 兜底 URL 之外的裸 `token=` / `Bearer` 令牌（大小写不敏感，
   值读到空白/`&`，末尾闭合符原样补回；`bearer` 后不跟空白不算令牌，`bearers` 不误伤）。
   先截断再脱敏会把 token 留在前 4096 字符里，顺序不能反。只作用于错误文案，不改服务端
-  回包本身；状态码、`Retry-After` 等处置头与 body 其他内容仍可读。结构化
-  `SodaError::Signer` 变体不在本票范围（破坏性变更，另票）。**测试**：
+  回包本身；状态码、`Retry-After` 等处置头与 body 其他内容仍可读。两个脱敏函数只
+  lowercase 一次 + 单向游标（共用 `next_marker`），标记密集或某类标记缺失时仍是 O(n)，
+  不在同步签名的错误路径上放大 CPU（CodeRabbit 安全审查返修；此前每轮重 lowercase 剩余
+  后缀是平方级）。结构化 `SodaError::Signer` 变体不在本票范围（破坏性变更，另票）。**测试**：
   `tests/signature_tests.rs` 四条（body 回显 URL 查询 token、body 里的 Bearer/裸 token
   大小写不敏感、超长 body 先脱敏再截断仍无 token、超长 token 脱敏缩短 body 后其后的
   诊断内容仍存活——最后一条用「先截断再脱敏会切掉它」锁住顺序本身）；
-  `src/soda/signature.rs` 一条（兜底边界：`&` 分隔、闭合引号、`bearers` 不误伤、空值、
-  多空白）。全部离线，无新依赖。
+  `src/soda/signature.rs` 两条（兜底边界：`&` 分隔、闭合引号、`bearers` 不误伤、空值、
+  多空白；密集标记下 token/Bearer/URL 逐个全脱敏、诊断尾巴保留）。全部离线，无新依赖。
 
 ## 未移植项
 
