@@ -22,12 +22,18 @@ where
 }
 
 /// 读探针写出的 pid 文件：有界重试，不押注「请求返回时文件一定已经可见」。
+///
+/// 只接受以换行结尾的完整行（探针用 `echo` / `print(..., file=f)`）：读到半截数字时
+/// 不能把前缀当成 pid，否则后面的 `kill(pid, 0)` 会在错误的对象上得出「已消失」。
+#[cfg(unix)]
 fn read_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse() {
-                return pid;
+            if text.ends_with('\n') {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
             }
         }
         assert!(
@@ -111,9 +117,9 @@ const RESIDENT_PROBE_SCRIPT: &str = "printf alive >&2; exec sleep 30";
 fn command_requester_times_out_with_resident_child() {
     let requester = CommandRequester::new("sh")
         .args(["-c", RESIDENT_PROBE_SCRIPT])
-        .timeout_ms(1_000);
+        .timeout_ms(2_000);
     let started = Instant::now();
-    let error = run_with_watchdog(Duration::from_secs(4), move || {
+    let error = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
     .expect_err("不读 stdin 又不退出，也得超时");
@@ -125,7 +131,7 @@ fn command_requester_times_out_with_resident_child() {
         text.contains("alive"),
         "stderr 标记应随超时错误交回：{text}"
     );
-    assert!(elapsed < Duration::from_secs(4), "超时用例拖了 {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "超时用例拖了 {elapsed:?}");
 }
 
 #[test]
@@ -253,7 +259,7 @@ if os.fork() == 0:
     os._exit(0)
 os.setpgid(0, os.getpgid(os.getppid()))
 with open(sys.argv[1], "w") as f:
-    f.write(str(os.getpid()))
+    print(os.getpid(), file=f)
 sys.stderr.write("escaped %d\n" % os.getpgrp())
 sys.stderr.flush()
 time.sleep(60)

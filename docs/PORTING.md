@@ -669,12 +669,12 @@
     将来支持 `cdylib`/FFI 或非 Rust 宿主时必须重新确认这条前提，不能默默继承。
   - **测试（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29) 收口余量与忙等）**：
     `tests/signature_tests.rs` —— 2 MiB 载荷 + `sh -c 'exec sleep 30'`（写入侧与等待侧同时到点，
-    200 ms）；2 MiB 载荷 + 探针先打 stderr 标记再 `exec sleep 30`（1 s，超时错误要带回标记）；
+    200 ms）；2 MiB 载荷 + 探针先打 stderr 标记再 `exec sleep 30`（2 s，超时错误要带回标记）；
     128 KiB 合法回包的成功路径（`command_signature_drains_large_response`，证明 stdout 被并发
     排空：没有读线程时子进程写满约 64 KiB 就阻塞，只能等到超时）。探针标记放在大块输出之前、
     驻留改用 `sleep`：慢机/抢核下不再因为「256 KiB 还没写完」而在时限前没打标记，也不再占满
     一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。
-    `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、超时（1 s，同样标记先行 + `exec sleep`）、
+    `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、超时（2 s，同样标记先行 + `exec sleep`）、
     128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
     后台 helper 后驻留到超时 —— helper 活着的唯一证据就是写端没关，探针写下的 stderr 标记能随
     EOF 交回来就说明整棵树已终止（Unix 与 Windows 同一份用例；Windows 侧「helper 已死」由这条
@@ -709,8 +709,9 @@
     `io::Error::other("injected write failure")`，断言分类为 `ChildError::Stdin` 且原始错误原样
     向上（`run_reports_non_broken_pipe_write_error_as_stdin`）；(2) `signature` / `browser` 各一条
     单元用例直接喂 `ChildError::Stdin`，断言冻结文案 `signer|requester stdin write: {err}` 原样
-    保留。端到端能走到的是它的反面：现有断管与提前退出用例断言 `stdin write` **不出现**，防止
-    分类漂移。Windows 侧另有非必需 CI job
+    保留。`sign()` / `request()` 到文案的剩下一步只是 `map_err(map_child_error)` 的直连；要端到端
+    走通得给公开类型加测试专用入口，代价大于收益。端到端能走到的是它的反面：现有断管与提前退出
+    用例断言 `stdin write` **不出现**，防止分类漂移。Windows 侧另有非必需 CI job
     `windows / clippy, test`（`windows-latest`；fmt 只在 Ubuntu 跑，rustfmt 输出不分平台），
     Job Object 代码因此至少被编译并由上述用例执行到；它不动必需检查的名字
     （`fmt / clippy / test`），是否必需由分支保护配置决定，本仓无法从代码侧验证。

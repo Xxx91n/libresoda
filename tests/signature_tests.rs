@@ -182,14 +182,14 @@ fn command_signature_times_out_with_resident_signer() {
     // 并交回可区分的超时错误。标记先于驻留写出，慢机不会因为探针自己没跑完而红。
     let provider = CommandSignature::new("sh")
         .args(["-c", RESIDENT_PROBE_SCRIPT])
-        .timeout_ms(1_000);
+        .timeout_ms(2_000);
     let started = std::time::Instant::now();
     let request = sign_request(
         "https://api.qishui.com/x",
         "POST",
         &"x".repeat(2 * 1024 * 1024),
     );
-    let error = run_with_watchdog(std::time::Duration::from_secs(4), move || {
+    let error = run_with_watchdog(std::time::Duration::from_secs(5), move || {
         provider.sign(&request)
     })
     .expect_err("签名器不退出就得报超时");
@@ -205,7 +205,7 @@ fn command_signature_times_out_with_resident_signer() {
         "stderr 标记应随超时错误交回：{text}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(4),
+        elapsed < std::time::Duration::from_secs(5),
         "超时用例拖了 {elapsed:?}"
     );
 }

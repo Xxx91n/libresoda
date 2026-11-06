@@ -640,8 +640,9 @@ mod tests {
     /// 真实管道到不了这条分支：读端关闭时 `write` 只回 `EPIPE`（`SIGPIPE` 已忽略时是
     /// `BrokenPipe`），所以用 `run_with` 的写入参数注入一个别的错误。断言分类是 `Stdin`
     /// （上层据此翻成 `signer|requester stdin write: {err}`），并且原始错误原样带上去。
-    /// 这条路径在出错后先 `terminate` 再返回；`live_command` 驻留 30 s，没有终止与回收
-    /// 就不会返回，用例本身因此能显形。
+    /// 本用例只钉分类与原始错误；收尸不在这里断言 —— `run_with` 在返回前调用共享的
+    /// `terminate`，终止与回收由 `attach_or_abort_kills_live_child_and_reports` 和进程树
+    /// 用例覆盖（注入的写入错误会在观察到的下一拍立即返回，不等待子进程自然退出）。
     #[cfg(any(unix, windows))]
     #[test]
     fn run_reports_non_broken_pipe_write_error_as_stdin() {
