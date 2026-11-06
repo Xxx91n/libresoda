@@ -608,8 +608,8 @@
       `(timeout, timeout + 10 ms]` —— 与 #23 同一区间（函数真正返回还要再加下面「线程收集有宽限」那条
       最多 1 s，这一段与间隔无关，改动前后一样）。**区间相同，相位不同**：具体落在区间里的哪一点，
       取决于每拍 sleep 的累积漂移，本来就不是一条能钉死的毫秒数，改动前后都一样。`#23` 那四条带
-      `recv_timeout` 看门狗的计时用例（两个「不读也不退出」+ 两个「边排空边到点」）断言的都是上界，
-      因而都不必调阈值。错误文案一条没改。
+      `recv_timeout` 看门狗的计时用例（票 #29 之后四个都是「不读也不退出」；其中两条只打 stderr
+      标记再驻留）断言的都是上界，因而都不必调阈值。错误文案一条没改。
     - **计时凭证（这张表怎么读，只写在这一条里）**：`examples/child_poll_probe.rs` 跑同一条最小
       签名器两遍（库路径 vs 裸 `spawn + write_all + wait_with_output`），同一趟里 A/B 交替、预热 5 轮，
       打印 min/p50/p90/mean 与两列的 p50 差值；`.github/workflows/ci.yml` 在 Test 之后跑一次，把表
@@ -676,8 +676,8 @@
     一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。旧用例在同一条里同时压住
     2 MiB 写入与 256 KiB stdout；现在拆成「写入阻塞」（2 MiB + 不读 stdin 的超时用例）与
     「stdout 排空」（128 KiB 成功用例）两个方向，各自有证据。
-    `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、超时（2 s，同样标记先行 + `exec sleep`）、
-    128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
+    `tests/browser_tests.rs` 九条 —— 非 0 退出、断管归因、两条超时（200 ms 的 `exec sleep 30`；
+    2 s 的标记先行 + `exec sleep`）、128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
     后台 helper 后驻留到超时 —— helper 活着的唯一证据就是写端没关，探针写下的 stderr 标记能随
     EOF 交回来就说明整棵树已终止（Unix 与 Windows 同一份用例；Windows 侧「helper 已死」由这条
     EOF 推出：写端持有者必须全部消失，没有另写 pid 检查是因为 `kill(pid, 0)` 是 Unix 语义）。
