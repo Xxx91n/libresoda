@@ -759,12 +759,14 @@
     把签名故障从纯文案提升为可判分支，这是最小改法）。
   - **测试**：`src/soda/download.rs` 八条（App 端点整曲 / App 端点试听 / 签名故障不透传
     web 试听 / 非签名故障仍回退 / 旧地址不盖签名故障 / 旧地址仍用于非签名故障 / 成功
-    解析优先于旧地址 / 无 Cookie 不请求 App 端点）；`src/soda/signature.rs` 两条（无
-    provider 不变、provider 失败带稳定前缀）；`src/soda/track.rs` 三条（签名故障从
-    详情主入口上抛、非签名失败仍返回元数据、成功结果写回歌曲）；`src/soda/stream.rs`
+    解析优先于旧地址 / 无 Cookie 不请求 App 端点）；`src/soda/signature.rs` 三条（无
+    provider 不变、provider 失败带稳定前缀、URL 脱敏（userinfo/查询/fragment、大小写
+    scheme、`]` 出现在查询值里））；`src/soda/track.rs` 四条（签名故障从详情主入口上抛、
+    非签名失败仍返回元数据、成功结果写回歌曲、签名失败后零次 App POST）；`src/soda/stream.rs`
     三条（`check_stream_access`
     把签名故障标进 `signer_failed`、非签名故障不标、hint 不写成会员权益）；
-    `src/error.rs` 一条（判定看开头，不看正文里是否出现 signer）；`tests/signature_tests.rs`
+    `src/soda/account.rs` 一条（签名故障不被当成缺权益）；`src/error.rs` 一条（判定看
+    开头，不看正文里是否出现 signer）；`tests/signature_tests.rs`
     九条（非 2xx 保留状态/头/体、非 2xx 超长体保留状态并标截断、`ok:false` 保留
     code/retry_after（含字符串形式）、空签名回包报错、2xx 超长回包报错、连接拒绝、超时、
     `fetch_pc_track_v2` 传播签名失败且不走网络、远程 5xx 端到端）。全部离线，无新依赖。

@@ -520,7 +520,10 @@ fn redact_urls_in_text(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
     loop {
-        let next = [rest.find("http://"), rest.find("https://")]
+        // 大小写不敏感的 scheme（ureq/代理可能回显 `HTTP://`）；ASCII 小写化
+        // 不改变字节偏移，找到的 index 可以直接切原文。
+        let lowered = rest.to_ascii_lowercase();
+        let next = [lowered.find("http://"), lowered.find("https://")]
             .into_iter()
             .flatten()
             .min();
@@ -906,6 +909,11 @@ mod tests {
         let bracket = redact_urls_in_text("failed http://Host/Sign?token=pre]secret");
         assert!(!bracket.contains("secret"), "{bracket}");
         assert!(!bracket.contains(']'), "{bracket}");
+
+        // scheme 大小写变化也要认出来。
+        let upper = redact_urls_in_text("failed HTTPS://Host/Sign?token=secret");
+        assert!(!upper.contains("secret"), "{upper}");
+        assert!(upper.contains("?<redacted>"), "{upper}");
     }
 
     #[test]
