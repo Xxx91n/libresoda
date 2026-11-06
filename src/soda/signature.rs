@@ -530,7 +530,11 @@ fn redact_urls_in_text(text: &str) -> String {
         };
         output.push_str(&rest[..index]);
         let tail = &rest[index..];
-        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        // 空白，或包住 URL 的引号/括号等闭合符。不把 `,` / `;` 当分隔符：
+        // 查询值里可能出现它们，提前截断反而会把后半段留在文本里。
+        let end = tail
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | '>' | ']'))
+            .unwrap_or(tail.len());
         output.push_str(&redact_url_for_error(&tail[..end]));
         rest = &tail[end..];
     }
@@ -881,7 +885,14 @@ mod tests {
         assert!(!redacted.contains("secret"), "{redacted}");
         assert!(!redacted.contains("token=two"), "{redacted}");
         assert!(redacted.contains("Host.Example"), "{redacted}");
+        // URL 之后的诊断原因不能被吞掉。
+        assert!(redacted.contains("Connection Failed"), "{redacted}");
         assert_eq!(redacted.matches("<redacted>").count(), 3, "{redacted}");
+
+        // 包住 URL 的闭合符保留在文本里。
+        let wrapped = redact_urls_in_text("failed: (http://Host/Sign?token=secret)");
+        assert!(!wrapped.contains("secret"), "{wrapped}");
+        assert!(wrapped.ends_with(')'), "{wrapped}");
     }
 
     #[test]
