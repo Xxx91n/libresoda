@@ -269,9 +269,14 @@ pub fn post_json(url: &str, body: &[u8], options: &[RequestOption]) -> Result<Ve
 /// libmssdk#4），普通接口的非 2xx 不包含这些信息，仍由 [`post_bytes`] 折成一句错误。
 pub(crate) struct PostResponse {
     pub(crate) status: u16,
-    /// 响应头，名字保留服务端写法；同名只留第一行（与 [`RawResponse`] 同口径）。
+    /// 跟随重定向后的最终地址（与 [`HttpResponse::final_url`] 同口径）。
+    pub(crate) final_url: String,
+    /// 响应头，名字保留服务端写法并按名字排序（错误文案可复现）；同名只留第一行。
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
+    /// 非 2xx 的响应体超过上限时只保留前一段；2xx 超限直接报错（不把截断的
+    /// 签名回包当合法 JSON 去解析）。
+    pub(crate) body_truncated: bool,
 }
 
 /// 签名服务回包体的硬上限。正常回包是几百字节；超过它的既不是签名结果，
@@ -297,7 +302,8 @@ pub(crate) fn post_with_status(
         Err(err) => return Err(SodaError::http(err.to_string())),
     };
     let status = response.status();
-    let headers = response
+    let final_url = response.get_url().to_string();
+    let mut headers: Vec<(String, String)> = response
         .headers_names()
         .into_iter()
         .filter_map(|name| {
@@ -306,21 +312,32 @@ pub(crate) fn post_with_status(
                 .map(|value| (name, value.to_string()))
         })
         .collect();
+    headers.sort_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
     let mut data = Vec::new();
     response
         .into_reader()
         .take((MAX_SIGNER_RESPONSE_BODY + 1) as u64)
         .read_to_end(&mut data)
         .map_err(|err| SodaError::http(err.to_string()))?;
-    if data.len() > MAX_SIGNER_RESPONSE_BODY {
-        return Err(SodaError::http(format!(
-            "http response body exceeds {MAX_SIGNER_RESPONSE_BODY} bytes"
-        )));
+    let body_truncated = data.len() > MAX_SIGNER_RESPONSE_BODY;
+    if body_truncated {
+        // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限说明
+        // 回包不是正常签名结果，不能拿截断的 JSON 当签名。
+        if (200..300).contains(&status) {
+            return Err(SodaError::http(format!(
+                "http response body exceeds {MAX_SIGNER_RESPONSE_BODY} bytes"
+            )));
+        }
+        data.truncate(MAX_SIGNER_RESPONSE_BODY);
     }
     Ok(PostResponse {
         status,
+        final_url,
         headers,
         body: data,
+        body_truncated,
     })
 }
 

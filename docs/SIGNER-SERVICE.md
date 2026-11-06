@@ -110,25 +110,32 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 票 [`#36`](https://github.com/sodahub-org/libresoda/issues/36) 起，「没配置签名器」与
 「签名器已配置但调用失败」是两条路：
 
-| 情况 | `sign()` | 取流链路 |
+| 情况 | `sign()` | App 端点调用方 |
 | --- | --- | --- |
-| 没配置 provider | 不调用 | 按未签名继续（**唯一**允许的降级） |
+| 没配置 provider，或 provider 明确回空（`NoopSignature`） | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
 | 连接拒绝 / 超时 / 子进程非 0 退出 | `signer error: …` / `signer exited …` | 错误上抛；不再发未签名请求 |
 | HTTP 非 2xx | `signer error: http request failed: status {code} ({url}); headers: […]; body: …` | 同上；响应头整份保留，`Retry-After` 可读 |
 | HTTP 2xx + `{"ok":false}` | `signer error: {error} [code=…] [retry_after_seconds=…]` | 同上；原因码与等待时长都在文案里 |
 | 签名成功、服务端只给试听 | `Ok` | `Ok + is_preview=true`（权益/曲目事实，不是签名故障） |
 
-非 2xx 的响应体最多保留 4 KiB、每个头值最多 200 字符（`Set-Cookie` 不进文案），
-避免签名服务的错误页把日志撑爆；回包体在读取时另有 1 MiB 硬上限。
+非 2xx 的响应体最多保留 4096 个字符（超过时截断并标 `...(truncated)`）、每个头值最多
+200 字符（`Set-Cookie` 不进文案），避免签名服务的错误页把日志撑爆；回包体在读取时另有
+1 MiB 硬上限。**非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接
+报签名故障，不拿截断的 JSON 当签名。
 
 `HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
 普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型
 （新增 `SodaError` 变体）不在本票范围，本票先用 `SodaError::Http` + 稳定前缀 +
 状态/响应体/`Retry-After` 的顺序交付，下游（sodam #103）据此分类。
 
-`get_download_info` 的取流回退边界：非签名故障仍按旧规则回退到 web 试听；
-签名故障直接返回 `Err`，**不**因为 web 侧有预览流就返回 `Ok`。`check_stream_access`
-仍返回诊断报告，但新增机器可读的 `signer_failed: bool`，`app_error` 继续保留原文。
+这条规则覆盖**所有走 `apply_stream_signature` 的 App 端点调用**：取流
+（`fetch_pc_track_v2`）与写操作（`pc_post_json`：收藏、歌单编辑、推荐流、播放上报等）。
+签名器故障时这些调用都会报错，而不是悄悄改发未签名请求。
+
+`get_download_info` 的取流回退边界：非签名故障仍按旧规则回退到 web 试听（以及手里的
+旧地址）；签名故障直接返回 `Err`，**不**因为 web 侧有预览流或手里有旧地址就返回 `Ok`。
+`check_stream_access` 仍返回诊断报告，但新增机器可读的 `signer_failed: bool`，
+`app_error` 继续保留原文。
 
 `CommandSignature::timeout_ms`（默认 5 s）自票
 [`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr

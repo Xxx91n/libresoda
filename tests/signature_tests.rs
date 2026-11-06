@@ -498,12 +498,36 @@ fn pc_track_v2_propagates_signer_failure_without_unsigned_request() {
         error.to_string().starts_with("signer error:"),
         "要带稳定前缀：{error}"
     );
+    assert!(
+        !error.to_string().contains("empty body"),
+        "不该走到未签名请求的空回包分支：{error}"
+    );
     // 结构上签名失败发生在 `post_json` 之前；这个时限只是把「没有偷偷去请求上游」
     // 变成可观察的失败，不押注具体网络耗时。
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
         "签名失败后不应再走网络：{:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn non_2xx_oversized_body_keeps_status_and_marks_truncation() {
+    // 2 MiB 错误页：非 2xx 仍要保住状态码/响应头，只截断响应体。
+    let body: &'static str = Box::leak("x".repeat(2 * 1024 * 1024).into_boxed_str());
+    let url = spawn_http_once("500 Internal Server Error", "", body);
+    let error = HttpSignature::new(url)
+        .timeout_ms(5_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("5xx 是签名故障");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 500"),
+        "超长响应体不能把状态码弄丢：{text}"
+    );
+    assert!(
+        text.contains("...(truncated)"),
+        "要标明响应体被截断：{text}"
     );
 }
 

@@ -23,22 +23,7 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
     let track_id = song_track_id(song);
     let cached = cached_download_info(song);
     if !track_id.is_empty() {
-        match resolve_download_info(soda, &track_id, None) {
-            Ok(info) => return Ok(info),
-            Err(err) => {
-                // 签名器故障不是"这一首拿不到"：即便手里有旧地址也要让调用方看见，
-                // 否则上层无法把签名服务故障与曲目权益区分开（#36 / sodam #103）。
-                if err.is_signer_failure() {
-                    return Err(err);
-                }
-                if let Some(cached) = cached {
-                    if !cached.url.is_empty() {
-                        return Ok(cached);
-                    }
-                }
-                return Err(err);
-            }
-        }
+        return prefer_cached(resolve_download_info(soda, &track_id, None), cached);
     }
     if let Some(cached) = cached {
         if !cached.url.is_empty() {
@@ -46,6 +31,28 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
         }
     }
     Err(SodaError::invalid_input("track id is empty"))
+}
+
+/// 解析失败时的取舍。
+///
+/// 签名器故障不是"这一首拿不到"：即便手里有旧地址也要让调用方看见，否则上层无法
+/// 把签名服务故障与曲目权益区分开（#36 / sodam #103）。其余错误沿用旧回退 ——
+/// 手里有可用地址就先返回它。
+fn prefer_cached(
+    resolved: Result<DownloadInfo>,
+    cached: Option<DownloadInfo>,
+) -> Result<DownloadInfo> {
+    let err = match resolved {
+        Ok(info) => return Ok(info),
+        Err(err) => err,
+    };
+    if err.is_signer_failure() {
+        return Err(err);
+    }
+    match cached {
+        Some(cached) if !cached.url.is_empty() => Ok(cached),
+        _ => Err(err),
+    }
 }
 
 /// 等价 `sodaCachedDownloadInfo`：从 `<url>#auth=<play_auth>` 恢复流量信息。
@@ -481,6 +488,50 @@ mod tests {
         .expect("非签名故障仍按旧规则回退");
         assert!(info.is_preview);
         assert_eq!(info.url, "https://cdn.example/track.m4a");
+    }
+
+    #[test]
+    fn cached_url_does_not_hide_a_signer_failure() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let error = prefer_cached(
+            Err(SodaError::http("signer error: connect to signer refused")),
+            Some(cached),
+        )
+        .expect_err("旧地址不能把签名故障盖掉");
+        assert!(error.is_signer_failure(), "{error}");
+    }
+
+    #[test]
+    fn cached_url_is_still_used_for_non_signer_failures() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let info = prefer_cached(
+            Err(SodaError::http(
+                "http request failed: status 500 (https://api.qishui.com/x)",
+            )),
+            Some(cached),
+        )
+        .expect("非签名故障沿用旧回退");
+        assert_eq!(info.url, "https://cdn.example/cached.m4a");
+    }
+
+    #[test]
+    fn resolved_stream_wins_over_cached() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let resolved = DownloadInfo {
+            url: "https://cdn.example/fresh.m4a".to_string(),
+            ..Default::default()
+        };
+        let info = prefer_cached(Ok(resolved), Some(cached)).expect("成功解析");
+        assert_eq!(info.url, "https://cdn.example/fresh.m4a");
     }
 
     #[test]

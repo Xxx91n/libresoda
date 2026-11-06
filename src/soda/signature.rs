@@ -367,7 +367,7 @@ impl HttpSignature {
 impl SignatureProvider for HttpSignature {
     fn sign(&self, request: &SignRequest) -> Result<SignResponse> {
         let payload = serde_json::to_vec(request)
-            .map_err(|err| SodaError::json(format!("sign request encode: {err}")))?;
+            .map_err(|err| SodaError::json(format!("signer request encode: {err}")))?;
         let mut option = crate::http::RequestOption::new()
             .header("Content-Type", "application/json; charset=utf-8")
             .header("Accept", "application/json")
@@ -383,7 +383,8 @@ impl SignatureProvider for HttpSignature {
             .map_err(with_signer_context)?;
         if !(200..300).contains(&reply.status) {
             return Err(SodaError::http(http_signature_failure_message(
-                &self.url, &reply,
+                &reply.final_url,
+                &reply,
             )));
         }
         Self::parse_response(&reply.body)
@@ -415,7 +416,10 @@ fn http_signature_failure_message(url: &str, reply: &crate::http::PostResponse) 
     if !headers.is_empty() {
         message.push_str(&format!("; headers: [{}]", headers.join(", ")));
     }
-    let body = truncate_for_error(String::from_utf8_lossy(&reply.body).trim(), 4096);
+    let mut body = truncate_for_error(String::from_utf8_lossy(&reply.body).trim(), 4096);
+    if reply.body_truncated && !body.ends_with("...(truncated)") {
+        body.push_str("...(truncated)");
+    }
     if !body.is_empty() {
         message.push_str(&format!("; body: {body}"));
     }
@@ -528,7 +532,7 @@ impl CommandSignature {
 impl SignatureProvider for CommandSignature {
     fn sign(&self, request: &SignRequest) -> Result<SignResponse> {
         let payload = serde_json::to_vec(request)
-            .map_err(|err| SodaError::json(format!("sign request encode: {err}")))?;
+            .map_err(|err| SodaError::json(format!("signer request encode: {err}")))?;
 
         let mut command = Command::new(&self.program);
         command
@@ -639,10 +643,11 @@ pub fn sign_request_with_headers(
 /// `x-helios` / `x-medusa`（也可以顺手带 `x-tt-trace-id` 等），
 /// `ms_token` / `a_bogus` 非空时会追加到 URL 查询参数上。
 ///
-/// 两种成功形态：
+/// 两种成功形态（`None` 只说明**URL 没被改写**，不说明没签名）：
 ///
-/// * `Ok(None)` —— **没有配置**签名器（或签名器明确回空）：调用方按未签名继续；
-/// * `Ok(Some(url))` —— 签名成功，URL 可能被 `msToken` / `a_bogus` 改写。
+/// * `Ok(None)` —— 没有配置签名器、签名器明确回空（如 [`NoopSignature`]），
+///   或只回请求头（头已写进 `options`）。调用方按原 URL 继续；
+/// * `Ok(Some(url))` —— 签名成功，URL 被 `msToken` / `a_bogus` 改写。
 ///
 /// `provider` 已配置但 `sign()` 失败时返回 `Err`，文案带 `signer`：
 /// **调用方不得再发未签名请求**。签名器已配置却失败不是"没配置"，把它降级成
