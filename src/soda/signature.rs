@@ -842,6 +842,20 @@ mod tests {
         );
     }
 
+    /// 票 #29：`signer stdin write: {err}` 的正向用例。
+    ///
+    /// 这条文案只由 `ChildError::Stdin` 产生，而真实管道到不了这个分类（读端关闭时只会回
+    /// `EPIPE`；产生侧由 `child.rs` 的
+    /// `run_reports_non_broken_pipe_write_error_as_stdin` 用注入的写入错误钉住）。这里钉
+    /// 分类到文案的边界，避免冻结文案被改写却没人发现。
+    #[test]
+    fn stdin_write_error_keeps_the_frozen_text() {
+        // program 不参与文案；用中性名字避免把前缀误读成来自 program。
+        let provider = CommandSignature::new("unused");
+        let error = provider.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
+        assert_eq!(error.to_string(), "signer stdin write: boom");
+    }
+
     #[test]
     fn stream_signature_without_provider_keeps_request_untouched() {
         let soda = super::super::Soda::new("sessionid_ss=test");

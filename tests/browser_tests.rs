@@ -21,6 +21,49 @@ where
         .expect("调用没有在期限内返回（用例自身挂住了）")
 }
 
+/// 读探针写出的 pid 文件：有界重试，不押注「请求返回时文件一定已经可见」。
+///
+/// 只接受以换行结尾的完整行（探针用 `echo` / `print(..., file=f)`）：读到半截数字时
+/// 不能把前缀当成 pid，否则后面的 `kill(pid, 0)` 会在错误的对象上得出「已消失」。
+#[cfg(unix)]
+fn read_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.ends_with('\n') {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "探针应把 pid 写出来：{}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 等到 pid 消失：组信号之后它可能先变成僵尸再被 init 收走，`kill(pid, 0)` 在这段里仍
+/// 返回 0；给 2 s 让内核完成回收，超时还没消失才算残留。
+#[cfg(unix)]
+fn assert_process_gone(pid: i32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "超时返回后 {what} {pid} 仍然存活"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn command_requester_rejects_non_zero_exit() {
     let requester = CommandRequester::new("sh").args(["-c", "printf bad >&2; exit 7"]);
@@ -80,37 +123,34 @@ fn command_requester_drains_and_parses_large_response() {
     assert_eq!(response.body.len(), 128 * 1024);
 }
 
-/// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
-/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— 它测的是「写入 / 排空与直接子进程
-/// 的关系」，进程树另有专项用例（见下方 `command_requester_kills_descendants_that_hold_the_pipe`）。
-/// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
-const DRAIN_PROBE_SCRIPT: &str = concat!(
-    "i=0; while [ $i -lt 4096 ]; do ",
-    "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
-    "i=$((i+1)); done; ",
-    "printf drained >&2; ",
-    "while :; do :; done",
-);
+/// 超时用例的驻留探针：先打 stderr 标记，再 `exec sleep 30` 驻留。
+///
+/// 票 #29：标记不排在「写完 256 KiB」之后（慢机/抢核时探针自己可能跑不到标记），驻留也
+/// 不用 `while :; do :; done`（白烧一个核）。排空证据在成功路径的
+/// `command_requester_drains_and_parses_large_response`：它要求 128 KiB 回包完整解析。
+/// 进程树另有专项用例（见下方 `command_requester_kills_descendants_that_hold_the_pipe`）。
+/// 两个测试 crate 各带一份探针：`tests/common` 是 MP4 素材模块，不混入进程探针。
+const RESIDENT_PROBE_SCRIPT: &str = "printf alive >&2; exec sleep 30";
 
 #[test]
-fn command_requester_times_out_while_draining_output() {
+fn command_requester_times_out_with_resident_child() {
     let requester = CommandRequester::new("sh")
-        .args(["-c", DRAIN_PROBE_SCRIPT])
+        .args(["-c", RESIDENT_PROBE_SCRIPT])
         .timeout_ms(2_000);
     let started = Instant::now();
     let error = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
-    .expect_err("写满输出又不退出，也得超时");
+    .expect_err("不读 stdin 又不退出，也得超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("requester timed out"), "{text}");
     assert!(!text.contains("requester exited"), "{text}");
     assert!(
-        text.contains("drained"),
-        "stdout 排空后子进程才走得到 stderr 标记：{text}"
+        text.contains("alive"),
+        "stderr 标记应随超时错误交回：{text}"
     );
-    assert!(elapsed < Duration::from_secs(5), "排空用例拖了 {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "超时用例拖了 {elapsed:?}");
 }
 
 #[test]
@@ -132,15 +172,22 @@ fn command_requester_times_out_when_child_never_exits() {
 
 /// 票 #25：直接子进程拉起一个继承 stdout/stderr 的后台 helper，自己驻留到超时。
 ///
-/// helper 活着的唯一证据就是写端没关：只 kill 直接子进程时排空线程等不到 EOF，1 s 宽限
-/// 走满后 stderr 按空输出处理；整棵树被终止时两个写端都关掉，探针在超时前写下的标记才能
-/// 随 EOF 交回来。`sh -c` 是非交互 shell，没有 job control，后台任务留在同一进程组里。
+/// helper 活着的唯一证据就是写端没关：整棵树被终止时两个写端都关掉，读线程立刻拿到 EOF，
+/// 探针写下的标记随之交回；只杀直接子进程时 helper 继续攥着写端，排空线程要走满 1 s 宽限
+/// 才交出已读到的部分。**「标记存在」本身不再证明树已终止**（票 #26 起宽限到点也会交回）
+/// —— 判据是返回时间：时限 2 s 不含宽限，只杀直接子进程时还要多等 1 s（约 3 s）。阈值取
+/// 中点 2.5 s，两边各留约 0.5 s。`sh -c` 是非交互 shell，没有 job control，后台任务留在
+/// 同一进程组里。
+///
+/// 票 #29：时限从 500 ms 放宽到 2 s —— 启动 `sh`、fork helper、写出标记都在时限之内，
+/// 旧值要求这三步在半秒内完成，抢核时会先超时、把失败原因变成「标记没写出来」。驻留改成
+/// `exec sleep 30`，不再用忙等烧核；标记先于驻留，不依赖大块输出。
 #[test]
 fn command_requester_kills_descendants_that_hold_the_pipe() {
-    const TREE_PROBE_SCRIPT: &str = "sleep 30 & printf tree-drained >&2; while :; do :; done";
+    const TREE_PROBE_SCRIPT: &str = "sleep 30 & printf tree-drained >&2; exec sleep 30";
     let requester = CommandRequester::new("sh")
         .args(["-c", TREE_PROBE_SCRIPT])
-        .timeout_ms(500);
+        .timeout_ms(2_000);
     let started = Instant::now();
     let error = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
@@ -152,11 +199,11 @@ fn command_requester_kills_descendants_that_hold_the_pipe() {
     assert!(!text.contains("requester exited"), "{text}");
     assert!(
         text.contains("tree-drained"),
-        "整棵树终止后读线程才拿得到 EOF 与 stderr：{text}"
+        "超时前写下的标记应随 EOF 或宽限交回：{text}"
     );
     assert!(
-        elapsed < Duration::from_secs(4),
-        "进程树用例拖了 {elapsed:?}"
+        elapsed < Duration::from_millis(2_500),
+        "标记随 EOF 交回 ≈ 树已终止；用满宽限说明写端仍被攥着：{elapsed:?}"
     );
 }
 
@@ -174,41 +221,25 @@ fn command_requester_kills_helper_process_on_timeout() {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+    // 票 #29：驻留用 `exec sleep 30`（不忙等），时限放宽到 2 s 覆盖启动 + fork + 写文件；
+    // pid 文件另做有界重试，不押注「请求返回时文件已经可见」。
     let script = format!(
-        "sleep 30 & echo $! > '{}'; while :; do :; done",
+        "sleep 30 & echo $! > '{}'; exec sleep 30",
         pid_file.display()
     );
     let requester = CommandRequester::new("sh")
         .args(["-c", script.as_str()])
-        .timeout_ms(1_000);
+        .timeout_ms(2_000);
     let error = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
     .expect_err("helper 不退出也得超时");
     assert!(error.to_string().contains("requester timed out"), "{error}");
 
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .expect("探针应把 helper 的 pid 写出来")
-        .trim()
-        .parse()
-        .expect("pid 应是整数");
+    let pid = read_pid_file(&pid_file, Duration::from_secs(2));
     let _ = std::fs::remove_file(&pid_file);
 
-    // 组信号之后 helper 可能先变成僵尸再被 init 收走，`kill(pid, 0)` 在这段里仍返回 0；
-    // 给 2 s 让内核完成回收，超时还没消失才算残留。
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "超时返回后 helper {pid} 仍然存活"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_process_gone(pid, "helper");
 }
 
 /// 票 #32 的验收：组杀「成功」不等于直接子进程已死。
@@ -216,7 +247,10 @@ fn command_requester_kills_helper_process_on_timeout() {
 /// 直接子进程（库用 `process_group(0)` 让它自领一组）先 fork 一个留在原组的 helper，再
 /// `setpgid` 把自己挪进父进程的组。此后 `kill(-原组, SIGKILL)` 只打到 helper，返回 0；
 /// 只看返回值就会跳过直接子进程，`terminate()` 的 `wait()` 便一直等到它自然退出。用例靠
-/// 6 s 看门狗把这个无界等待变成失败：修复前 `request()` 不返回，修复后正常报超时。
+/// 8 s 看门狗把这个无界等待变成失败：修复前 `request()` 不返回，修复后正常报超时。
+///
+/// 票 #29：时限从 1.5 s 放宽到 3 s —— python 启动、fork、`setpgid`、写 pid 文件与标记都
+/// 在时限之内；旧值在抢核环境下可能先超时。pid 文件读取另做有界重试。
 ///
 /// 用 `python3` 是因为 `sh` 没有 `setpgid` 内建；脚本里不 fork 别的 shell，helper 就是
 /// python 自己 fork 出来的那个。只在 Unix 上跑（`kill(pid, 0)` 与 `setpgid` 都是 Unix 语义）。
@@ -233,7 +267,7 @@ if os.fork() == 0:
     os._exit(0)
 os.setpgid(0, os.getpgid(os.getppid()))
 with open(sys.argv[1], "w") as f:
-    f.write(str(os.getpid()))
+    print(os.getpid(), file=f)
 sys.stderr.write("escaped %d\n" % os.getpgrp())
 sys.stderr.flush()
 time.sleep(60)
@@ -249,9 +283,9 @@ time.sleep(60)
     let pid_arg = pid_file.display().to_string();
     let requester = CommandRequester::new("python3")
         .args(["-c", ESCAPE_SCRIPT, pid_arg.as_str()])
-        .timeout_ms(1_500);
+        .timeout_ms(3_000);
     let started = Instant::now();
-    let error = run_with_watchdog(Duration::from_secs(6), move || {
+    let error = run_with_watchdog(Duration::from_secs(8), move || {
         requester.request(&BrowserRequest::default())
     })
     .expect_err("直接子进程逃出原组也不能跳过超时终止");
@@ -262,37 +296,61 @@ time.sleep(60)
         text.contains("escaped"),
         "要证明它真的走到了移组之后：{text}"
     );
-    assert!(elapsed < Duration::from_secs(5), "移组用例拖了 {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(6), "移组用例拖了 {elapsed:?}");
 
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .expect("探针应把直接子进程的 pid 写出来")
-        .trim()
-        .parse()
-        .expect("pid 应是整数");
+    let pid = read_pid_file(&pid_file, Duration::from_secs(2));
     let _ = std::fs::remove_file(&pid_file);
 
     // 组杀只带走了 helper；直接子进程要靠补打的 `Child::kill()` 才会消失。
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "逃出原组的直接子进程 {pid} 仍然存活"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_process_gone(pid, "逃出原组的直接子进程");
+}
+
+/// 票 #26 的验收：标记先写、写端被一个逃出进程组的 helper 攥住，超时错误仍要带出标记。
+///
+/// helper 在 `os.fork()` 出来的子进程里 `setsid()`（它不是组长，能成功），随后继承着
+/// stderr 睡 6 s；直接子进程在原地睡 60 s。超时组杀只带走直接子进程，helper 的写端让读线程
+/// 等不到 EOF —— 旧实现整段缓冲被丢，`requester timed out` 后面没有标记；现在宽限到点交出
+/// 已收到的部分，标记随错误一起回来。只跑 Unix（`setsid` 与 `fork` 都是 Unix 语义）。
+/// 时限按票 #29 的口径放到 3 s：python 启动、fork、写标记都要挤进时限，2 s 在抢核时会先超时。
+#[cfg(unix)]
+#[test]
+fn command_requester_delivers_stderr_before_escaped_helper_holds_the_pipe() {
+    const STALL_PROBE_SCRIPT: &str = r#"
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    time.sleep(6)
+    os._exit(0)
+sys.stderr.write("marker-before-timeout\n")
+sys.stderr.flush()
+time.sleep(60)
+"#;
+    let requester = CommandRequester::new("python3")
+        .args(["-c", STALL_PROBE_SCRIPT])
+        .timeout_ms(3_000);
+    let started = Instant::now();
+    let error = run_with_watchdog(Duration::from_secs(8), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 攥着 stderr 也不能跳过超时终止");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("requester timed out"), "{text}");
+    assert!(
+        text.contains("marker-before-timeout"),
+        "宽限到点应交出已收到的 stderr：{text}"
+    );
+    assert!(elapsed < Duration::from_secs(6), "标记用例拖了 {elapsed:?}");
 }
 
 /// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。
 ///
 /// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper
 /// 应当还活着 —— Windows 上 `release` 清不掉 `KILL_ON_JOB_CLOSE` 的话，`Job::drop` 会把它
-/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价也一并断言：helper 攥着
-/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层看到的是「返回无法解析」。
+/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。
+///
+/// 票 #26 改了口径：helper 攥着写端时读线程等不到 EOF，但宽限到点会交出**已收到**的回包，
+/// 所以这次请求成功 —— 代价是等满宽限（每条被攥住的流 1 s），不再把回包整块丢掉。
 #[test]
 fn command_requester_leaves_resident_descendants_on_success() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -311,16 +369,12 @@ fn command_requester_leaves_resident_descendants_on_success() {
          printf '{{\"ok\":true,\"status\":200,\"body\":\"\"}}'; exit 0"
     );
     let requester = CommandRequester::new("sh").args(["-c", script.as_str()]);
-    let error = run_with_watchdog(Duration::from_secs(5), move || {
+    let response = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
-    .expect_err("helper 攥着写端时回包应被宽限丢掉");
-    let text = error.to_string();
-    assert!(
-        text.contains("返回无法解析"),
-        "宽限到点后已收到的输出应被丢掉，只剩解析失败：{text}"
-    );
-    assert!(!text.contains("timed out"), "{text}");
+    .expect("helper 攥着写端时已收到的回包应被交出");
+    assert!(response.ok, "回包应能完整解析");
+    assert_eq!(response.status, 200);
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while !marker.exists() {

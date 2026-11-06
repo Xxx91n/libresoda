@@ -151,17 +151,16 @@ fn command_signature_times_out_when_signer_never_reads_or_exits() {
     );
 }
 
-/// 只在直接子进程里产出并驻留的探针：写固定 256 KiB 到 stdout、给 stderr 打标记，
-/// 然后原地忙等。全程只用 shell 内建、不 fork 子进程 —— 它测的是「写入 / 排空与直接子进程
-/// 的关系」；拉起 helper 的进程树用例在 `tests/browser_tests.rs`。
-/// 两个测试 crate 各带一份：`tests/common` 是 MP4 素材模块，不混入进程探针。
-const DRAIN_PROBE_SCRIPT: &str = concat!(
-    "i=0; while [ $i -lt 4096 ]; do ",
-    "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
-    "i=$((i+1)); done; ",
-    "printf drained >&2; ",
-    "while :; do :; done",
-);
+/// 超时用例的驻留探针：先打 stderr 标记，再 `exec sleep 30` 驻留。
+///
+/// 票 #29 有两条约束：标记不能排在「写完 256 KiB」之后（慢机/抢核时探针自己可能跑不到
+/// 标记），驻留也不能用 `while :; do :; done`（白烧一个核）。`sleep` 是阻塞等待，标记只
+/// 依赖 shell 启动。
+///
+/// 排空证据不放在这条用例里：`command_signature_drains_large_response` 用成功路径证明
+/// stdout 被并发读走。两个测试 crate 各带一份探针：`tests/common` 是 MP4 素材模块，不混入
+/// 进程探针。
+const RESIDENT_PROBE_SCRIPT: &str = "printf alive >&2; exec sleep 30";
 
 /// 把可能永久阻塞的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
 fn run_with_watchdog<T, F>(timeout: std::time::Duration, task: F) -> T
@@ -178,13 +177,11 @@ where
 }
 
 #[test]
-fn command_signature_times_out_while_draining_signer_output() {
-    // 两个方向同时压住：探针固定写 256 KiB（4× 64 KiB 默认管道容量）且从不读 stdin，
-    // 2 MiB 载荷会把写入线程卡在管道上 —— 没有排空线程会堵在 stdout、没有时限会卡在
-    // 写入，任一缺失都走不到 stderr 标记或拿不回错误。到点必须终止 + 回收并交回
-    // 可区分的超时错误。
+fn command_signature_times_out_with_resident_signer() {
+    // 2 MiB 载荷把写入线程卡在管道上；签名器既不读 stdin 也不退出。到点必须终止 + 回收，
+    // 并交回可区分的超时错误。标记先于驻留写出，慢机不会因为探针自己没跑完而红。
     let provider = CommandSignature::new("sh")
-        .args(["-c", DRAIN_PROBE_SCRIPT])
+        .args(["-c", RESIDENT_PROBE_SCRIPT])
         .timeout_ms(2_000);
     let started = std::time::Instant::now();
     let request = sign_request(
@@ -195,19 +192,47 @@ fn command_signature_times_out_while_draining_signer_output() {
     let error = run_with_watchdog(std::time::Duration::from_secs(5), move || {
         provider.sign(&request)
     })
-    .expect_err("写满输出又不退出，也得超时");
+    .expect_err("签名器不退出就得报超时");
     let elapsed = started.elapsed();
     let text = error.to_string();
     assert!(text.contains("timed out"), "{text}");
-    assert!(!text.contains("signer exited"), "{text}");
     assert!(
-        text.contains("drained"),
-        "stdout 排空后子进程才走得到 stderr 标记：{text}"
+        !text.contains("signer exited"),
+        "超时不能伪装成正常退出：{text}"
+    );
+    assert!(
+        text.contains("alive"),
+        "stderr 标记应随超时错误交回：{text}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "排空用例拖了 {elapsed:?}"
+        "超时用例拖了 {elapsed:?}"
     );
+}
+
+/// 成功路径的排空证据（票 #29）：子进程先读干净 stdin，再往 stdout 写 128 KiB 合法 JSON
+/// 并退出 0。128 KiB 是默认 64 KiB 管道容量的两倍；没有并发排空，子进程写完约 64 KiB 就会
+/// 阻塞在管道上，`sign()` 只能等到超时。断言的是「能退出并完整解析」，不是「恰好很快」。
+#[test]
+fn command_signature_drains_large_response() {
+    const LARGE_RESPONSE_SCRIPT: &str = concat!(
+        "cat >/dev/null; printf '{\"msToken\":\"'; ",
+        "i=0; while [ $i -lt 2048 ]; do ",
+        "printf 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; ",
+        "i=$((i+1)); done; ",
+        "printf '\"}'"
+    );
+    let provider = CommandSignature::new("sh")
+        .args(["-c", LARGE_RESPONSE_SCRIPT])
+        // 上限只是失败路径的兜底；成功路径约 0.5 s 返回，不受这个大数拖累。
+        .timeout_ms(5_000);
+    let request = sign_request("https://api.qishui.com/x", "POST", "{}");
+    // 库内时限之外再加一层看门狗：库若退回无限等待，这里是失败而不是挂住 `cargo test`。
+    let response = run_with_watchdog(std::time::Duration::from_secs(8), move || {
+        provider.sign(&request)
+    })
+    .expect("大回包应能解析");
+    assert_eq!(response.ms_token.len(), 2048 * 64);
 }
 
 #[test]

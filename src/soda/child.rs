@@ -29,10 +29,12 @@ fn next_poll_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(POLL_INTERVAL_MAX)
 }
 
-/// 子进程结束/被终止后，收集工作线程结果的宽限。
+/// 子进程结束/被终止后，收集**每个流**工作线程结果的宽限。
 ///
-/// 正常路径它们在管道 EOF 上立刻结束；逃出进程组/作业的后继进程攥着管道时才可能走满。宽限只保证
-/// 调用方回来，不负责回收卡在阻塞写/读上的线程（std 无法从外部中断它们）。
+/// 正常路径它们在管道 EOF 上立刻结束；逃出进程组/作业的后继进程攥着管道时才可能走满。三个流
+/// 各自从「开始收它」起算（票 #26）：写线程被攥住吃掉一个宽限，不会把 stdout/stderr 的宽限
+/// 挤成 0；成功路径最坏等 3 个宽限，超时路径只等 stderr 一个。宽限只保证调用方回来，不负责
+/// 回收卡在阻塞写/读上的线程（std 无法从外部中断它们）。
 const THREAD_GRACE: Duration = Duration::from_secs(1);
 
 /// 单个输出流最多收集这么多字节，超出部分继续排空但丢弃。
@@ -71,19 +73,32 @@ pub(crate) fn run(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> Result<ChildOutput, ChildError> {
-    run_with_attach(command, payload, timeout_ms, tree::attach)
+    run_with(command, payload, timeout_ms, tree::attach, write_stdin)
 }
 
-/// `run` 的本体。`attach` 作为参数传入，用例才能稳定造出 attach 失败来钉**调用点**
-/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）；生产路径永远传 `tree::attach`。
-fn run_with_attach<A>(
+/// 把载荷写进子进程 stdin 的生产实现。
+///
+/// 作为参数传给 `run_with`，用例才能注入一个**非断管**的写入错误（票 #29）：真实管道在
+/// 上游只会回 `EPIPE`（`SIGPIPE` 被忽略时映射成 `BrokenPipe`），这条分支到达不了。
+fn write_stdin(stdin: &mut std::process::ChildStdin, payload: Vec<u8>) -> io::Result<()> {
+    stdin.write_all(&payload)
+}
+
+/// `run` 的本体：attach 与 stdin 写入都可注入。
+///
+/// 两者都只服务分类边界上的用例 —— attach 失败、非断管写入错误；生产路径永远传
+/// `tree::attach` 与 `write_stdin`。attach 要能注入，用例才能稳定造出失败来钉**调用点**
+/// （只钉收场函数的话，这里把返回值吞掉仍能全绿）。
+fn run_with<A, W>(
     command: &mut Command,
     payload: Vec<u8>,
     timeout_ms: u64,
     attach: A,
+    write: W,
 ) -> Result<ChildOutput, ChildError>
 where
     A: FnOnce(&tree::Job, &Child) -> io::Result<()>,
+    W: FnOnce(&mut std::process::ChildStdin, Vec<u8>) -> io::Result<()> + Send + 'static,
 {
     // 先把容器准备好，再 spawn：Unix 是进程组（spawn 时生效），Windows 是作业句柄。
     // 容器建不出来就不跑 —— 宁可不启动，也不假装能兜住整棵树。
@@ -105,7 +120,7 @@ where
     let (write_tx, write_rx) = mpsc::channel();
     thread::spawn(move || {
         // None = 写完；Some(err) = 写到一半失败。断管是预期内的一种。
-        let result = stdin.write_all(&payload).err();
+        let result = write(&mut stdin, payload).err();
         // 写端必须在这里关掉：子进程靠 EOF 判断「请求读完了」。
         drop(stdin);
         let _ = write_tx.send(result);
@@ -160,13 +175,12 @@ where
         if let Err(err) = terminate(&tree, &mut child) {
             return Err(ChildError::Wait(err));
         }
-        let stderr = collect(stderr, Instant::now() + THREAD_GRACE).unwrap_or_default();
+        let stderr = collect_stream(stderr, Instant::now() + THREAD_GRACE);
         return Err(ChildError::Timeout { stderr });
     };
 
-    let grace_deadline = Instant::now() + THREAD_GRACE;
     if !write_finished {
-        match collect(Some(write_rx), grace_deadline) {
+        match collect_write(write_rx, Instant::now() + THREAD_GRACE) {
             Some(Some(err)) if err.kind() != ErrorKind::BrokenPipe => {
                 return Err(ChildError::Stdin(err));
             }
@@ -176,8 +190,8 @@ where
             None => write_incomplete = true,
         }
     }
-    let stdout = collect(stdout, grace_deadline).unwrap_or_default();
-    let stderr = collect(stderr, grace_deadline).unwrap_or_default();
+    let stdout = collect_stream(stdout, Instant::now() + THREAD_GRACE);
+    let stderr = collect_stream(stderr, Instant::now() + THREAD_GRACE);
 
     // 成功路径不杀愿意继续驻留的后继进程：Windows 侧先清掉 `KILL_ON_JOB_CLOSE` 再关句柄，
     // 与 Unix 进程组（不打信号就不动组里的进程）对齐。
@@ -226,33 +240,67 @@ fn attach_or_abort(
     }
 }
 
+/// 读一个管道：分块送到收集方，EOF/读错误时关闭发送端。
+///
+/// 不攒到 EOF 才交（票 #26）：宽限到点时收集方要能拿到已经读到的部分。8 MiB 上限照旧，
+/// 超出的字节继续读走（排空）但不再发送。
 fn spawn_reader<R>(mut pipe: R) -> Receiver<Vec<u8>>
 where
     R: Read + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut collected = Vec::new();
+        let mut captured_bytes = 0_usize;
         let mut buffer = [0_u8; READ_CHUNK_BYTES];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    // 超出上限的字节照样读走（排空），但不留在内存里。
-                    let room = MAX_CAPTURE_BYTES.saturating_sub(collected.len());
-                    collected.extend_from_slice(&buffer[..read.min(room)]);
+                    let room = MAX_CAPTURE_BYTES.saturating_sub(captured_bytes);
+                    if room == 0 {
+                        continue;
+                    }
+                    let take = read.min(room);
+                    captured_bytes += take;
+                    // 收集方已经走了也要继续读走：排空是读线程的职责，发送失败只是没人收。
+                    let _ = tx.send(buffer[..take].to_vec());
                 }
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
-        let _ = tx.send(collected);
     });
     rx
 }
 
-fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
-    let receiver = receiver?;
+/// 收集一个输出流：分块累加，直到宽限到点或读线程关闭发送端。
+///
+/// 到点时交出**已收到**的部分（票 #26）；`None`（没有这个管道）按空输出处理。
+/// 总量上限由发送方 `spawn_reader` 夹在 `MAX_CAPTURE_BYTES` 以内，这里不再重复夹紧。
+fn collect_stream(receiver: Option<Receiver<Vec<u8>>>, deadline: Instant) -> Vec<u8> {
+    let Some(receiver) = receiver else {
+        return Vec::new();
+    };
+    let mut collected = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    debug_assert!(
+        collected.len() <= MAX_CAPTURE_BYTES,
+        "发送方应已夹紧上限（见 reader_caps_capture_and_keeps_draining）"
+    );
+    collected
+}
+
+/// 等写线程的唯一一条结果（写完 / 写到一半的错误）。宽限到了还没来按「没交全」处理。
+fn collect_write(
+    receiver: Receiver<Option<io::Error>>,
+    deadline: Instant,
+) -> Option<Option<io::Error>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     receiver.recv_timeout(remaining).ok()
 }
@@ -445,11 +493,10 @@ mod tests {
             inner: Cursor::new(vec![b'x'; total]),
             read: Arc::clone(&read),
         };
-        let collected = collect(
+        let collected = collect_stream(
             Some(spawn_reader(reader)),
             Instant::now() + Duration::from_secs(5),
-        )
-        .expect("读线程应把结果送回来");
+        );
         assert_eq!(
             collected.len(),
             MAX_CAPTURE_BYTES,
@@ -459,6 +506,117 @@ mod tests {
             read.load(Ordering::Relaxed),
             total,
             "超出上限的字节也必须读走（排空）"
+        );
+    }
+
+    /// 票 #26：宽限到点时读线程还没看到 EOF，也必须交出已经读到的部分。
+    struct MarkerThenStall {
+        sent: bool,
+    }
+
+    impl Read for MarkerThenStall {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                // 这条用例的截止时间是 500 ms，这里拖到 2 s：收集方必须在 EOF 之前返回。
+                thread::sleep(Duration::from_secs(2));
+                return Ok(0);
+            }
+            self.sent = true;
+            buf[..6].copy_from_slice(b"marker");
+            Ok(6)
+        }
+    }
+
+    #[test]
+    fn collect_stream_returns_partial_buffer_when_grace_expires() {
+        let started = Instant::now();
+        let collected = collect_stream(
+            Some(spawn_reader(MarkerThenStall { sent: false })),
+            Instant::now() + Duration::from_millis(500),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            collected,
+            b"marker".to_vec(),
+            "宽限到点也要交出已读到的字节"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "宽限到点就该返回，不能等到 2 s 的 EOF：{elapsed:?}"
+        );
+    }
+
+    /// 把可能无界等待的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
+    #[cfg(unix)]
+    fn run_with_watchdog<T, F>(timeout: Duration, task: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(task());
+        });
+        rx.recv_timeout(timeout)
+            .expect("调用没有在期限内返回（用例自身挂住了）")
+    }
+
+    /// 票 #26：写线程被 helper 攥住吃满一个宽限时，stdout/stderr 仍各自拿得到宽限。
+    ///
+    /// 直接子进程（python）不读 stdin 就退出；fork 出来的 helper 继承 stdin 的读端，所以两百万
+    /// 字节的载荷写不完，写线程要耗掉一整个宽限。helper 同时继承了 stdout/stderr，等过 1.2 个
+    /// 宽限才开始写标记，并每 0.1 s 重复写到 1.8 个宽限 —— 这个窗口落在「写宽限结束（1 个）
+    /// 到 stdout 截止（2 个）」之间，单次唤醒被调度拖后也不会整段落出截止点。旧实现三个流共用
+    /// 一个截止时间，stdout/stderr 的截止点已经过去，标记全部丢失；现在各自计时（从开始收它
+    /// 起算），两份都能交回来。用 python 而不是 `sh -c '(...) &'`：POSIX 会把非交互 shell 的
+    /// 后台列表的 stdin 接到 /dev/null，读端就没了。
+    #[cfg(unix)]
+    #[test]
+    fn streams_get_their_own_grace_when_the_write_is_stuck() {
+        let grace = THREAD_GRACE.as_secs_f64();
+        let script = format!(
+            r#"
+import os, time
+if os.fork() == 0:
+    time.sleep({marker_delay})
+    end = time.time() + {write_window}
+    while time.time() < end:
+        os.write(1, b"out")
+        os.write(2, b"err")
+        time.sleep(0.1)
+    time.sleep({exit_after})
+    os._exit(0)
+os._exit(0)
+"#,
+            marker_delay = grace * 1.2,
+            write_window = grace * 0.6,
+            exit_after = grace * 0.5,
+        );
+        let run_timeout_ms = (grace * 3_000.0) as u64;
+        let output = run_with_watchdog(Duration::from_secs_f64(grace * 5.0), move || {
+            let mut command = Command::new("python3");
+            command.args(["-c", script.as_str()]);
+            command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            run(&mut command, vec![b'x'; 2 * 1024 * 1024], run_timeout_ms).ok()
+        })
+        .expect("子进程正常退出，不该走错误分支");
+        assert!(output.status.success(), "探针应以 0 退出");
+        assert!(
+            output.stdout.starts_with(b"out"),
+            "stdout 应拿到自己的宽限：{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.starts_with(b"err"),
+            "stderr 应拿到自己的宽限：{:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.request_write_failed,
+            "写端被 helper 攥住时应按请求没交全记"
         );
     }
 
@@ -514,6 +672,16 @@ mod tests {
             command
         };
         quiet(command)
+    }
+
+    /// 按生产路径给三个流接管道：`run_with` 要能取到 stdin/stdout/stderr。
+    #[cfg(any(unix, windows))]
+    fn piped(mut command: Command) -> Command {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
     }
 
     /// 探针不碰终端：stdio 全空。
@@ -596,9 +764,13 @@ mod tests {
     #[test]
     fn run_reports_spawn_when_attach_fails_and_child_is_alive() {
         let mut command = quiet(live_command());
-        let error = super::run_with_attach(&mut command, Vec::new(), 5_000, |_, _| {
-            Err(io::Error::from_raw_os_error(5))
-        })
+        let error = super::run_with(
+            &mut command,
+            Vec::new(),
+            5_000,
+            |_, _| Err(io::Error::from_raw_os_error(5)),
+            super::write_stdin,
+        )
         // `ChildOutput` 没有 `Debug`，不能用 `expect_err`（它要打印 Ok 值）。
         .err()
         .expect("attach 失败且子进程还活着必须报错");
@@ -606,6 +778,116 @@ mod tests {
             matches!(error, ChildError::Spawn(ref err) if err.raw_os_error() == Some(5)),
             "应报 Spawn（错误 5）"
         );
+    }
+
+    /// 票 #29：非断管写入错误的分类与收尸。
+    ///
+    /// 真实管道到不了这条分支：读端关闭时 `write` 只回 `EPIPE`（`SIGPIPE` 已忽略时是
+    /// `BrokenPipe`），所以用 `run_with` 的写入参数注入一个别的错误。断言分类是 `Stdin`
+    /// （上层据此翻成 `signer|requester stdin write: {err}`），并且原始错误原样带上去。
+    /// 本用例只钉分类与原始错误；收尸不在这里断言 —— `run_with` 在返回前调用共享的
+    /// `terminate`，终止与回收由 `attach_or_abort_kills_live_child_and_reports` 和进程树
+    /// 用例覆盖（注入的写入错误会在观察到的下一拍立即返回，不等待子进程自然退出）。
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn run_reports_non_broken_pipe_write_error_as_stdin() {
+        let mut command = piped(live_command());
+        let error = super::run_with(
+            &mut command,
+            vec![b'x'; 8],
+            5_000,
+            super::tree::attach,
+            |_, _| Err(io::Error::other("injected write failure")),
+        )
+        .err()
+        .expect("非断管写入错误必须报 Err(Stdin)");
+        match error {
+            ChildError::Stdin(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+                assert!(
+                    err.to_string().contains("injected write failure"),
+                    "原始错误要原样向上：{err}"
+                );
+            }
+            _ => panic!("非断管写入错误必须归到 Stdin，而不是其它分类"),
+        }
+    }
+
+    /// 票 #29 / #23：非断管写入错误在返回前必须终止并回收子进程。
+    ///
+    /// 上一条只钉分类；这条让注入的写入错误等探针写出自己的 pid 后再返回，随后用
+    /// `kill(pid, 0)` 确认它已经消失 —— 把「早退路径漏收尸」钉在调用点上。只在 Unix 上跑：
+    /// `kill(pid, 0)` 是 Unix 语义；Windows 的 Job Object 终止由进程树用例覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn run_reaps_child_when_stdin_write_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid_file = std::env::temp_dir().join(format!(
+            "libresoda-child-stdin-{}-{}.pid",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]);
+        let mut command = piped(command);
+
+        // 写线程等到探针把 pid 落盘再注入错误：避免「错误先到、shell 还没启动」时
+        // 用例拿到一个根本不存在的 pid。
+        let seen = pid_file.clone();
+        let error = super::run_with(
+            &mut command,
+            Vec::new(),
+            5_000,
+            super::tree::attach,
+            move |_, _| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if std::fs::read_to_string(&seen).is_ok_and(|text| text.ends_with('\n')) {
+                        return Err(io::Error::other("injected write failure"));
+                    }
+                    // 不在写线程里 panic：那条路径不会把消息交回调用方。超时也按写入错误
+                    // 返回，由下面的文案断言把「探针没写出 pid」和真正的注入错误分开。
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("probe did not write pid"));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .err()
+        .expect("非断管写入错误必须报 Err(Stdin)");
+        match error {
+            ChildError::Stdin(err) => assert!(
+                err.to_string().contains("injected write failure"),
+                "注入的写入错误应原样向上：{err}"
+            ),
+            _ => panic!("非断管写入错误必须归到 Stdin，而不是其它分类"),
+        }
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("探针应把 pid 写出来")
+            .trim()
+            .parse()
+            .expect("pid 应是整数");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "写入错误返回后子进程 {pid} 仍然存活（早退路径漏了收尸）"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// 票 #32 的前提与判据一起钉住（Windows）：对已退出的进程 `AssignProcessToJobObject`
