@@ -45,6 +45,25 @@ fn read_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
     }
 }
 
+/// 等到 pid 消失：组信号之后它可能先变成僵尸再被 init 收走，`kill(pid, 0)` 在这段里仍
+/// 返回 0；给 2 s 让内核完成回收，超时还没消失才算残留。
+#[cfg(unix)]
+fn assert_process_gone(pid: i32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "超时返回后 {what} {pid} 仍然存活"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn command_requester_rejects_non_zero_exit() {
     let requester = CommandRequester::new("sh").args(["-c", "printf bad >&2; exit 7"]);
@@ -217,21 +236,7 @@ fn command_requester_kills_helper_process_on_timeout() {
     let pid = read_pid_file(&pid_file, Duration::from_secs(2));
     let _ = std::fs::remove_file(&pid_file);
 
-    // 组信号之后 helper 可能先变成僵尸再被 init 收走，`kill(pid, 0)` 在这段里仍返回 0；
-    // 给 2 s 让内核完成回收，超时还没消失才算残留。
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "超时返回后 helper {pid} 仍然存活"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_process_gone(pid, "helper");
 }
 
 /// 票 #32 的验收：组杀「成功」不等于直接子进程已死。
@@ -294,19 +299,7 @@ time.sleep(60)
     let _ = std::fs::remove_file(&pid_file);
 
     // 组杀只带走了 helper；直接子进程要靠补打的 `Child::kill()` 才会消失。
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "逃出原组的直接子进程 {pid} 仍然存活"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_process_gone(pid, "逃出原组的直接子进程");
 }
 
 /// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。

@@ -668,6 +668,77 @@ mod tests {
         }
     }
 
+    /// 票 #29 / #23：非断管写入错误在返回前必须终止并回收子进程。
+    ///
+    /// 上一条只钉分类；这条让注入的写入错误等探针写出自己的 pid 后再返回，随后用
+    /// `kill(pid, 0)` 确认它已经消失 —— 把「早退路径漏收尸」钉在调用点上。只在 Unix 上跑：
+    /// `kill(pid, 0)` 是 Unix 语义；Windows 的 Job Object 终止由进程树用例覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn run_reaps_child_when_stdin_write_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid_file = std::env::temp_dir().join(format!(
+            "libresoda-child-stdin-{}-{}.pid",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]);
+        let mut command = piped(command);
+
+        // 写线程等到探针把 pid 落盘再注入错误：避免「错误先到、shell 还没启动」时
+        // 用例拿到一个根本不存在的 pid。
+        let seen = pid_file.clone();
+        let error = super::run_with(
+            &mut command,
+            Vec::new(),
+            5_000,
+            super::tree::attach,
+            move |_, _| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if std::fs::read_to_string(&seen).is_ok_and(|text| text.ends_with('\n')) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "探针没有写出 pid");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(io::Error::other("injected write failure"))
+            },
+        )
+        .err()
+        .expect("非断管写入错误必须报 Err(Stdin)");
+        assert!(
+            matches!(error, ChildError::Stdin(_)),
+            "非断管写入错误应报 Stdin"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("探针应把 pid 写出来")
+            .trim()
+            .parse()
+            .expect("pid 应是整数");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: `kill(2)` 只读这两个整数，不碰进程内存。
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "写入错误返回后子进程 {pid} 仍然存活（早退路径漏了收尸）"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// 票 #32 的前提与判据一起钉住（Windows）：对已退出的进程 `AssignProcessToJobObject`
     /// 真的会失败（`ERROR_ACCESS_DENIED` = 5），而 `run` 的分类不把它当 `Spawn`。
     ///

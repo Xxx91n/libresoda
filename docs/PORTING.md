@@ -687,21 +687,23 @@
     自然退出（8 s 看门狗把无界等待变成失败），修复后正常报超时，并从 pid 文件用 `kill(pid, 0)`
     确认直接子进程已消失。`python3` 是这条用例额外要的解释器（`sh` 没有 `setpgid` 内建），只在
     Unix 上跑。
-    `src/soda/child.rs` 八条单元用例（其中一条只在 Windows 上编译）—— 钉 8 MiB 收集上限（超出字节
-    读走但丢弃）、钉票 #28 的退避序列 0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」（所以超时那一拍
-    的宽限仍与 `#23` 一致）、票 #29 注入一个非断管写入错误钉 `ChildError::Stdin`，以及票 #32 的四条
-    attach 收场：已退出的子进程不算 `Spawn` 失败、还活着的子进程 attach 失败必须报 `Spawn`（并断言
-    已终止收尸）、`run` 端到端在 attach 失败且子进程活着时必须报 `Spawn`（钉调用点：吞掉返回值会
-    走到 `StdinUnavailable`），Windows 上再真调一次 `AssignProcessToJobObject`（对已退出的进程）
-    钉住「确实回错误 5、且收场为非致命」—— 竞态窗口没法稳定构造，钉的是窗口的结果；判定与终止
-    一起放在 `attach_or_abort`，用例直接喂 attach 结果，不伪造 Win32 调用。
+    `src/soda/child.rs` 九条单元用例（其中一条只在 Windows 上编译、一条只在 Unix 上跑）—— 钉 8 MiB
+    收集上限（超出字节读走但丢弃）、钉票 #28 的退避序列 0.5 → 1 → 2 → 4 → 8 → 10 ms、钉「到顶不再涨」
+    （所以超时那一拍宽限仍与 `#23` 一致）、票 #29 注入一个非断管写入错误钉 `ChildError::Stdin`
+    （Unix 另有一条用 pid 确认早退路径真的终止并回收），以及票 #32 的四条 attach 收场：已退出的
+    子进程不算 `Spawn` 失败、还活着的子进程 attach 失败必须报 `Spawn`（并断言已终止收尸）、`run`
+    端到端在 attach 失败且子进程活着时必须报 `Spawn`（钉调用点：吞掉返回值会走到
+    `StdinUnavailable`），Windows 上再真调一次 `AssignProcessToJobObject`（对已退出的进程）钉住
+    「确实回错误 5、且收场为非致命」—— 竞态窗口没法稳定构造，钉的是窗口的结果；判定与终止一起
+    放在 `attach_or_abort`，用例直接喂 attach 结果，不伪造 Win32 调用。
     全部离线，超时用例时限 200 ms–3 s（还有 1 s 线程宽限），大回包用例的子进程上限是 5 s / 10 s，
-    驻留用例用 4–5 s 看门狗、移组用例用 8 s；计时用例都把调用放进带 `recv_timeout` 的线程里，
+    驻留用例用 5 s 看门狗、移组用例用 8 s；计时用例都把调用放进带 `recv_timeout` 的线程里，
     库一旦退回无限等待就是 3–8 s 内失败而不是挂住，不拖慢 `cargo test`。票 #29 把两条进程树
     用例的时限从 500 ms / 1 s 放宽到 2 s，并给 pid 文件读取加了 2 s 有界重试：启动 `sh`、fork
     helper、写 pid/标记原先都要挤在半秒里，抢核时会先超时、失败原因变成「标记/pid 没写出来」。
-    排空探针只用 shell 内建、不 fork 子进程，测的是写入/排空与直接子进程的关系；进程树由上面
-    四条专项用例覆盖。
+    超时探针只用 shell 内建、不 fork 子进程，测的是写入/等待与直接子进程的关系；成功路径的
+    排空用例用 `cat` 读干净 stdin（它在回包前退出，不参与排空断言）。进程树由上面四条专项
+    用例覆盖。
   - **`signer stdin write: {err}` 的可测边界（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29)）**：
     真实管道到不了这个分类 —— 读端关闭时 `write` 只回 `EPIPE`（Rust 默认忽略 SIGPIPE，映射成
     `ErrorKind::BrokenPipe`，走「断管归因给退出码/stderr」那条），其它非断管写入错误没有稳定、
