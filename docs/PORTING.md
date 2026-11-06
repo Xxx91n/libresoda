@@ -815,6 +815,25 @@
     code/retry_after（含字符串形式）、空签名回包报错、2xx 超长回包报错、连接拒绝、超时、
     `fetch_pc_track_v2` 传播签名失败且不走网络、远程 5xx 端到端）。全部离线，无新依赖。
 
+* **签名错误透传收尾：非 2xx 响应体脱敏（`soda::signature`，上游无对应）**：实现票
+  [`#38`](https://github.com/sodahub-org/libresoda/issues/38)，#36 合入时记录的非阻断后续。
+  `http_signature_failure_message` 的响应体此前按原文截到 4096 字符就拼进错误文案；
+  反代/网关错误页常回显请求行或请求头，签名地址的 `?token=…` 会随 body 进
+  `SodaError` → `StreamAccessReport.app_error` → 日志。现在 body **先脱敏再截断**：
+  先过 `redact_urls_in_text`（回显 URL 的 userinfo/查询/fragment 整体去掉），再由
+  `redact_bare_credentials` 兜底 URL 之外的裸 `token=` / `Bearer` 令牌（大小写不敏感，
+  值读到空白/`&`，末尾闭合符原样补回；`bearer` 后不跟空白不算令牌，`bearers` 不误伤）。
+  先截断再脱敏会把 token 留在前 4096 字符里，顺序不能反。只作用于错误文案，不改服务端
+  回包本身；状态码、`Retry-After` 等处置头与 body 其他内容仍可读。两个脱敏函数只
+  lowercase 一次 + 单向游标（共用 `next_marker`），标记密集或某类标记缺失时仍是 O(n)，
+  不在同步签名的错误路径上放大 CPU（CodeRabbit 安全审查返修；此前每轮重 lowercase 剩余
+  后缀是平方级）。结构化 `SodaError::Signer` 变体不在本票范围（破坏性变更，另票）。**测试**：
+  `tests/signature_tests.rs` 四条（body 回显 URL 查询 token、body 里的 Bearer/裸 token
+  大小写不敏感、超长 body 先脱敏再截断仍无 token、超长 token 脱敏缩短 body 后其后的
+  诊断内容仍存活——最后一条用「先截断再脱敏会切掉它」锁住顺序本身）；
+  `src/soda/signature.rs` 两条（兜底边界：`&` 分隔、闭合引号、`bearers` 不误伤、空值、
+  多空白；密集标记下 token/Bearer/URL 逐个全脱敏、诊断尾巴保留）。全部离线，无新依赖。
+
 ## 未移植项
 
 > **客户端能力（上游 `music-lib` 完全没有，2026-09-15 照官方客户端 IDL 补齐并真机验证）**：

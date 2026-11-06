@@ -429,7 +429,8 @@ fn redact_url_for_error(url: &str) -> String {
 ///
 /// 形状刻意保留旧的 `http request failed: status {code} ({url})`，再补上响应头
 /// （含 `Retry-After`）与响应体；`signer error:` 前缀是上层分类的稳定入口。
-/// 回包体与头值都截断，不让签名服务的错误页把日志撑爆。
+/// 响应体先脱敏（URL 与裸 token/Bearer）再截断，回包体与头值都有上限，
+/// 不让签名服务的错误页把日志撑爆。
 fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     let mut message = format!(
         "signer error: http request failed: status {} ({})",
@@ -452,7 +453,12 @@ fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     if !headers.is_empty() {
         message.push_str(&format!("; headers: [{}]", headers.join(", ")));
     }
-    let mut body = truncate_for_error(String::from_utf8_lossy(&reply.body).trim(), 4096);
+    // 先脱敏再截断：先截断会把 token 留在前 4096 字符里（票 #38）。
+    // URL 整体脱敏在前：查询里的 token 随整个查询去掉，兜底只处理 URL 之外的裸令牌。
+    let body = redact_bare_credentials(&redact_urls_in_text(
+        String::from_utf8_lossy(&reply.body).trim(),
+    ));
+    let mut body = truncate_for_error(&body, 4096);
     if reply.body_truncated && !body.ends_with("...(truncated)") {
         body.push_str("...(truncated)");
     }
@@ -515,24 +521,32 @@ fn signer_transport_error(url: &str, error: SodaError) -> SodaError {
     with_signer_context(error)
 }
 
+/// 从 `from` 起在已小写化的字节里找下一个标记起点：逐字节前进、只在标记处停下。
+/// 配合「只 lowercase 一次 + 游标单调前进」，标记密集或某类标记缺失时仍是 O(n)，
+/// 不会每轮重扫剩余后缀而在错误路径上放大 CPU（票 #38 CodeRabbit 安全审查）。
+/// 标记都是 ASCII，UTF-8 续字节（≥0x80）不会误匹配，返回偏移可直接切原文。
+fn next_marker(lowered: &[u8], from: usize, markers: &[&[u8]]) -> Option<usize> {
+    let mut i = from;
+    while i < lowered.len() {
+        if markers.iter().any(|m| lowered[i..].starts_with(m)) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// 把文本里出现的每个 `http(s)://…` 令牌交给 [`redact_url_for_error`]。
 fn redact_urls_in_text(text: &str) -> String {
+    // 大小写不敏感的 scheme（ureq/代理可能回显 `HTTP://`）；ASCII 小写化
+    // 不改变字节偏移，找到的 index 可以直接切原文。只 lowercase 一次。
+    let lowered = text.to_ascii_lowercase();
     let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        // 大小写不敏感的 scheme（ureq/代理可能回显 `HTTP://`）；ASCII 小写化
-        // 不改变字节偏移，找到的 index 可以直接切原文。
-        let lowered = rest.to_ascii_lowercase();
-        let next = [lowered.find("http://"), lowered.find("https://")]
-            .into_iter()
-            .flatten()
-            .min();
-        let Some(index) = next else {
-            output.push_str(rest);
-            break;
-        };
-        output.push_str(&rest[..index]);
-        let tail = &rest[index..];
+    let mut cursor = 0;
+    let mut literal = 0;
+    while let Some(index) = next_marker(lowered.as_bytes(), cursor, &[b"http://", b"https://"]) {
+        output.push_str(&text[literal..index]);
+        let tail = &text[index..];
         let token_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
         // 不能按标点把 URL 提前截断：查询值里可能出现 `]` / `)` / `,`，截断会把
         // 后半段留在文本里反而泄漏。这里只在令牌**末尾**把成对的闭合符/句读剥出来，
@@ -547,8 +561,71 @@ fn redact_urls_in_text(text: &str) -> String {
         }
         output.push_str(&redact_url_for_error(&tail[..url_end]));
         output.push_str(&tail[url_end..token_end]);
-        rest = &tail[token_end..];
+        cursor = index + token_end;
+        literal = cursor;
     }
+    output.push_str(&text[literal..]);
+    output
+}
+
+/// URL 之外的裸令牌兜底：`token=…` 与 `Bearer …`（大小写不敏感）。
+/// 网关错误页可能回显请求头或表单参数，那里没有完整 URL 可认。
+/// 值读到下一个空白或 `&`（表单分隔符）为止；末尾的闭合符/句读剥出来原样补回，
+/// 与 [`redact_urls_in_text`] 同一思路（闭合符集合另收 JSON 的 `}`）。
+/// 只用于错误文案，不改回包本身。扫描同 [`next_marker`]：O(n)，不随标记密度放大。
+fn redact_bare_credentials(text: &str) -> String {
+    // ASCII 小写化不改变字节偏移，找到的 index 可以直接切原文。只 lowercase 一次。
+    let lowered = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut literal = 0;
+    while let Some(index) = next_marker(lowered.as_bytes(), cursor, &[b"token=", b"bearer"]) {
+        output.push_str(&text[literal..index]);
+        let tail = &text[index..];
+        // 两个标记都是 6 字节。
+        let marker_end = 6;
+        let is_bearer = lowered[index..].starts_with("bearer");
+        // `bearer` 后必须跟空白才算令牌（`bearers` 是普通单词）。
+        if is_bearer && !tail[marker_end..].starts_with(char::is_whitespace) {
+            output.push_str(&tail[..marker_end]);
+            cursor = index + marker_end;
+            literal = cursor;
+            continue;
+        }
+        // 空白 run 原样保留，只换掉令牌值。
+        let value_start = if is_bearer {
+            let after = &tail[marker_end..];
+            marker_end + (after.len() - after.trim_start().len())
+        } else {
+            marker_end
+        };
+        let value = &tail[value_start..];
+        let value_end = value
+            .find(|c: char| c.is_whitespace() || c == '&')
+            .unwrap_or(value.len());
+        let mut kept_end = value_end;
+        while let Some(last) = value[..kept_end].chars().last() {
+            if matches!(
+                last,
+                '"' | '\'' | ')' | '>' | ']' | '}' | '.' | ',' | ';' | ':'
+            ) {
+                kept_end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if kept_end == 0 {
+            // 值为空或全是句读：没什么可脱敏的，原样保留。
+            output.push_str(&tail[..value_start + value_end]);
+        } else {
+            output.push_str(&tail[..value_start]);
+            output.push_str("<redacted>");
+            output.push_str(&value[kept_end..value_end]);
+        }
+        cursor = index + value_start + value_end;
+        literal = cursor;
+    }
+    output.push_str(&text[literal..]);
     output
 }
 
@@ -928,6 +1005,62 @@ mod tests {
         let upper = redact_urls_in_text("failed HTTPS://Host/Sign?token=secret");
         assert!(!upper.contains("secret"), "{upper}");
         assert!(upper.contains("?<redacted>"), "{upper}");
+    }
+
+    #[test]
+    fn bare_credentials_are_redacted_case_insensitively() {
+        // URL 之外的裸令牌兜底：值读到空白/`&`，末尾闭合符原样补回。
+        let text = "Authorization: BEARER eyJsecret.jwt\r\nToken=bare-secret; code=BUSY";
+        let redacted = redact_bare_credentials(text);
+        assert!(!redacted.contains("eyJsecret.jwt"), "{redacted}");
+        assert!(!redacted.contains("bare-secret"), "{redacted}");
+        assert!(redacted.contains("code=BUSY"), "{redacted}");
+        assert!(redacted.contains("Token=<redacted>;"), "{redacted}");
+
+        // `&` 是表单分隔符，后面的参数要保留。
+        assert_eq!(
+            redact_bare_credentials("token=abc123&x=1"),
+            "token=<redacted>&x=1"
+        );
+        // JSON 字符串里的闭合引号不被吃掉。
+        assert_eq!(
+            redact_bare_credentials(r#"{"error":"token=abc"}"#),
+            r#"{"error":"token=<redacted>"}"#
+        );
+        // bearer 后不是空白就不算令牌（`bearers` 是普通单词）。
+        assert_eq!(
+            redact_bare_credentials("bearers of news"),
+            "bearers of news"
+        );
+        // 空值没什么可脱敏的。
+        assert_eq!(redact_bare_credentials("token= next"), "token= next");
+        // Bearer 与令牌之间的多个空白原样保留。
+        assert_eq!(
+            redact_bare_credentials("Bearer   spaced-secret"),
+            "Bearer   <redacted>"
+        );
+    }
+
+    /// 票 #38 CodeRabbit 安全审查：扫描改成 O(n) 后，标记密集时行为不变。
+    /// 一条正文里塞大量 token=/Bearer 与 URL，逐个都要被换掉，诊断尾巴保留。
+    #[test]
+    fn dense_markers_are_all_redacted() {
+        let mut body = String::new();
+        for i in 0..3000 {
+            body.push_str(&format!("token=sekret{i} Bearer jwt{i} "));
+        }
+        body.push_str("code=BUSY");
+        let redacted = redact_bare_credentials(&body);
+        assert!(!redacted.contains("sekret"), "密集 token 要全脱敏");
+        assert!(!redacted.contains("jwt"), "密集 Bearer 要全脱敏");
+        assert_eq!(redacted.matches("<redacted>").count(), 6000);
+        assert!(redacted.ends_with("code=BUSY"), "诊断尾巴要保留");
+
+        // URL 密集同样要全脱敏（redact_urls_in_text 也改成了单向扫描）。
+        let urls = "http://h/p?token=x ".repeat(3000);
+        let redacted_urls = redact_urls_in_text(&urls);
+        assert!(!redacted_urls.contains("token=x"));
+        assert_eq!(redacted_urls.matches("?<redacted>").count(), 3000);
     }
 
     #[test]
