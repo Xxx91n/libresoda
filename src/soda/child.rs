@@ -564,11 +564,12 @@ mod tests {
     /// 票 #26：写线程被 helper 攥住吃满一个宽限时，stdout/stderr 仍各自拿得到宽限。
     ///
     /// 直接子进程（python）不读 stdin 就退出；fork 出来的 helper 继承 stdin 的读端，所以两百万
-    /// 字节的载荷写不完，写线程要耗掉一整个宽限。helper 同时继承了 stdout/stderr，等过 1.5 个
-    /// 宽限才写两份标记 —— 这个点落在「写宽限结束（1 个）到 stdout 截止（2 个）」之间。旧实现
-    /// 三个流共用一个截止时间，stdout/stderr 的截止点已经过去，标记全部丢失；现在各自计时（从
-    /// 开始收它起算），两份都能交回来。用 python 而不是 `sh -c '(...) &'`：POSIX 会把非交互
-    /// shell 的后台列表的 stdin 接到 /dev/null，读端就没了。
+    /// 字节的载荷写不完，写线程要耗掉一整个宽限。helper 同时继承了 stdout/stderr，等过 1.2 个
+    /// 宽限才开始写标记，并每 0.1 s 重复写到 1.8 个宽限 —— 这个窗口落在「写宽限结束（1 个）
+    /// 到 stdout 截止（2 个）」之间，单次唤醒被调度拖后也不会整段落出截止点。旧实现三个流共用
+    /// 一个截止时间，stdout/stderr 的截止点已经过去，标记全部丢失；现在各自计时（从开始收它
+    /// 起算），两份都能交回来。用 python 而不是 `sh -c '(...) &'`：POSIX 会把非交互 shell 的
+    /// 后台列表的 stdin 接到 /dev/null，读端就没了。
     #[cfg(unix)]
     #[test]
     fn streams_get_their_own_grace_when_the_write_is_stuck() {
@@ -578,14 +579,18 @@ mod tests {
 import os, time
 if os.fork() == 0:
     time.sleep({marker_delay})
-    os.write(1, b"out")
-    os.write(2, b"err")
+    end = time.time() + {write_window}
+    while time.time() < end:
+        os.write(1, b"out")
+        os.write(2, b"err")
+        time.sleep(0.1)
     time.sleep({exit_after})
     os._exit(0)
 os._exit(0)
 "#,
-            marker_delay = grace * 1.5,
-            exit_after = grace,
+            marker_delay = grace * 1.2,
+            write_window = grace * 0.6,
+            exit_after = grace * 0.5,
         );
         let run_timeout_ms = (grace * 3_000.0) as u64;
         let output = run_with_watchdog(Duration::from_secs_f64(grace * 5.0), move || {
@@ -599,8 +604,16 @@ os._exit(0)
         })
         .expect("子进程正常退出，不该走错误分支");
         assert!(output.status.success(), "探针应以 0 退出");
-        assert_eq!(output.stdout, b"out".to_vec(), "stdout 应拿到自己的宽限");
-        assert_eq!(output.stderr, b"err".to_vec(), "stderr 应拿到自己的宽限");
+        assert!(
+            output.stdout.starts_with(b"out"),
+            "stdout 应拿到自己的宽限：{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.starts_with(b"err"),
+            "stderr 应拿到自己的宽限：{:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             output.request_write_failed,
             "写端被 helper 攥住时应按请求没交全记"
