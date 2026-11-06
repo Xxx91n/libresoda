@@ -561,7 +561,8 @@ fn redact_urls_in_text(text: &str) -> String {
 /// URL 之外的裸令牌兜底：`token=…` 与 `Bearer …`（大小写不敏感）。
 /// 网关错误页可能回显请求头或表单参数，那里没有完整 URL 可认。
 /// 值读到下一个空白或 `&`（表单分隔符）为止；末尾的闭合符/句读剥出来原样补回，
-/// 与 [`redact_urls_in_text`] 同一口径。只用于错误文案，不改回包本身。
+/// 与 [`redact_urls_in_text`] 同一思路（闭合符集合另收 JSON 的 `}`）。
+/// 只用于错误文案，不改回包本身。
 fn redact_bare_credentials(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;

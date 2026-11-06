@@ -686,6 +686,33 @@ fn non_2xx_oversized_body_redacts_before_truncation() {
 }
 
 #[test]
+fn non_2xx_redaction_shrinks_body_before_truncation() {
+    // 票 #38 钉住「先脱敏再截断」的顺序本身：一个超长查询 token 脱敏后大幅缩短，
+    // 把它后面的诊断内容挤进前 4096 字符。若先截断再脱敏，这段内容会被切掉、断言失败。
+    let body: &'static str = Box::leak(
+        format!(
+            "{}http://host/sign?token={} IMPORTANT_DIAGNOSTIC_TAIL{}",
+            "x".repeat(4000),
+            "S".repeat(2000),
+            "y".repeat(2000)
+        )
+        .into_boxed_str(),
+    );
+    let url = spawn_http_once("500 Internal Server Error", "", body);
+    let error = HttpSignature::new(url)
+        .timeout_ms(5_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("5xx 是签名故障");
+    let text = error.to_string();
+    assert!(!text.contains("SSSSS"), "超长 token 不能进文案：{text}");
+    assert!(
+        text.contains("IMPORTANT_DIAGNOSTIC_TAIL"),
+        "脱敏缩短 body 后，token 之后的诊断内容应留在前 4096 字符里（先脱敏再截断）：{text}"
+    );
+    assert!(text.contains("...(truncated)"), "{text}");
+}
+
+#[test]
 fn pc_track_v2_surfaces_remote_signer_5xx_details() {
     let url = spawn_http_once(
         "503 Service Unavailable",
