@@ -133,8 +133,9 @@ fn command_requester_times_out_when_child_never_exits() {
 /// 票 #25：直接子进程拉起一个继承 stdout/stderr 的后台 helper，自己驻留到超时。
 ///
 /// helper 活着的唯一证据就是写端没关：只 kill 直接子进程时排空线程等不到 EOF，1 s 宽限
-/// 走满后 stderr 按空输出处理；整棵树被终止时两个写端都关掉，探针在超时前写下的标记才能
-/// 随 EOF 交回来。`sh -c` 是非交互 shell，没有 job control，后台任务留在同一进程组里。
+/// 到点只交出已读到的部分（旧实现直接按空输出处理）；整棵树被终止时两个写端都关掉，探针在
+/// 超时前写下的标记才能随 EOF（或宽限到点）交回来。`sh -c` 是非交互 shell，没有 job
+/// control，后台任务留在同一进程组里。
 #[test]
 fn command_requester_kills_descendants_that_hold_the_pipe() {
     const TREE_PROBE_SCRIPT: &str = "sleep 30 & printf tree-drained >&2; while :; do :; done";

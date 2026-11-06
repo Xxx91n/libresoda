@@ -237,18 +237,18 @@ where
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut captured = 0_usize;
+        let mut captured_bytes = 0_usize;
         let mut buffer = [0_u8; READ_CHUNK_BYTES];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    let room = MAX_CAPTURE_BYTES.saturating_sub(captured);
+                    let room = MAX_CAPTURE_BYTES.saturating_sub(captured_bytes);
                     if room == 0 {
                         continue;
                     }
                     let take = read.min(room);
-                    captured += take;
+                    captured_bytes += take;
                     // 收集方已经走了也要继续读走：排空是读线程的职责，发送失败只是没人收。
                     let _ = tx.send(buffer[..take].to_vec());
                 }
@@ -263,6 +263,7 @@ where
 /// 收集一个输出流：分块累加，直到宽限到点或读线程关闭发送端。
 ///
 /// 到点时交出**已收到**的部分（票 #26）；`None`（没有这个管道）按空输出处理。
+/// 总量上限由发送方 `spawn_reader` 夹在 `MAX_CAPTURE_BYTES` 以内，这里不再重复夹紧。
 fn collect_stream(receiver: Option<Receiver<Vec<u8>>>, deadline: Instant) -> Vec<u8> {
     let Some(receiver) = receiver else {
         return Vec::new();
@@ -497,7 +498,7 @@ mod tests {
     impl Read for MarkerThenStall {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self.sent {
-                // 宽限是 100 ms，这里拖到 300 ms：收集方必须在 EOF 之前就返回。
+                // 这条用例的截止时间是 100 ms，这里拖到 300 ms：收集方必须在 EOF 之前返回。
                 thread::sleep(Duration::from_millis(300));
                 return Ok(0);
             }
@@ -520,6 +521,21 @@ mod tests {
         );
     }
 
+    /// 把可能无界等待的调用放进线程，到点让用例失败而不是挂住 `cargo test`。
+    #[cfg(unix)]
+    fn run_with_watchdog<T, F>(timeout: Duration, task: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(task());
+        });
+        rx.recv_timeout(timeout)
+            .expect("调用没有在期限内返回（用例自身挂住了）")
+    }
+
     /// 票 #26：写线程被 helper 攥住吃满一个宽限时，stdout/stderr 仍各自拿得到宽限。
     ///
     /// 直接子进程（python）不读 stdin 就退出；fork 出来的 helper 继承 stdin 的读端，所以两百万
@@ -540,16 +556,16 @@ if os.fork() == 0:
     os._exit(0)
 os._exit(0)
 "#;
-        let mut command = Command::new("python3");
-        command.args(["-c", HOLD_STDIN_SCRIPT]);
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let output = match run(&mut command, vec![b'x'; 2 * 1024 * 1024], 5_000) {
-            Ok(output) => output,
-            Err(_) => panic!("子进程正常退出，不该走错误分支"),
-        };
+        let output = run_with_watchdog(Duration::from_secs(5), || {
+            let mut command = Command::new("python3");
+            command.args(["-c", HOLD_STDIN_SCRIPT]);
+            command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            run(&mut command, vec![b'x'; 2 * 1024 * 1024], 5_000).ok()
+        })
+        .expect("子进程正常退出，不该走错误分支");
         assert!(output.status.success(), "探针应以 0 退出");
         assert_eq!(output.stdout, b"out".to_vec(), "stdout 应拿到自己的宽限");
         assert_eq!(output.stderr, b"err".to_vec(), "stderr 应拿到自己的宽限");
