@@ -3,7 +3,7 @@
 use super::quality::is_preview;
 use super::types::{VIP_PROBE_TRACK_ID, VIP_PROBE_TRACK_URL};
 use super::Soda;
-use crate::error::Result;
+use crate::error::{Result, SodaError};
 use crate::model::{Song, SOURCE_SODA};
 
 /// 等价 `IsVipAccount`：用一首已知的 VIP 曲目探测当前 Cookie 是否能拿到完整流。
@@ -45,7 +45,7 @@ pub fn is_vip_account(soda: &Soda) -> Result<bool> {
             Ok(is_vip)
         }
         Err(err) => {
-            if err.is_missing_entitlement() {
+            if probe_failure_means_not_vip(&err) {
                 soda.set_cached_vip(false);
                 return Ok(false);
             }
@@ -54,9 +54,35 @@ pub fn is_vip_account(soda: &Soda) -> Result<bool> {
     }
 }
 
+/// 探测失败能否判定「不是会员」。
+///
+/// 签名故障优先：签名器 stderr / 自定义提供者的文案里可能碰巧带
+/// `requires cookie` 之类子串，但那是服务故障，不能缓存成"非会员"（#36）。
+fn probe_failure_means_not_vip(err: &SodaError) -> bool {
+    !err.is_signer_failure() && err.is_missing_entitlement()
+}
+
 impl Soda {
     /// 等价 `(*Soda).IsVipAccount`。
     pub fn is_vip_account(&self) -> Result<bool> {
         is_vip_account(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signer_failure_is_not_treated_as_missing_entitlement() {
+        let signer = SodaError::http("signer error: requires cookie");
+        assert!(signer.is_missing_entitlement(), "子串确实会命中");
+        assert!(
+            !probe_failure_means_not_vip(&signer),
+            "签名故障不能被缓存成非会员"
+        );
+        assert!(probe_failure_means_not_vip(&SodaError::http(
+            "feed requires cookie"
+        )));
     }
 }

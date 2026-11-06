@@ -530,13 +530,21 @@ fn redact_urls_in_text(text: &str) -> String {
         };
         output.push_str(&rest[..index]);
         let tail = &rest[index..];
-        // 空白，或包住 URL 的引号/括号等闭合符。不把 `,` / `;` 当分隔符：
-        // 查询值里可能出现它们，提前截断反而会把后半段留在文本里。
-        let end = tail
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | '>' | ']'))
-            .unwrap_or(tail.len());
-        output.push_str(&redact_url_for_error(&tail[..end]));
-        rest = &tail[end..];
+        let token_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        // 不能按标点把 URL 提前截断：查询值里可能出现 `]` / `)` / `,`，截断会把
+        // 后半段留在文本里反而泄漏。这里只在令牌**末尾**把成对的闭合符/句读剥出来，
+        // 原样补回去，URL 主体仍交给 `redact_url_for_error` 整体处理。
+        let mut url_end = token_end;
+        while let Some(last) = tail[..url_end].chars().last() {
+            if matches!(last, '"' | '\'' | ')' | '>' | ']' | '.' | ',' | ';' | ':') {
+                url_end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        output.push_str(&redact_url_for_error(&tail[..url_end]));
+        output.push_str(&tail[url_end..token_end]);
+        rest = &tail[token_end..];
     }
     output
 }
@@ -893,6 +901,11 @@ mod tests {
         let wrapped = redact_urls_in_text("failed: (http://Host/Sign?token=secret)");
         assert!(!wrapped.contains("secret"), "{wrapped}");
         assert!(wrapped.ends_with(')'), "{wrapped}");
+
+        // 查询值里的 `]` 不能被当成 URL 边界，否则 `]secret` 会留在文本里。
+        let bracket = redact_urls_in_text("failed http://Host/Sign?token=pre]secret");
+        assert!(!bracket.contains("secret"), "{bracket}");
+        assert!(!bracket.contains(']'), "{bracket}");
     }
 
     #[test]

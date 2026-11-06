@@ -136,6 +136,17 @@ pub fn fetch_web_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response
 
 /// 等价 `fetchPCTrackV2`（需要 Cookie）。
 pub fn fetch_pc_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response> {
+    fetch_pc_track_v2_with(soda, track_id, |url, body, options| {
+        http::post_json(url, body, options)
+    })
+}
+
+/// [`fetch_pc_track_v2`] 的本体；POST 入口做成参数，离线用例才能证明
+/// 「签名失败后一次 App POST 都没发」。
+fn fetch_pc_track_v2_with<F>(soda: &Soda, track_id: &str, post: F) -> Result<TrackV2Response>
+where
+    F: FnOnce(&str, &[u8], &[RequestOption]) -> Result<Vec<u8>>,
+{
     if !soda.has_cookie() {
         return Err(SodaError::invalid_input("soda pc track_v2 requires cookie"));
     }
@@ -172,7 +183,7 @@ pub fn fetch_pc_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response>
         url = signature;
     }
 
-    let response = http::post_json(&url, &body, &options)?;
+    let response = post(&url, &body, &options)?;
     if response.is_empty() {
         // 服务端对"缺少应用级签名头"的请求就是这么回的：HTTP 200 + 0 字节。
         // 裸调看起来像接口下线，其实是风控把 body 挖空了。
@@ -691,6 +702,34 @@ fn video_model_play_auth(values: &Map<String, Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::soda::signature::{SignRequest, SignResponse, SignatureProvider};
+    use std::sync::Arc;
+
+    /// 固定失败的签名器，用来证明签名失败发生在 App POST 之前。
+    struct FailingProvider;
+
+    impl SignatureProvider for FailingProvider {
+        fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
+            Err(SodaError::http("connect to signer refused"))
+        }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    #[test]
+    fn pc_track_v2_does_not_post_when_signer_fails() {
+        let soda = Soda::new("sessionid_ss=test");
+        soda.set_signature_provider(Arc::new(FailingProvider));
+        let posted = std::cell::Cell::new(false);
+        let error = fetch_pc_track_v2_with(&soda, "7501674235158431760", |_, _, _| {
+            posted.set(true);
+            Ok(Vec::new())
+        })
+        .expect_err("签名失败必须中断");
+        assert!(!posted.get(), "签名失败后不得再发 App POST");
+        assert!(error.is_signer_failure(), "{error}");
+    }
 
     /// 一条最小的 web 曲目元数据（id 非空，长度 200 秒）。
     fn web_track() -> TrackV2Response {
