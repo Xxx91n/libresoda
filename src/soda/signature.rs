@@ -177,7 +177,11 @@ impl SignResponse {
 
 /// 签名提供者。
 pub trait SignatureProvider: Send + Sync {
-    /// 为一次请求生成签名参数/头。出错时应返回 `Err`，调用方会退化为不签名。
+    /// 为一次请求生成签名参数/头。
+    ///
+    /// 出错时返回 `Err`：取流链路会把它当**签名故障**上抛（文案带 `signer`），
+    /// 不会退化为未签名请求。只有「根本没配置提供者」才走未签名路径
+    /// （见 [`apply_stream_signature`]）。
     fn sign(&self, request: &SignRequest) -> Result<SignResponse>;
     /// 名称，便于日志与诊断。
     fn name(&self) -> &'static str;
@@ -302,6 +306,10 @@ impl HttpSignature {
     }
 
     /// 解析签名服务回包；兼容结构体形式与 Meting 的扁平形式。
+    ///
+    /// `{"ok":false}` 的错误文案固定以 `signer error: ` 开头，并把稳定原因码
+    /// （`code`）与等待时长（`retry_after_seconds`）一并留在文案里，供上层
+    /// 区分「可重试（带等待时长）」与「不可重试」（libmssdk 的失败契约）。
     pub fn parse_response(raw: &[u8]) -> Result<SignResponse> {
         let value: serde_json::Value = serde_json::from_slice(raw)
             .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
@@ -314,18 +322,26 @@ impl HttpSignature {
                 .get("code")
                 .and_then(|code| code.as_str())
                 .unwrap_or_default();
+            let retry_after = json_u64(&value, "retry_after_seconds");
             // 服务端要求鉴权时给出可操作的提示（libmssdk 会回 ok:false + code=unauthorized）
             let unauthorized = code.eq_ignore_ascii_case("unauthorized")
                 || message.to_ascii_lowercase().contains("unauthorized")
                 || message.contains("401");
-            return Err(SodaError::http(if unauthorized {
-                format!(
-                    "signer error: {message}（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN，\
-                     或用 HttpSignature::new(url).with_token(..) / .header(\"Authorization\", ..)）"
-                )
-            } else {
-                format!("signer error: {message}")
-            }));
+            let mut detail = format!("signer error: {message}");
+            if !code.is_empty() {
+                detail.push_str(&format!(" [code={code}]"));
+            }
+            if let Some(seconds) = retry_after {
+                // 名字与回包字段一致：上层读不到结构化回包时也能按同一把钥匙找。
+                detail.push_str(&format!(" [retry_after_seconds={seconds}]"));
+            }
+            if unauthorized {
+                detail.push_str(
+                    "（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN，\
+                     或用 HttpSignature::new(url).with_token(..) / .header(\"Authorization\", ..)）",
+                );
+            }
+            return Err(SodaError::http(detail));
         }
         let mut response: SignResponse = serde_json::from_value(value.clone())
             .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
@@ -359,12 +375,83 @@ impl SignatureProvider for HttpSignature {
         for (name, value) in &self.headers {
             option = option.header(name.clone(), value.clone());
         }
-        let raw = crate::http::post_json(&self.url, &payload, &[option])?;
-        Self::parse_response(&raw)
+        // 非 2xx 必须把状态码、响应头（至少 `Retry-After`）与响应体一起交回：
+        // libmssdk 用它们区分「服务忙，等一下再来」与「必须有人来修」。
+        // 传输层失败（拒绝连接 / 超时）也要带上签名上下文：直接调用
+        // `HttpSignature::sign` 的调用方同样能把它判成签名故障。
+        let reply = crate::http::post_with_status(&self.url, &payload, &[option])
+            .map_err(with_signer_context)?;
+        if !(200..300).contains(&reply.status) {
+            return Err(SodaError::http(http_signature_failure_message(
+                &self.url, &reply,
+            )));
+        }
+        Self::parse_response(&reply.body)
     }
 
     fn name(&self) -> &'static str {
         "http"
+    }
+}
+
+/// 非 2xx 的签名服务回包 → 一条能区分故障种类的错误文案。
+///
+/// 形状刻意保留旧的 `http request failed: status {code} ({url})`，再补上响应头
+/// （含 `Retry-After`）与响应体；`signer error:` 前缀是上层分类的稳定入口。
+/// 回包体与头值都截断，不让签名服务的错误页把日志撑爆。
+fn http_signature_failure_message(url: &str, reply: &crate::http::PostResponse) -> String {
+    let mut message = format!(
+        "signer error: http request failed: status {} ({url})",
+        reply.status
+    );
+    let mut headers = Vec::new();
+    for (name, value) in &reply.headers {
+        // 不把可能是凭据的 Set-Cookie 拼进错误文案；其余头原样保留。
+        if name.eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        headers.push(format!("{name}: {}", truncate_for_error(value.trim(), 200)));
+    }
+    if !headers.is_empty() {
+        message.push_str(&format!("; headers: [{}]", headers.join(", ")));
+    }
+    let body = truncate_for_error(String::from_utf8_lossy(&reply.body).trim(), 4096);
+    if !body.is_empty() {
+        message.push_str(&format!("; body: {body}"));
+    }
+    message
+}
+
+/// 按字符截断，避免把多字节 UTF-8 切坏。
+fn truncate_for_error(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut kept: String = text.chars().take(max_chars).collect();
+    kept.push_str("...(truncated)");
+    kept
+}
+
+/// 从回包里读一个非负整数，兼容数字与数字字符串。
+fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    let item = value.get(key)?;
+    if let Some(number) = item.as_u64() {
+        return Some(number);
+    }
+    item.as_str().and_then(|text| text.trim().parse().ok())
+}
+
+/// 给签名提供者的失败补上稳定前缀：上层只按 `signer` 这个词判定签名故障
+/// （sodam 的失败分类就是这么做的）。
+///
+/// 已经以 `signer` 开头的文案原样保留：`CommandSignature` 的四条既有文案与
+/// `HttpSignature` 的 `signer error: …` 都不会被再加一层前缀。
+fn with_signer_context(error: SodaError) -> SodaError {
+    let text = error.to_string();
+    if text.to_ascii_lowercase().starts_with("signer") {
+        error
+    } else {
+        SodaError::Http(format!("signer error: {text}"))
     }
 }
 
@@ -468,7 +555,7 @@ impl SignatureProvider for CommandSignature {
             )));
         }
         serde_json::from_slice(&output.stdout)
-            .map_err(|err| SodaError::json(format!("sign response decode: {err}")))
+            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))
     }
 
     fn name(&self) -> &'static str {
@@ -552,22 +639,30 @@ pub fn sign_request_with_headers(
 /// `x-helios` / `x-medusa`（也可以顺手带 `x-tt-trace-id` 等），
 /// `ms_token` / `a_bogus` 非空时会追加到 URL 查询参数上。
 ///
-/// 返回 `Some(url)` 表示 URL 可能被签名参数改写；签名不可用时返回 `None`，
-/// 调用方按"未签名"继续（服务器会回空 body，由上层给出可读错误）。
+/// 两种成功形态：
+///
+/// * `Ok(None)` —— **没有配置**签名器（或签名器明确回空）：调用方按未签名继续；
+/// * `Ok(Some(url))` —— 签名成功，URL 可能被 `msToken` / `a_bogus` 改写。
+///
+/// `provider` 已配置但 `sign()` 失败时返回 `Err`，文案带 `signer`：
+/// **调用方不得再发未签名请求**。签名器已配置却失败不是"没配置"，把它降级成
+/// 未签名请求会让风控回 `HTTP 200 + 0 字节`，最后看起来像一次成功的试听。
 pub(crate) fn apply_stream_signature(
     soda: &super::Soda,
     url: &str,
     body: &str,
     options: &mut Vec<crate::http::RequestOption>,
-) -> Option<String> {
-    let provider = soda.signature_provider()?;
+) -> Result<Option<String>> {
+    let Some(provider) = soda.signature_provider() else {
+        return Ok(None);
+    };
     // 先合并出"这次真的要发出去的头"，再交给签名器：汽水签名覆盖 URL + 头，
     // 少一个（比如 cookie / x-ss-stub）都会被判空响应。
     let mut merged = crate::http::merge_options(options);
     let request = sign_request_with_headers(url, "POST", body, merged.headers());
-    let response = provider.sign(&request).ok()?;
+    let response = provider.sign(&request).map_err(with_signer_context)?;
     if response.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // 先整体覆盖成合并后的头，避免调用方再关心顺序。
@@ -578,9 +673,9 @@ pub(crate) fn apply_stream_signature(
 
     let signed_url = apply_signature_to_url(url, &response);
     if signed_url == url {
-        None
+        Ok(None)
     } else {
-        Some(signed_url)
+        Ok(Some(signed_url))
     }
 }
 
@@ -613,7 +708,8 @@ mod tests {
             r#"{"track_id":"1","media_type":"track"}"#,
             &mut options,
         )
-        .expect("签名器返回了参数，URL 应被改写");
+        .expect("签名器返回了参数")
+        .expect("URL 应被改写");
 
         assert!(signed.contains("msToken=token-value"));
         assert!(signed.contains("aid=386088"), "原有查询参数不能被丢掉");
@@ -641,8 +737,40 @@ mod tests {
             "https://api.qishui.com/luna/pc/track_v2?aid=386088",
             "{}",
             &mut options,
-        );
+        )
+        .expect("未配置签名器不是错误");
         assert!(signed.is_none());
+        assert_eq!(options.len(), 1);
+    }
+
+    struct BrokenSignature;
+
+    impl SignatureProvider for BrokenSignature {
+        fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
+            Err(SodaError::http("connect to signer refused"))
+        }
+        fn name(&self) -> &'static str {
+            "broken"
+        }
+    }
+
+    #[test]
+    fn stream_signature_propagates_provider_failure_with_stable_prefix() {
+        let soda = super::super::Soda::new("sessionid_ss=test");
+        soda.set_signature_provider(Arc::new(BrokenSignature));
+        let mut options = vec![crate::http::RequestOption::new().header("X-Test", "1")];
+
+        let error = apply_stream_signature(
+            &soda,
+            "https://api.qishui.com/luna/pc/track_v2?aid=386088",
+            "{}",
+            &mut options,
+        )
+        .expect_err("已配置的签名器失败必须上抛");
+        let text = error.to_string();
+        assert!(text.starts_with("signer error:"), "{text}");
+        assert!(text.contains("connect to signer refused"), "{text}");
+        // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
         assert_eq!(options.len(), 1);
     }
 }

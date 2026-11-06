@@ -262,6 +262,68 @@ pub fn post_json(url: &str, body: &[u8], options: &[RequestOption]) -> Result<Ve
     Ok(post_bytes(url, body, options)?.body)
 }
 
+/// POST 一次交回的原始事实；**非 2xx 也走这里**，状态码、响应头与响应体一个都不丢。
+///
+/// 只给签名服务用：上游 libmssdk 的失败契约把「可重试（带等待时长）」与「不可重试」
+/// 放在状态码、`Retry-After` 头与回包体里（见 `docs/SIGNER-SERVICE.md` §2.3 与
+/// libmssdk#4），普通接口的非 2xx 不包含这些信息，仍由 [`post_bytes`] 折成一句错误。
+pub(crate) struct PostResponse {
+    pub(crate) status: u16,
+    /// 响应头，名字保留服务端写法；同名只留第一行（与 [`RawResponse`] 同口径）。
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+}
+
+/// 签名服务回包体的硬上限。正常回包是几百字节；超过它的既不是签名结果，
+/// 也不该被整块读进内存或拼进错误文案。
+const MAX_SIGNER_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
+pub(crate) fn post_with_status(
+    url: &str,
+    body: &[u8],
+    options: &[RequestOption],
+) -> Result<PostResponse> {
+    let merged = merge_options(options);
+    let mut request = ureq::post(url)
+        .timeout(merged.timeout_value())
+        .set("User-Agent", DEFAULT_USER_AGENT);
+    for (key, value) in merged.headers() {
+        request = request.set(key, value);
+    }
+    let response = match request.send_bytes(body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(err) => return Err(SodaError::http(err.to_string())),
+    };
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name, value.to_string()))
+        })
+        .collect();
+    let mut data = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_SIGNER_RESPONSE_BODY + 1) as u64)
+        .read_to_end(&mut data)
+        .map_err(|err| SodaError::http(err.to_string()))?;
+    if data.len() > MAX_SIGNER_RESPONSE_BODY {
+        return Err(SodaError::http(format!(
+            "http response body exceeds {MAX_SIGNER_RESPONSE_BODY} bytes"
+        )));
+    }
+    Ok(PostResponse {
+        status,
+        headers,
+        body: data,
+    })
+}
+
 /// POST 请求，返回完整响应（含 `Set-Cookie`），供 passport 登录流程使用。
 pub fn post_bytes(url: &str, body: &[u8], options: &[RequestOption]) -> Result<HttpResponse> {
     let merged = merge_options(options);

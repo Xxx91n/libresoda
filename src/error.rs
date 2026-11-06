@@ -78,6 +78,16 @@ impl SodaError {
     pub fn is_cookie_required(&self) -> bool {
         self.to_string().contains("requires cookie")
     }
+
+    /// 是否是**已配置的签名器调用失败**（不是"没配置签名器"）。
+    ///
+    /// 判据是错误文案里出现 `signer`：`HttpSignature` 的非 2xx / `ok:false` 以
+    /// `signer error:` 开头，`CommandSignature` 的 spawn / 退出码 / 超时也用
+    /// `signer ...` 前缀。取流链路（`get_download_info`）据此停止「退化成试听」，
+    /// 上层据此区分「签名服务故障」与「曲目权益问题」。
+    pub fn is_signer_failure(&self) -> bool {
+        self.to_string().to_ascii_lowercase().contains("signer")
+    }
 }
 
 impl fmt::Display for SodaError {

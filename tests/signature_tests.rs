@@ -3,7 +3,7 @@
 use libresoda::soda::signature::HttpSignature;
 use libresoda::soda::signature::{
     apply_signature_to_url, sign_request, CapturedSignature, CommandSignature, NoopSignature,
-    SignResponse, SignatureProvider,
+    SignRequest, SignResponse, SignatureProvider,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -305,6 +305,51 @@ fn spawn_signer_service(
     format!("http://{addr}/sign")
 }
 
+/// 只回一次的任意状态行服务：用来钉住非 2xx 的状态码、响应头与响应体。
+fn spawn_http_once(
+    status_line: &'static str,
+    extra_headers: &'static str,
+    body: &'static str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut collected: Vec<u8> = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    collected.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&collected).to_string();
+                    if let Some(index) = text.find("\r\n\r\n") {
+                        let content_length = text[..index]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if collected.len() >= index + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    format!("http://{addr}/sign")
+}
+
 #[test]
 fn http_signature_calls_remote_service() {
     let url = spawn_signer_service(
@@ -358,6 +403,129 @@ fn http_signature_reports_service_failure() {
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("应把服务端错误往上抛");
     assert!(error.to_string().contains("mssdk 未初始化"), "{error}");
+}
+
+#[test]
+fn http_signature_non_2xx_keeps_status_headers_and_body() {
+    let url = spawn_http_once(
+        "503 Service Unavailable",
+        "Retry-After: 1\r\nContent-Type: application/json\r\n",
+        r#"{"ok":false,"error":"服务忙：没有空闲的签名槽位","code":"BUSY","retry_after_seconds":1}"#,
+    );
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("非 2xx 是签名故障");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 503"),
+        "状态码与稳定前缀都要在：{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 1"),
+        "`Retry-After` 不能被丢掉：{text}"
+    );
+    assert!(text.contains("BUSY"), "响应体要可读：{text}");
+    assert!(text.contains("服务忙"), "响应体原文要保留：{text}");
+}
+
+#[test]
+fn http_signature_ok_false_keeps_code_and_retry_after() {
+    let error = HttpSignature::parse_response(
+        r#"{"ok":false,"error":"服务忙","code":"BUSY","retry_after_seconds":1}"#.as_bytes(),
+    )
+    .expect_err("ok:false 是签名故障");
+    let text = error.to_string();
+    assert!(text.starts_with("signer error: 服务忙"), "{text}");
+    assert!(text.contains("[code=BUSY]"), "原因码要留下来：{text}");
+    assert!(
+        text.contains("[retry_after_seconds=1]"),
+        "等待时长要留下来：{text}"
+    );
+}
+
+#[test]
+fn http_signature_connection_refused_is_signer_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener); // 端口随即无人监听：连接会被拒绝。
+
+    let error = HttpSignature::new(format!("http://{addr}/sign"))
+        .timeout_ms(500)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("连不上签名服务就是签名故障");
+    assert!(error.to_string().starts_with("signer error:"), "{error}");
+}
+
+#[test]
+fn http_signature_timeout_is_signer_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        // 接受连接但始终不回包，让客户端走到自己的超时。
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(std::time::Duration::from_millis(800));
+            drop(stream);
+        }
+    });
+
+    let error = HttpSignature::new(format!("http://{addr}/sign"))
+        .timeout_ms(100)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("签名服务不回包就是签名故障");
+    assert!(error.to_string().starts_with("signer error:"), "{error}");
+}
+
+struct FailingSigner(&'static str);
+
+impl SignatureProvider for FailingSigner {
+    fn sign(&self, _request: &SignRequest) -> libresoda::Result<SignResponse> {
+        Err(libresoda::SodaError::http(self.0))
+    }
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+}
+
+#[test]
+fn pc_track_v2_propagates_signer_failure_without_unsigned_request() {
+    let soda = libresoda::Soda::new("sessionid_ss=test");
+    soda.set_signature_provider(Arc::new(FailingSigner("connect to signer refused")));
+    let started = std::time::Instant::now();
+    let error = libresoda::soda::track::fetch_pc_track_v2(&soda, "7501674235158431760")
+        .expect_err("签名失败必须中断，不得改发未签名请求");
+    assert!(
+        error.to_string().starts_with("signer error:"),
+        "要带稳定前缀：{error}"
+    );
+    // 结构上签名失败发生在 `post_json` 之前；这个时限只是把「没有偷偷去请求上游」
+    // 变成可观察的失败，不押注具体网络耗时。
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "签名失败后不应再走网络：{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn pc_track_v2_surfaces_remote_signer_5xx_details() {
+    let url = spawn_http_once(
+        "503 Service Unavailable",
+        "Retry-After: 1\r\n",
+        r#"{"ok":false,"error":"busy","code":"BUSY"}"#,
+    );
+    let soda = libresoda::Soda::new("sessionid_ss=test");
+    soda.set_signature_provider(Arc::new(HttpSignature::new(url)));
+    let error = libresoda::soda::track::fetch_pc_track_v2(&soda, "7501674235158431760")
+        .expect_err("签名服务 5xx 必须中断取流");
+    let text = error.to_string();
+    assert!(text.starts_with("signer error:"), "{text}");
+    assert!(text.contains("status 503"), "{text}");
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 1"),
+        "{text}"
+    );
+    assert!(text.contains("BUSY"), "{text}");
 }
 
 #[test]

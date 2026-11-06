@@ -164,8 +164,10 @@ pub fn fetch_pc_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response>
     // 签名换 body（甚至只改键顺序）就会被判空响应。因此这里把真实签名交给
     // SignatureProvider —— Windows/macOS 上的桥接器算完回填即可。
     let body_text = String::from_utf8_lossy(&body).to_string();
+    // 签名器失败直接上抛：不拿未签名请求去撞风控（那会回 200 + 空 body，
+    // 最后被当成"试听"吞掉）。未配置签名器仍返回 Ok(None)。
     if let Some(signature) =
-        super::signature::apply_stream_signature(soda, &url, &body_text, &mut options)
+        super::signature::apply_stream_signature(soda, &url, &body_text, &mut options)?
     {
         url = signature;
     }

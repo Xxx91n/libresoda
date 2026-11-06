@@ -105,6 +105,31 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 写入被管道缓冲吃掉、签名器一个字节都没读，库这边看不出来，所以这条契约得由签名器自己守住。
 `HttpSignature` 那侧没有这根管道，body 由 HTTP 客户端自己发完。
 
+### 2.3 签名失败不再退化成未签名请求
+
+票 [`#36`](https://github.com/sodahub-org/libresoda/issues/36) 起，「没配置签名器」与
+「签名器已配置但调用失败」是两条路：
+
+| 情况 | `sign()` | 取流链路 |
+| --- | --- | --- |
+| 没配置 provider | 不调用 | 按未签名继续（**唯一**允许的降级） |
+| 连接拒绝 / 超时 / 子进程非 0 退出 | `signer error: …` / `signer exited …` | 错误上抛；不再发未签名请求 |
+| HTTP 非 2xx | `signer error: http request failed: status {code} ({url}); headers: […]; body: …` | 同上；响应头整份保留，`Retry-After` 可读 |
+| HTTP 2xx + `{"ok":false}` | `signer error: {error} [code=…] [retry_after_seconds=…]` | 同上；原因码与等待时长都在文案里 |
+| 签名成功、服务端只给试听 | `Ok` | `Ok + is_preview=true`（权益/曲目事实，不是签名故障） |
+
+非 2xx 的响应体最多保留 4 KiB、每个头值最多 200 字符（`Set-Cookie` 不进文案），
+避免签名服务的错误页把日志撑爆；回包体在读取时另有 1 MiB 硬上限。
+
+`HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
+普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型
+（新增 `SodaError` 变体）不在本票范围，本票先用 `SodaError::Http` + 稳定前缀 +
+状态/响应体/`Retry-After` 的顺序交付，下游（sodam #103）据此分类。
+
+`get_download_info` 的取流回退边界：非签名故障仍按旧规则回退到 web 试听；
+签名故障直接返回 `Err`，**不**因为 web 侧有预览流就返回 `Ok`。`check_stream_access`
+仍返回诊断报告，但新增机器可读的 `signer_failed: bool`，`app_error` 继续保留原文。
+
 `CommandSignature::timeout_ms`（默认 5 s）自票
 [`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr
 排空都在独立线程里进行，主线程按这个上限等子进程；到点终止整棵子进程树（Unix 进程组 /
@@ -184,7 +209,7 @@ let provider = HttpSignature::new("http://signer.example.com:8921/sign")
 
 服务端开了鉴权而客户端没带 token 时，`sign()` 会返回带提示的错误
 （`signer error: unauthorized（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN…）`），
-不会静默降级成试听流。
+不会静默降级成试听流；连接拒绝、超时与非 2xx 同理（见 §2.3）。
 
 ## 4. 失败模式与自愈
 
@@ -192,8 +217,10 @@ let provider = HttpSignature::new("http://signer.example.com:8921/sign")
 | --- | --- | --- |
 | `check_stream_access().app_error` 提示"缺少应用级签名头" | 没配签名器 | 配 `HttpSignature` 或 `CommandSignature` |
 | 提示"签名凭证可能已过期" | 设备指纹/会话换了 | 重新抓 `device_id` / `iid` / `fp` |
-| `/healthz` 正常但 `/sign` 502 | 桥接器/客户端侧出错 | 看服务日志里的桥接器 stderr |
-| 拿到 30 秒试听且 `is_preview=true` | 签名缺失或不被接受 | 先跑 `--selftest`，再用 `stream_access_diagnose_online` 验收 |
+| `signer error: …` / `signer exited …` | 签名器已配置但调用失败 | 看错误里的状态码、响应体与 `Retry-After`；可重试的按服务端给的时长退避 |
+| `check_stream_access().signer_failed == true` | 同上；报告仍给出 web 侧候选 | 修签名器后再看 `app_error`，不要把它当曲目权益问题 |
+| `/sign` 回 503 `BUSY` / 429 `RATE_LIMITED` | 服务忙 / 被限流 | 按 `Retry-After` 退避；`/stat` 看队列与桶 |
+| 拿到 30 秒试听且 `is_preview=true` 且 `signer_failed=false` | 签名缺失或不被接受 | 先跑 `--selftest`，再用 `stream_access_diagnose_online` 验收 |
 
 ## 5. 安全与合规
 
