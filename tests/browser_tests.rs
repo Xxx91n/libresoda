@@ -172,9 +172,12 @@ fn command_requester_times_out_when_child_never_exits() {
 
 /// 票 #25：直接子进程拉起一个继承 stdout/stderr 的后台 helper，自己驻留到超时。
 ///
-/// helper 活着的唯一证据就是写端没关：只 kill 直接子进程时排空线程等不到 EOF，1 s 宽限
-/// 走满后 stderr 按空输出处理；整棵树被终止时两个写端都关掉，探针写下的标记才能随 EOF
-/// 交回来。`sh -c` 是非交互 shell，没有 job control，后台任务留在同一进程组里。
+/// helper 活着的唯一证据就是写端没关：整棵树被终止时两个写端都关掉，读线程立刻拿到 EOF，
+/// 探针写下的标记随之交回；只杀直接子进程时 helper 继续攥着写端，排空线程要走满 1 s 宽限
+/// 才交出已读到的部分。**「标记存在」本身不再证明树已终止**（票 #26 起宽限到点也会交回）
+/// —— 判据是返回时间：时限 2 s 不含宽限，只杀直接子进程时还要多等 1 s（约 3 s）。阈值取
+/// 中点 2.5 s，两边各留约 0.5 s。`sh -c` 是非交互 shell，没有 job control，后台任务留在
+/// 同一进程组里。
 ///
 /// 票 #29：时限从 500 ms 放宽到 2 s —— 启动 `sh`、fork helper、写出标记都在时限之内，
 /// 旧值要求这三步在半秒内完成，抢核时会先超时、把失败原因变成「标记没写出来」。驻留改成
@@ -196,11 +199,11 @@ fn command_requester_kills_descendants_that_hold_the_pipe() {
     assert!(!text.contains("requester exited"), "{text}");
     assert!(
         text.contains("tree-drained"),
-        "整棵树终止后读线程才拿得到 EOF 与 stderr：{text}"
+        "超时前写下的标记应随 EOF 或宽限交回：{text}"
     );
     assert!(
-        elapsed < Duration::from_secs(4),
-        "进程树用例拖了 {elapsed:?}"
+        elapsed < Duration::from_millis(2_500),
+        "标记随 EOF 交回 ≈ 树已终止；用满宽限说明写端仍被攥着：{elapsed:?}"
     );
 }
 
@@ -302,12 +305,52 @@ time.sleep(60)
     assert_process_gone(pid, "逃出原组的直接子进程");
 }
 
+/// 票 #26 的验收：标记先写、写端被一个逃出进程组的 helper 攥住，超时错误仍要带出标记。
+///
+/// helper 在 `os.fork()` 出来的子进程里 `setsid()`（它不是组长，能成功），随后继承着
+/// stderr 睡 6 s；直接子进程在原地睡 60 s。超时组杀只带走直接子进程，helper 的写端让读线程
+/// 等不到 EOF —— 旧实现整段缓冲被丢，`requester timed out` 后面没有标记；现在宽限到点交出
+/// 已收到的部分，标记随错误一起回来。只跑 Unix（`setsid` 与 `fork` 都是 Unix 语义）。
+/// 时限按票 #29 的口径放到 3 s：python 启动、fork、写标记都要挤进时限，2 s 在抢核时会先超时。
+#[cfg(unix)]
+#[test]
+fn command_requester_delivers_stderr_before_escaped_helper_holds_the_pipe() {
+    const STALL_PROBE_SCRIPT: &str = r#"
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    time.sleep(6)
+    os._exit(0)
+sys.stderr.write("marker-before-timeout\n")
+sys.stderr.flush()
+time.sleep(60)
+"#;
+    let requester = CommandRequester::new("python3")
+        .args(["-c", STALL_PROBE_SCRIPT])
+        .timeout_ms(3_000);
+    let started = Instant::now();
+    let error = run_with_watchdog(Duration::from_secs(8), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("helper 攥着 stderr 也不能跳过超时终止");
+    let elapsed = started.elapsed();
+    let text = error.to_string();
+    assert!(text.contains("requester timed out"), "{text}");
+    assert!(
+        text.contains("marker-before-timeout"),
+        "宽限到点应交出已收到的 stderr：{text}"
+    );
+    assert!(elapsed < Duration::from_secs(6), "标记用例拖了 {elapsed:?}");
+}
+
 /// 票 #25 的另一半：成功路径不杀自愿驻留的后继进程（`release`）。
 ///
 /// 子进程交完回包就退出，后台 helper 继承着 stdout 在 2 s 后写标记。调用方回来时 helper
 /// 应当还活着 —— Windows 上 `release` 清不掉 `KILL_ON_JOB_CLOSE` 的话，`Job::drop` 会把它
-/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。代价也一并断言：helper 攥着
-/// 写端时排空线程拿不到 EOF，1 s 宽限到点后整份输出被丢弃，上层看到的是「返回无法解析」。
+/// 带走，标记就不会落盘（审计在 #31 用一次性探针验过这条口径）。
+///
+/// 票 #26 改了口径：helper 攥着写端时读线程等不到 EOF，但宽限到点会交出**已收到**的回包，
+/// 所以这次请求成功 —— 代价是等满宽限（每条被攥住的流 1 s），不再把回包整块丢掉。
 #[test]
 fn command_requester_leaves_resident_descendants_on_success() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,16 +369,12 @@ fn command_requester_leaves_resident_descendants_on_success() {
          printf '{{\"ok\":true,\"status\":200,\"body\":\"\"}}'; exit 0"
     );
     let requester = CommandRequester::new("sh").args(["-c", script.as_str()]);
-    let error = run_with_watchdog(Duration::from_secs(5), move || {
+    let response = run_with_watchdog(Duration::from_secs(5), move || {
         requester.request(&BrowserRequest::default())
     })
-    .expect_err("helper 攥着写端时回包应被宽限丢掉");
-    let text = error.to_string();
-    assert!(
-        text.contains("返回无法解析"),
-        "宽限到点后已收到的输出应被丢掉，只剩解析失败：{text}"
-    );
-    assert!(!text.contains("timed out"), "{text}");
+    .expect("helper 攥着写端时已收到的回包应被交出");
+    assert!(response.ok, "回包应能完整解析");
+    assert_eq!(response.status, 200);
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while !marker.exists() {
