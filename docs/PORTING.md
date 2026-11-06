@@ -699,13 +699,15 @@
     「确实回错误 5、且收场为非致命」—— 竞态窗口没法稳定构造，钉的是窗口的结果；判定与终止一起
     放在 `attach_or_abort`，用例直接喂 attach 结果，不伪造 Win32 调用。
     全部离线，超时用例时限 200 ms–3 s（还有 1 s 线程宽限），两条大回包用例的子进程上限都是 5 s，
-    驻留用例用 5 s 看门狗、移组与排空成功用例用 8 s；计时用例都把调用放进带 `recv_timeout` 的线程里，
-    库一旦退回无限等待就是 3–8 s 内失败而不是挂住，不拖慢 `cargo test`。票 #29 把两条进程树
-    用例的时限从 500 ms / 1 s / 1.5 s 放宽到 2 s / 2 s / 3 s，并给 pid 文件读取加了 2 s 有界
+    驻留用例用 5 s 看门狗、移组与排空成功用例用 8 s；需要防挂住的计时用例（请求器大回包成功
+    用例除外，它由库内 5 s 上限兜底）都把调用放进带 `recv_timeout` 的线程里，库一旦退回无界
+    等待就是 3–8 s 内失败而不是挂住，不拖慢 `cargo test`。票 #29 把三条进程树相关用例（含票
+    #32 的移组用例）的时限从 500 ms / 1 s / 1.5 s 放宽到 2 s / 2 s / 3 s，并给 pid 文件读取加了 2 s 有界
     重试：启动 `sh`/python、fork helper、写 pid/标记原先都要挤在 1.5 s 内，抢核时会先超时、
-    失败原因变成「标记/pid 没写出来」。`RESIDENT_PROBE_SCRIPT` 只用 shell 内建、不 fork 子进程，
-    测的是写入/等待与直接子进程的关系；进程树探针里的 `sleep 30 &` 正是被测的 helper（fork 是
-    它的语义），成功路径的排空用例用 `cat` 读干净 stdin（它在回包前退出，不参与排空断言）。
+    失败原因变成「标记/pid 没写出来」。`RESIDENT_PROBE_SCRIPT` 不 fork 子进程（标记用 shell 内建
+    `printf` 写出，`exec sleep` 把 shell 换成 `sleep`），测的是写入/等待与直接子进程的关系；
+    进程树探针里的 `sleep 30 &` 正是被测的 helper（fork 是它的语义），成功路径的排空用例用
+    `cat` 读干净 stdin（它在回包前退出，不参与排空断言）。
     进程树由上面四条专项用例覆盖。
   - **`signer stdin write: {err}` 的可测边界（票 [`#29`](https://github.com/sodahub-org/libresoda/issues/29)）**：
     真实管道到不了这个分类 —— 读端关闭时 `write` 只回 `EPIPE`（Rust 默认忽略 SIGPIPE，映射成
