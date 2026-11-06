@@ -136,6 +136,17 @@ pub fn fetch_web_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response
 
 /// 等价 `fetchPCTrackV2`（需要 Cookie）。
 pub fn fetch_pc_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response> {
+    fetch_pc_track_v2_with(soda, track_id, |url, body, options| {
+        http::post_json(url, body, options)
+    })
+}
+
+/// [`fetch_pc_track_v2`] 的本体；POST 入口做成参数，离线用例才能证明
+/// 「签名失败后一次 App POST 都没发」。
+fn fetch_pc_track_v2_with<F>(soda: &Soda, track_id: &str, post: F) -> Result<TrackV2Response>
+where
+    F: FnOnce(&str, &[u8], &[RequestOption]) -> Result<Vec<u8>>,
+{
     if !soda.has_cookie() {
         return Err(SodaError::invalid_input("soda pc track_v2 requires cookie"));
     }
@@ -164,13 +175,15 @@ pub fn fetch_pc_track_v2(soda: &Soda, track_id: &str) -> Result<TrackV2Response>
     // 签名换 body（甚至只改键顺序）就会被判空响应。因此这里把真实签名交给
     // SignatureProvider —— Windows/macOS 上的桥接器算完回填即可。
     let body_text = String::from_utf8_lossy(&body).to_string();
+    // 签名器失败直接上抛：不拿未签名请求去撞风控（那会回 200 + 空 body，
+    // 最后被当成"试听"吞掉）。未配置签名器仍返回 Ok(None)。
     if let Some(signature) =
-        super::signature::apply_stream_signature(soda, &url, &body_text, &mut options)
+        super::signature::apply_stream_signature(soda, &url, &body_text, &mut options)?
     {
         url = signature;
     }
 
-    let response = http::post_json(&url, &body, &options)?;
+    let response = post(&url, &body, &options)?;
     if response.is_empty() {
         // 服务端对"缺少应用级签名头"的请求就是这么回的：HTTP 200 + 0 字节。
         // 裸调看起来像接口下线，其实是风控把 body 挖空了。
@@ -235,15 +248,39 @@ pub fn fetch_player_info(soda: &Soda, player_info_url: &str) -> Result<DownloadI
 
 /// 等价 `fetchSongDetail`。
 pub fn fetch_song_detail(soda: &Soda, track_id: &str) -> Result<Song> {
-    let response = fetch_web_track_v2(soda, track_id)?;
+    fetch_song_detail_with(
+        soda,
+        track_id,
+        fetch_web_track_v2,
+        super::download::resolve_download_info,
+    )
+}
+
+/// [`fetch_song_detail`] 的本体；两个取数入口做成参数，离线用例才能钉住
+/// 「签名故障不能悄悄变成一条没有流的歌曲」。
+fn fetch_song_detail_with<W, R>(
+    soda: &Soda,
+    track_id: &str,
+    fetch_web: W,
+    resolve: R,
+) -> Result<Song>
+where
+    W: FnOnce(&Soda, &str) -> Result<TrackV2Response>,
+    R: FnOnce(&Soda, &str, Option<&TrackV2Response>) -> Result<DownloadInfo>,
+{
+    let response = fetch_web(soda, track_id)?;
     let track = response.primary_track();
     if track.id.is_empty() {
         return Err(SodaError::not_found("track info not found"));
     }
 
     let mut song = build_song_from_track(&track);
-    if let Ok(info) = super::download::resolve_download_info(soda, &track.id, Some(&response)) {
-        apply_download_info(&mut song, &info);
+    match resolve(soda, &track.id, Some(&response)) {
+        Ok(info) => apply_download_info(&mut song, &info),
+        // 签名器故障不能只留在"这次没补上更好地址"里：主入口（Parse / 详情）也要
+        // 看见它（#36）。其它取流失败仍保持上游的可选补全语义。
+        Err(err) if err.is_signer_failure() => return Err(err),
+        Err(_) => {}
     }
     Ok(song)
 }
@@ -660,4 +697,96 @@ fn video_model_play_auth(values: &Map<String, Value>) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::soda::signature::{SignRequest, SignResponse, SignatureProvider};
+    use std::sync::Arc;
+
+    /// 固定失败的签名器，用来证明签名失败发生在 App POST 之前。
+    struct FailingProvider;
+
+    impl SignatureProvider for FailingProvider {
+        fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
+            Err(SodaError::http("connect to signer refused"))
+        }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    #[test]
+    fn pc_track_v2_does_not_post_when_signer_fails() {
+        let soda = Soda::new("sessionid_ss=test");
+        soda.set_signature_provider(Arc::new(FailingProvider));
+        let posted = std::cell::Cell::new(false);
+        let error = fetch_pc_track_v2_with(&soda, "7501674235158431760", |_, _, _| {
+            posted.set(true);
+            Ok(Vec::new())
+        })
+        .expect_err("签名失败必须中断");
+        assert!(!posted.get(), "签名失败后不得再发 App POST");
+        assert!(error.is_signer_failure(), "{error}");
+    }
+
+    /// 一条最小的 web 曲目元数据（id 非空，长度 200 秒）。
+    fn web_track() -> TrackV2Response {
+        TrackV2Response {
+            track: Track {
+                id: "7501674235158431760".to_string(),
+                name: "下完这场雨".to_string(),
+                duration: 200,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn song_detail_propagates_signer_failure() {
+        let soda = Soda::new("sessionid_ss=test");
+        let error = fetch_song_detail_with(
+            &soda,
+            "7501674235158431760",
+            |_, _| Ok(web_track()),
+            |_, _, _| Err(SodaError::http("signer error: connect to signer refused")),
+        )
+        .expect_err("主入口也要看见签名故障");
+        assert!(error.is_signer_failure(), "{error}");
+    }
+
+    #[test]
+    fn song_detail_keeps_metadata_for_non_signer_failures() {
+        let soda = Soda::new("sessionid_ss=test");
+        let song = fetch_song_detail_with(
+            &soda,
+            "7501674235158431760",
+            |_, _| Ok(web_track()),
+            |_, _, _| Err(SodaError::not_found("player info url not found")),
+        )
+        .expect("非签名故障仍返回歌曲元数据");
+        assert_eq!(song.id, "7501674235158431760");
+    }
+
+    #[test]
+    fn song_detail_applies_resolved_stream() {
+        let soda = Soda::new("sessionid_ss=test");
+        let song = fetch_song_detail_with(
+            &soda,
+            "7501674235158431760",
+            |_, _| Ok(web_track()),
+            |_, _, _| {
+                Ok(DownloadInfo {
+                    url: "https://cdn.example/full.m4a".to_string(),
+                    quality: "无损".to_string(),
+                    ..Default::default()
+                })
+            },
+        )
+        .expect("正常解析");
+        assert_eq!(song.url, "https://cdn.example/full.m4a");
+        assert_eq!(song.extra_get("quality"), Some("无损"));
+    }
 }

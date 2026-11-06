@@ -417,7 +417,8 @@ pub(crate) fn pc_post_json(
         pc_app_params_with(credentials.as_ref()).encode()
     );
     let body_text = String::from_utf8_lossy(&body_bytes).to_string();
-    if let Some(signed) = signature::apply_stream_signature(soda, &url, &body_text, &mut options) {
+    // 同 `fetch_pc_track_v2`：签名器失败上抛，不退化为未签名请求。
+    if let Some(signed) = signature::apply_stream_signature(soda, &url, &body_text, &mut options)? {
         url = signed;
     }
     let raw = crate::http::post_json(&url, &body_bytes, &options)?;

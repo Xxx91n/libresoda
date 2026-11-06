@@ -61,7 +61,12 @@ stdin : {"url":"https://api.qishui.com/passport/web/check_qrconnect/?...",
 stdout: {"ms_token":"...","a_bogus":"...","headers":{"bd-ticket-guard-version":"2"}}
 ```
 
-失败就返回非 0 退出码；本 crate 会退化为"不签名继续"（不会让请求失败）。
+失败就返回非 0 退出码；**App 端点的调用方（取流与写操作）会把这次失败上抛**，
+不会退化为"不签名继续"。
+签名器已配置但调用失败（非 0 退出、超时、连不上、HTTP 非 2xx、`ok:false`）时，错误文案
+带稳定的 `signer` 前缀（远程服务为 `signer error:`），并保留状态码、响应体与响应头
+（含 `Retry-After`）。只有"根本没配置签名器"才走未签名路径 —— 这两件事不能混为一谈
+（票 [`#36`](https://github.com/sodahub-org/libresoda/issues/36)）。
 
 ### 桥接器实现示例（Windows，Python + ctypes 调 mssdk DLL）
 

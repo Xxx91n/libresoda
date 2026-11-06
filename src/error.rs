@@ -78,6 +78,17 @@ impl SodaError {
     pub fn is_cookie_required(&self) -> bool {
         self.to_string().contains("requires cookie")
     }
+
+    /// 是否是**已配置的签名器调用失败**（不是"没配置签名器"）。
+    ///
+    /// 判据是错误文案**以 `signer` 开头**：签名链路的每一层都保证这一点 ——
+    /// `HttpSignature` 的非 2xx / `ok:false` 以 `signer error:` 开头，
+    /// `CommandSignature` 的 spawn / 退出码 / 超时用 `signer ...` 前缀，
+    /// `apply_stream_signature` 给第三方提供者的无前缀失败补 `signer error: `。
+    /// 不用「包含 signer」是避免把引用了签名器地址的普通 HTTP 错误误判成签名故障。
+    pub fn is_signer_failure(&self) -> bool {
+        self.to_string().to_ascii_lowercase().starts_with("signer")
+    }
 }
 
 impl fmt::Display for SodaError {
@@ -114,3 +125,19 @@ impl From<serde_json::Error> for SodaError {
 
 /// crate 内统一使用的 `Result`。
 pub type Result<T> = std::result::Result<T, SodaError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signer_failure_is_judged_by_the_leading_word() {
+        assert!(SodaError::http("signer error: connect refused").is_signer_failure());
+        assert!(SodaError::json("signer response decode: expected value").is_signer_failure());
+        // 普通错误里引用了签名器地址不算签名故障（否则会把可回退的失败判成服务故障）。
+        assert!(
+            !SodaError::http("http request failed: status 404 (https://signer.example/sign)")
+                .is_signer_failure()
+        );
+    }
+}

@@ -44,8 +44,13 @@ pub struct StreamAccessReport {
     pub has_app_credentials: bool,
     /// 是否配置了实时签名器（`x-helios` / `x-medusa` 每次现算）。
     pub has_signature_provider: bool,
-    /// App 端点不可用时的原始原因（未配置 / 空 body / 已过期）。
+    /// App 端点不可用时的原始原因（未配置 / 空 body / 已过期 / 签名器调用失败）。
     pub app_error: String,
+    /// App 端点失败是否来自**已配置的签名器**（调用失败，而不是没配置）。
+    ///
+    /// 与 `app_error` 的分工：`app_error` 是给人看的原文，这个字段给程序判分支 ——
+    /// 「签名服务故障」要停、要提示，且不能和「曲目只有试听」混为一谈（#36）。
+    pub signer_failed: bool,
     /// 人话结论，可直接展示给终端用户。
     pub hint: String,
 }
@@ -118,12 +123,27 @@ fn push_candidates(
 
 /// 诊断某首曲目的取流能力（`Soda::check_stream_access` 的实现）。
 pub fn check_stream_access(soda: &Soda, track_id: &str) -> Result<StreamAccessReport> {
+    check_stream_access_with(soda, track_id, fetch_web_track_v2, fetch_pc_track_v2)
+}
+
+/// [`check_stream_access`] 的本体；两个取数入口做成参数，离线用例才能钉住
+/// 「App 端点签名故障 → `signer_failed`」而不联网。
+fn check_stream_access_with<W, P>(
+    soda: &Soda,
+    track_id: &str,
+    fetch_web: W,
+    fetch_pc: P,
+) -> Result<StreamAccessReport>
+where
+    W: FnOnce(&Soda, &str) -> Result<super::types::TrackV2Response>,
+    P: FnOnce(&Soda, &str) -> Result<super::types::TrackV2Response>,
+{
     let track_id = track_id.trim();
     if track_id.is_empty() {
         return Err(SodaError::invalid_input("track id is empty"));
     }
 
-    let web = fetch_web_track_v2(soda, track_id)?;
+    let web = fetch_web(soda, track_id)?;
     let track = web.primary_track();
     let full_duration = track_duration_seconds(track.duration);
     let requires_vip = track.label_info.is_vip();
@@ -145,10 +165,14 @@ pub fn check_stream_access(soda: &Soda, track_id: &str) -> Result<StreamAccessRe
                 .map(|value| value.is_complete())
                 .unwrap_or(false));
     let mut app_error = String::new();
+    let mut signer_failed = false;
     if can_sign {
-        match fetch_pc_track_v2(soda, track_id) {
+        match fetch_pc(soda, track_id) {
             Ok(pc) => push_candidates(&mut candidates, "pc", soda, &pc),
-            Err(err) => app_error = err.to_string(),
+            Err(err) => {
+                signer_failed = err.is_signer_failure();
+                app_error = err.to_string();
+            }
         }
     } else if credentials.is_some() && !has_device_fingerprint {
         app_error = "应用签名凭证缺 device_id（必须与签名器同设备）".to_string();
@@ -178,6 +202,7 @@ pub fn check_stream_access(soda: &Soda, track_id: &str) -> Result<StreamAccessRe
         has_cookie: soda.has_cookie(),
         has_app_credentials: has_device_fingerprint,
         has_signature_provider,
+        signer_failed,
         app_error,
         ..Default::default()
     };
@@ -203,6 +228,13 @@ pub fn check_stream_access(soda: &Soda, track_id: &str) -> Result<StreamAccessRe
 }
 
 fn build_hint(report: &StreamAccessReport) -> String {
+    // 签名服务故障优先于「试听」的所有解释：它要停、要修，和曲目权益不是一件事。
+    if report.signer_failed {
+        // 不把 `app_error` 原文拼进这条「可直接展示」的结论：它可能带上
+        // 4 KiB 的签名服务回包体。细节留给 `app_error` 字段。
+        return "签名器调用失败（不是曲目权益问题）；详情见 app_error，修好签名器后会重新走 App 端点"
+            .to_string();
+    }
     if report.best.is_none() {
         return "没有解析到任何播放流，请检查曲目 ID 与网络".to_string();
     }
@@ -256,5 +288,105 @@ impl Soda {
     /// ```
     pub fn check_stream_access(&self, track_id: &str) -> Result<StreamAccessReport> {
         check_stream_access(self, track_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::soda::signature::{AppCredentials, NoopSignature};
+    use crate::soda::types::{Track, TrackPlayer, TrackV2Response};
+    use std::sync::Arc;
+
+    /// 一条 web 端点能给出的播放流；短于整曲时长时就是试听。
+    fn web_response(stream_seconds: f64) -> TrackV2Response {
+        TrackV2Response {
+            track: Track {
+                id: "7501674235158431760".to_string(),
+                duration: 200_000,
+                ..Default::default()
+            },
+            track_player: TrackPlayer {
+                video_model: Some(serde_json::json!({
+                    "main_play_url": "https://cdn.example/track.m4a",
+                    "duration": stream_seconds,
+                    "quality": "标准",
+                    "format": "m4a",
+                    "bitrate": 128_000,
+                    "size": 12_345
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 设备指纹与签名提供者都就位的客户端（`can_sign` 成立）。
+    fn signing_soda() -> Soda {
+        let soda = Soda::new("sessionid_ss=test");
+        soda.set_app_credentials(AppCredentials {
+            device_id: "7461234567890123".to_string(),
+            ..Default::default()
+        });
+        soda.set_signature_provider(Arc::new(NoopSignature));
+        soda
+    }
+
+    #[test]
+    fn check_stream_access_marks_signer_failure_in_the_report() {
+        let soda = signing_soda();
+        let web = web_response(30.0);
+        let report = check_stream_access_with(
+            &soda,
+            "7501674235158431760",
+            |_, _| Ok(web.clone()),
+            |_, _| Err(SodaError::http("signer error: connect to signer refused")),
+        )
+        .expect("签名故障仍返回诊断报告");
+        assert!(report.signer_failed);
+        assert!(report.app_error.contains("connect to signer refused"));
+        assert!(report.hint.contains("签名器调用失败"), "{}", report.hint);
+    }
+
+    #[test]
+    fn check_stream_access_keeps_non_signer_errors_as_entitlement() {
+        let soda = signing_soda();
+        let web = web_response(30.0);
+        let report = check_stream_access_with(
+            &soda,
+            "7501674235158431760",
+            |_, _| Ok(web.clone()),
+            |_, _| {
+                Err(SodaError::http(
+                    "http request failed: status 500 (https://api.qishui.com/luna/pc/track_v2)",
+                ))
+            },
+        )
+        .expect("非签名故障也返回诊断报告");
+        assert!(!report.signer_failed);
+        assert!(!report.hint.contains("签名器调用失败"), "{}", report.hint);
+    }
+
+    #[test]
+    fn signer_failure_hint_is_not_reported_as_entitlement() {
+        let report = StreamAccessReport {
+            best: Some(DownloadInfo {
+                duration: 30.0,
+                ..Default::default()
+            }),
+            is_preview: true,
+            requires_vip: true,
+            signer_failed: true,
+            app_error: "signer error: connect to signer refused".to_string(),
+            ..Default::default()
+        };
+        let hint = build_hint(&report);
+        assert!(hint.contains("签名器调用失败"), "{hint}");
+        assert!(hint.contains("app_error"), "{hint}");
+        assert!(!hint.contains("connect to signer refused"), "{hint}");
+        assert!(
+            !hint.contains("仅限会员"),
+            "签名故障不能写成会员权益问题：{hint}"
+        );
     }
 }

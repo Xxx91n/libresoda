@@ -241,15 +241,7 @@ pub(crate) fn get_raw(url: &str, options: &[RequestOption]) -> Result<RawRespons
     // 只收能读成文本的头：读不懂的 `Content-Range` 本来也不能当范围信息用，
     // 交给上层按「没带这个头」处理。`headers_names()` 不去重（同名几行返几个名字），
     // 而 `Response::header` 只认第一个匹配，所以按名收敛成第一行的值就在这里发生。
-    let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            response
-                .header(&name)
-                .map(|value| (name, value.to_string()))
-        })
-        .collect();
+    let headers = response_headers(&response);
     Ok(RawResponse {
         status,
         headers,
@@ -262,8 +254,29 @@ pub fn post_json(url: &str, body: &[u8], options: &[RequestOption]) -> Result<Ve
     Ok(post_bytes(url, body, options)?.body)
 }
 
-/// POST 请求，返回完整响应（含 `Set-Cookie`），供 passport 登录流程使用。
-pub fn post_bytes(url: &str, body: &[u8], options: &[RequestOption]) -> Result<HttpResponse> {
+/// POST 一次交回的原始事实；**非 2xx 也走这里**，状态码、响应头与响应体一个都不丢。
+///
+/// 只给签名服务用：上游 libmssdk 的失败契约把「可重试（带等待时长）」与「不可重试」
+/// 放在状态码、`Retry-After` 头与回包体里（见 `docs/SIGNER-SERVICE.md` §2.3 与
+/// libmssdk#4），普通接口的非 2xx 不包含这些信息，仍由 [`post_bytes`] 折成一句错误。
+pub(crate) struct PostResponse {
+    pub(crate) status: u16,
+    /// 跟随重定向后的最终地址（与 [`HttpResponse::final_url`] 同口径）。
+    pub(crate) final_url: String,
+    /// 响应头，名字保留服务端写法并按名字排序（错误文案可复现）；同名只留第一行。
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    /// 非 2xx 的响应体超过上限时只保留前一段；2xx 超限直接报错（不把截断的
+    /// 签名回包当合法 JSON 去解析）。
+    pub(crate) body_truncated: bool,
+}
+
+/// 读回来的响应体硬上限。签名服务回包正常只有几百字节，超过它不是正常结果，
+/// 也不该被整块读进内存或拼进错误文案。
+const MAX_POST_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// 发一次 POST，**4xx/5xx 也当响应交回**；传输层失败才返回 `Err`。
+fn send_post(url: &str, body: &[u8], options: &[RequestOption]) -> Result<ureq::Response> {
     let merged = merge_options(options);
     let mut request = ureq::post(url)
         .timeout(merged.timeout_value())
@@ -271,18 +284,76 @@ pub fn post_bytes(url: &str, body: &[u8], options: &[RequestOption]) -> Result<H
     for (key, value) in merged.headers() {
         request = request.set(key, value);
     }
-    let response = match request.send_bytes(body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            let final_url = response.get_url().to_string();
-            return Err(SodaError::http(format!(
-                "http request failed: status {status} ({final_url})"
-            )));
-        }
-        Err(err) => return Err(SodaError::http(err.to_string())),
-    };
+    match request.send_bytes(body) {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(_, response)) => Ok(response),
+        Err(err) => Err(SodaError::http(err.to_string())),
+    }
+}
+
+/// 把响应头收成可读文本：同名只留第一行（顺序保持 `ureq` 给的样子）。
+fn response_headers(response: &ureq::Response) -> Vec<(String, String)> {
+    response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name, value.to_string()))
+        })
+        .collect()
+}
+
+/// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
+pub(crate) fn post_with_status(
+    url: &str,
+    body: &[u8],
+    options: &[RequestOption],
+) -> Result<PostResponse> {
+    let response = send_post(url, body, options)?;
     let status = response.status();
     let final_url = response.get_url().to_string();
+    let mut headers = response_headers(&response);
+    // 错误文案要可复现：头序不依赖服务端发送顺序。
+    headers.sort_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
+    let mut data = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_POST_RESPONSE_BODY + 1) as u64)
+        .read_to_end(&mut data)
+        .map_err(|err| SodaError::http(err.to_string()))?;
+    let body_truncated = data.len() > MAX_POST_RESPONSE_BODY;
+    if body_truncated {
+        // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限说明
+        // 回包不是正常签名结果，不能拿截断的 JSON 当签名。
+        if (200..300).contains(&status) {
+            return Err(SodaError::http(format!(
+                "http response body exceeds {MAX_POST_RESPONSE_BODY} bytes"
+            )));
+        }
+        data.truncate(MAX_POST_RESPONSE_BODY);
+    }
+    Ok(PostResponse {
+        status,
+        final_url,
+        headers,
+        body: data,
+        body_truncated,
+    })
+}
+
+/// POST 请求，返回完整响应（含 `Set-Cookie`），供 passport 登录流程使用。
+pub fn post_bytes(url: &str, body: &[u8], options: &[RequestOption]) -> Result<HttpResponse> {
+    let response = send_post(url, body, options)?;
+    let status = response.status();
+    let final_url = response.get_url().to_string();
+    if !(200..300).contains(&status) {
+        return Err(SodaError::http(format!(
+            "http request failed: status {status} ({final_url})"
+        )));
+    }
     let cookies = collect_cookies(&response);
     let mut data = Vec::new();
     response

@@ -8,7 +8,7 @@ use super::staged::{DownloadStrategy, StagedDownload};
 use super::track::{
     best_from_video_model_with_preference, fetch_pc_track_v2, fetch_player_info, fetch_web_track_v2,
 };
-use super::types::DownloadInfo;
+use super::types::{DownloadInfo, TrackV2Response};
 use super::Soda;
 use crate::error::{Result, SodaError};
 use crate::model::{Song, SOURCE_SODA};
@@ -23,17 +23,7 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
     let track_id = song_track_id(song);
     let cached = cached_download_info(song);
     if !track_id.is_empty() {
-        match resolve_download_info(soda, &track_id, None) {
-            Ok(info) => return Ok(info),
-            Err(err) => {
-                if let Some(cached) = cached {
-                    if !cached.url.is_empty() {
-                        return Ok(cached);
-                    }
-                }
-                return Err(err);
-            }
-        }
+        return resolve_with_cache_fallback(resolve_download_info(soda, &track_id, None), cached);
     }
     if let Some(cached) = cached {
         if !cached.url.is_empty() {
@@ -41,6 +31,28 @@ pub fn get_download_info(soda: &Soda, song: &Song) -> Result<DownloadInfo> {
         }
     }
     Err(SodaError::invalid_input("track id is empty"))
+}
+
+/// 解析失败时的取舍。
+///
+/// 签名器故障不是"这一首拿不到"：即便手里有旧地址也要让调用方看见，否则上层无法
+/// 把签名服务故障与曲目权益区分开（#36 / sodam #103）。其余错误沿用旧回退 ——
+/// 手里有可用地址就先返回它。
+fn resolve_with_cache_fallback(
+    resolved: Result<DownloadInfo>,
+    cached: Option<DownloadInfo>,
+) -> Result<DownloadInfo> {
+    let err = match resolved {
+        Ok(info) => return Ok(info),
+        Err(err) => err,
+    };
+    if err.is_signer_failure() {
+        return Err(err);
+    }
+    match cached {
+        Some(cached) if !cached.url.is_empty() => Ok(cached),
+        _ => Err(err),
+    }
 }
 
 /// 等价 `sodaCachedDownloadInfo`：从 `<url>#auth=<play_auth>` 恢复流量信息。
@@ -78,8 +90,22 @@ pub fn song_track_id(song: &Song) -> String {
 pub fn resolve_download_info(
     soda: &Soda,
     track_id: &str,
-    web_response: Option<&super::types::TrackV2Response>,
+    web_response: Option<&TrackV2Response>,
 ) -> Result<DownloadInfo> {
+    resolve_download_info_with(soda, track_id, web_response, fetch_pc_track_v2)
+}
+
+/// [`resolve_download_info`] 的本体；App 端点取数做成参数，离线用例才能钉住
+/// 「签名成功但只有试听」与「签名失败」两条分支而不联网。
+fn resolve_download_info_with<F>(
+    soda: &Soda,
+    track_id: &str,
+    web_response: Option<&TrackV2Response>,
+    fetch_pc: F,
+) -> Result<DownloadInfo>
+where
+    F: FnOnce(&Soda, &str) -> Result<TrackV2Response>,
+{
     let track_id = track_id.trim();
     if track_id.is_empty() {
         return Err(SodaError::invalid_input("track id is empty"));
@@ -138,7 +164,7 @@ pub fn resolve_download_info(
     }
 
     if should_try_pc {
-        match fetch_pc_track_v2(soda, track_id) {
+        match fetch_pc(soda, track_id) {
             Ok(pc_response) => {
                 let pc_track = pc_response.primary_track();
                 if full_duration == 0 {
@@ -183,7 +209,15 @@ pub fn resolve_download_info(
                     ));
                 }
             }
-            Err(err) => last_err = Some(err),
+            Err(err) => {
+                // 签名故障停在 App 端点：不因为 web 侧还有预览流就返回 Ok。
+                // 「只有试听」是权益事实（`is_preview`），「签名失败」是服务故障，
+                // 两者对用户意味着完全不同的下一步（#36）。
+                if err.is_signer_failure() {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
         }
     }
 
@@ -372,5 +406,142 @@ impl Soda {
     /// 以可续传路径下载整曲，并交回这次传输的五个事实（见 [`DownloadReport`]）。
     pub fn download_resumable(&self, song: &Song, output_path: &Path) -> Result<DownloadReport> {
         download_resumable(self, song, output_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::soda::types::{Track, TrackPlayer};
+
+    /// 一条 web 端点能给出的播放流；`stream_seconds` 小于整曲时长时就是试听。
+    fn track_response(stream_seconds: f64) -> TrackV2Response {
+        TrackV2Response {
+            track: Track {
+                id: "7501674235158431760".to_string(),
+                duration: 200_000, // 毫秒，`track_duration_seconds` 会折成 200 秒
+                ..Default::default()
+            },
+            track_player: TrackPlayer {
+                video_model: Some(serde_json::json!({
+                    "main_play_url": "https://cdn.example/track.m4a",
+                    "duration": stream_seconds,
+                    "quality": "标准",
+                    "format": "m4a",
+                    "bitrate": 128_000,
+                    "size": 12_345
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pc_full_stream_is_returned_when_signature_succeeds() {
+        let soda = Soda::new("sessionid_ss=test");
+        let web = track_response(30.0);
+        let info = resolve_download_info_with(&soda, "7501674235158431760", Some(&web), |_, _| {
+            Ok(track_response(200.0))
+        })
+        .expect("签名成功且 App 端点给整曲");
+        assert!(!info.is_preview);
+        assert_eq!(info.url, "https://cdn.example/track.m4a");
+        assert_eq!(info.duration, 200.0);
+    }
+
+    #[test]
+    fn pc_preview_stream_stays_ok_and_is_marked_preview() {
+        // 签名成功、服务端只给试听：这是权益/曲目事实，不能被当成签名故障。
+        let soda = Soda::new("sessionid_ss=test");
+        let web = track_response(30.0);
+        let info = resolve_download_info_with(&soda, "7501674235158431760", Some(&web), |_, _| {
+            Ok(track_response(30.0))
+        })
+        .expect("试听不是错误");
+        assert!(info.is_preview);
+        assert_eq!(info.duration, 30.0);
+    }
+
+    #[test]
+    fn signer_failure_is_not_swallowed_by_web_preview() {
+        let soda = Soda::new("sessionid_ss=test");
+        let web = track_response(30.0);
+        let error = resolve_download_info_with(&soda, "7501674235158431760", Some(&web), |_, _| {
+            Err(SodaError::http("signer error: connect to signer refused"))
+        })
+        .expect_err("签名故障必须上抛，不能退化成试听");
+        assert!(error.is_signer_failure(), "{error}");
+        assert!(error.to_string().contains("connect to signer refused"));
+    }
+
+    #[test]
+    fn non_signer_pc_failure_still_falls_back_to_web_preview() {
+        // 对照：不是签名器的问题时，既有回退（返回 web 试听并标 is_preview）保持不变。
+        let soda = Soda::new("sessionid_ss=test");
+        let web = track_response(30.0);
+        let info = resolve_download_info_with(&soda, "7501674235158431760", Some(&web), |_, _| {
+            Err(SodaError::http(
+                "http request failed: status 500 (https://api.qishui.com/luna/pc/track_v2)",
+            ))
+        })
+        .expect("非签名故障仍按旧规则回退");
+        assert!(info.is_preview);
+        assert_eq!(info.url, "https://cdn.example/track.m4a");
+    }
+
+    #[test]
+    fn cached_url_does_not_hide_a_signer_failure() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let error = resolve_with_cache_fallback(
+            Err(SodaError::http("signer error: connect to signer refused")),
+            Some(cached),
+        )
+        .expect_err("旧地址不能把签名故障盖掉");
+        assert!(error.is_signer_failure(), "{error}");
+    }
+
+    #[test]
+    fn cached_url_is_still_used_for_non_signer_failures() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let info = resolve_with_cache_fallback(
+            Err(SodaError::http(
+                "http request failed: status 500 (https://api.qishui.com/x)",
+            )),
+            Some(cached),
+        )
+        .expect("非签名故障沿用旧回退");
+        assert_eq!(info.url, "https://cdn.example/cached.m4a");
+    }
+
+    #[test]
+    fn resolved_stream_wins_over_cached() {
+        let cached = DownloadInfo {
+            url: "https://cdn.example/cached.m4a".to_string(),
+            ..Default::default()
+        };
+        let resolved = DownloadInfo {
+            url: "https://cdn.example/fresh.m4a".to_string(),
+            ..Default::default()
+        };
+        let info = resolve_with_cache_fallback(Ok(resolved), Some(cached)).expect("成功解析");
+        assert_eq!(info.url, "https://cdn.example/fresh.m4a");
+    }
+
+    #[test]
+    fn no_cookie_never_calls_app_endpoint() {
+        let soda = Soda::new("");
+        let web = track_response(30.0);
+        let info = resolve_download_info_with(&soda, "7501674235158431760", Some(&web), |_, _| {
+            panic!("没有 Cookie 时不该请求 App 端点")
+        })
+        .expect("匿名只能拿 web 试听");
+        assert!(info.is_preview);
     }
 }
