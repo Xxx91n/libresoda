@@ -291,9 +291,9 @@ fn send_post(url: &str, body: &[u8], options: &[RequestOption]) -> Result<ureq::
     }
 }
 
-/// 把响应头收成可读文本：同名只留第一行，按名字排序（错误文案可复现）。
+/// 把响应头收成可读文本：同名只留第一行（顺序保持 `ureq` 给的样子）。
 fn response_headers(response: &ureq::Response) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = response
+    response
         .headers_names()
         .into_iter()
         .filter_map(|name| {
@@ -301,11 +301,7 @@ fn response_headers(response: &ureq::Response) -> Vec<(String, String)> {
                 .header(&name)
                 .map(|value| (name, value.to_string()))
         })
-        .collect();
-    headers.sort_by(|(left, _), (right, _)| {
-        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
-    });
-    headers
+        .collect()
 }
 
 /// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
@@ -317,7 +313,11 @@ pub(crate) fn post_with_status(
     let response = send_post(url, body, options)?;
     let status = response.status();
     let final_url = response.get_url().to_string();
-    let headers = response_headers(&response);
+    let mut headers = response_headers(&response);
+    // 错误文案要可复现：头序不依赖服务端发送顺序。
+    headers.sort_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
     let mut data = Vec::new();
     response
         .into_reader()

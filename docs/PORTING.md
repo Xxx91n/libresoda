@@ -714,7 +714,8 @@
     `signer error: http request failed: status {code} ({final_url}); headers: […]; body: …`：
     保留了旧的 `http request failed: status …` 子串，头按名字排序以便复现。只保留
     `Retry-After` / `Content-Type` / `Deprecation` / `Sunset` / `Allow` 这几个与处置相关的
-    头，URL 查询参数脱敏成 `<redacted>`（可能带签名服务 token）；头值截到 200 字符、体
+    头，URL 查询参数脱敏成 `<redacted>`（可能带签名服务 token；非 2xx 与连接拒绝/超时
+    两条路径都脱敏）；头值截到 200 字符、体
     截到 4096 字符；回包读取另有 1 MiB 硬上限。**非 2xx 超限仍保留状态码/头，只截断体并
     标 `...(truncated)`**；2xx 超限直接报签名故障。普通接口的非 2xx 行为不变（仍由
     `post_bytes` 折成一句错误）。`post_bytes` 与本函数共用 `send_post`/`response_headers`，
@@ -726,8 +727,9 @@
     改为 `signer error: empty signature response`：配了远程或子进程签名器却等于没签，
     不能悄悄改发未签名请求（`NoopSignature` 与自定义 no-op 仍按未签名继续）。
     前缀补写保留原错误变体（`Json` 仍是 `Json`）。`CommandSignature` 的解码/编码失败
-    文案由 `sign (request|response) decode` 改成 `signer (request|response) decode`
-    （与 `HttpSignature::parse_response` 对齐，sodam 的失败分类按 `signer` 判定）。
+    文案由 `sign request encode` / `sign response decode` 改成
+    `signer request encode` / `signer response decode`（与 `HttpSignature::parse_response`
+    对齐，sodam 的失败分类按 `signer` 判定）。
   - 新增 `SodaError::is_signer_failure()`：判据是文案**以 `signer` 开头**（签名链路每层
     都保证这一点；不用「包含 signer」是为了不把引用了签名器地址的普通 HTTP 错误误判成
     服务故障）。`SodaError` 的形状**没改**（仍不新增变体）；结构化错误类型
@@ -737,17 +739,21 @@
     故障盖掉。非签名故障（例如 PC 端点 500）仍按旧规则回退到 web 试听（`Ok + is_preview`）
     或手里的旧地址。「签名成功但服务端只给试听」保持 `Ok + is_preview`，不误判成故障。
     取数函数做成 `resolve_download_info_with` 的闭包参数，离线用例可注入 App 端点结果
-    而不联网。
+    而不联网。`fetch_song_detail`（`Parse` / 详情主入口）同样传播签名故障：否则
+    `parse` 会返回一条没有新流的歌曲，签名故障在主入口上又看不见了；非签名取流失败
+    仍保持上游的可选补全语义（返回元数据）。
   - `StreamAccessReport` 新增公开字段 `signer_failed: bool`（结构体级
     `#[serde(default)]` 已覆盖它）：`app_error` 继续保留原文，但签名故障不再只是文案
-    备注；`build_hint` 优先给出「签名服务调用失败（不是曲目权益问题）」。这是**对外
+    备注；`build_hint` 优先给出「签名器调用失败（不是曲目权益问题）」。这是**对外
     结构体加字段** —— 外部用结构体字面量且不带 `..Default::default()` 的代码需要补
     字段；该结构体本来就以 `Default` 为构造入口，仓内与 sodam 都不受影响（票 #36 要求
     把签名故障从纯文案提升为可判分支，这是最小改法）。
   - **测试**：`src/soda/download.rs` 八条（App 端点整曲 / App 端点试听 / 签名故障不透传
     web 试听 / 非签名故障仍回退 / 旧地址不盖签名故障 / 旧地址仍用于非签名故障 / 成功
     解析优先于旧地址 / 无 Cookie 不请求 App 端点）；`src/soda/signature.rs` 两条（无
-    provider 不变、provider 失败带稳定前缀）；`src/soda/stream.rs` 三条（`check_stream_access`
+    provider 不变、provider 失败带稳定前缀）；`src/soda/track.rs` 三条（签名故障从
+    详情主入口上抛、非签名失败仍返回元数据、成功结果写回歌曲）；`src/soda/stream.rs`
+    三条（`check_stream_access`
     把签名故障标进 `signer_failed`、非签名故障不标、hint 不写成会员权益）；
     `src/error.rs` 一条（判定看开头，不看正文里是否出现 signer）；`tests/signature_tests.rs`
     九条（非 2xx 保留状态/头/体、非 2xx 超长体保留状态并标截断、`ok:false` 保留

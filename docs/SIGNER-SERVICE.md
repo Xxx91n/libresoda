@@ -121,7 +121,8 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 非 2xx 的错误文案只带与处置相关的响应头（`Retry-After` / `Content-Type` /
 `Deprecation` / `Sunset` / `Allow`），其余头（可能含凭据）不输出；URL 只保留到 path，
-查询参数里的 token 显示为 `<redacted>`。响应体最多保留 4096 个字符（超过时截断并标
+查询参数里的 token 显示为 `<redacted>`（连接拒绝/超时时 ureq 回显的 URL 同样脱敏）。
+响应体最多保留 4096 个字符（超过时截断并标
 `...(truncated)`）、每个头值最多 200 字符；回包体在读取时另有 1 MiB 硬上限。
 **非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接报签名故障，
 不拿截断的 JSON 当签名。`CapturedSignature` 回空仍按「未签名」处理（它是用户显式
@@ -138,8 +139,9 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 `get_download_info` 的取流回退边界：非签名故障仍按旧规则回退到 web 试听（以及手里的
 旧地址）；签名故障直接返回 `Err`，**不**因为 web 侧有预览流或手里有旧地址就返回 `Ok`。
-`check_stream_access` 仍返回诊断报告，但新增机器可读的 `signer_failed: bool`，
-`app_error` 继续保留原文。
+`fetch_song_detail`（`Parse` / 详情主入口）同样把签名故障上抛；非签名取流失败仍只
+影响「有没有补上更好的地址」，不阻断元数据。`check_stream_access` 仍返回诊断报告，但
+新增机器可读的 `signer_failed: bool`，`app_error` 继续保留原文。
 
 `CommandSignature::timeout_ms`（默认 5 s）自票
 [`#23`](https://github.com/sodahub-org/libresoda/issues/23) 起真的生效：写入与 stdout/stderr

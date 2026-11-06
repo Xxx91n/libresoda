@@ -242,7 +242,6 @@ fn soda_accepts_signature_provider() {
 // 分离架构：远程 HTTP 签名服务
 // ---------------------------------------------------------------------------
 
-/// 起一个只回一次的迷你签名服务，验证 HttpSignature 的请求/解析。
 /// 读完一次 HTTP 请求：先读头部，再按 `Content-Length` 读完 body（ureq 可能分多次写）。
 fn read_request(stream: &mut std::net::TcpStream) -> String {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
@@ -274,6 +273,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8_lossy(&collected).to_string()
 }
 
+/// 起一个只回一次的迷你签名服务，验证 HttpSignature 的请求/解析。
 fn spawn_signer_service(
     response_body: &'static str,
     expect_url: bool,
@@ -465,11 +465,17 @@ fn http_signature_connection_refused_is_signer_failure() {
     let addr = listener.local_addr().expect("addr");
     drop(listener); // 端口随即无人监听：连接会被拒绝。
 
-    let error = HttpSignature::new(format!("http://{addr}/sign"))
+    let error = HttpSignature::new(format!("http://{addr}/sign?token=secret-token"))
         .timeout_ms(500)
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("连不上签名服务就是签名故障");
-    assert!(error.to_string().starts_with("signer error:"), "{error}");
+    let text = error.to_string();
+    assert!(text.starts_with("signer error:"), "{text}");
+    assert!(
+        !text.contains("secret-token"),
+        "URL 里的 token 不能进错误文案：{text}"
+    );
+    assert!(text.contains("<redacted>"), "要显示查询参数已脱敏：{text}");
 }
 
 #[test]

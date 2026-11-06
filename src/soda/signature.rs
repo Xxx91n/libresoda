@@ -380,12 +380,9 @@ impl SignatureProvider for HttpSignature {
         // 传输层失败（拒绝连接 / 超时）也要带上签名上下文：直接调用
         // `HttpSignature::sign` 的调用方同样能把它判成签名故障。
         let reply = crate::http::post_with_status(&self.url, &payload, &[option])
-            .map_err(with_signer_context)?;
+            .map_err(|err| signer_transport_error(&self.url, err))?;
         if !(200..300).contains(&reply.status) {
-            return Err(SodaError::http(http_signature_failure_message(
-                &reply.final_url,
-                &reply,
-            )));
+            return Err(SodaError::http(http_signature_failure_message(&reply)));
         }
         let response = Self::parse_response(&reply.body)?;
         if response.is_empty() {
@@ -422,11 +419,11 @@ fn redact_url_for_error(url: &str) -> String {
 /// 形状刻意保留旧的 `http request failed: status {code} ({url})`，再补上响应头
 /// （含 `Retry-After`）与响应体；`signer error:` 前缀是上层分类的稳定入口。
 /// 回包体与头值都截断，不让签名服务的错误页把日志撑爆。
-fn http_signature_failure_message(url: &str, reply: &crate::http::PostResponse) -> String {
+fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     let mut message = format!(
         "signer error: http request failed: status {} ({})",
         reply.status,
-        redact_url_for_error(url)
+        redact_url_for_error(&reply.final_url)
     );
     let mut headers = Vec::new();
     for (name, value) in &reply.headers {
@@ -478,6 +475,24 @@ fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
 ///
 /// 已经以 `signer` 开头的文案原样保留：`CommandSignature` 的四条既有文案与
 /// `HttpSignature` 的 `signer error: …` 都不会被再加一层前缀。
+/// 传输层错误（拒绝连接 / 超时）里带着完整 URL；先把查询参数脱敏，再补签名前缀。
+///
+/// ureq 的错误文案会把配置里的地址原样打印出来，`?token=…` 这种签名服务 token
+/// 不能跟着进日志。
+fn signer_transport_error(url: &str, error: SodaError) -> SodaError {
+    let text = error.to_string();
+    let redacted = if url.is_empty() {
+        text
+    } else {
+        text.replace(url, &redact_url_for_error(url))
+    };
+    let error = match error {
+        SodaError::Json(_) => SodaError::Json(redacted),
+        _ => SodaError::Http(redacted),
+    };
+    with_signer_context(error)
+}
+
 fn with_signer_context(error: SodaError) -> SodaError {
     let text = error.to_string();
     if text.to_ascii_lowercase().starts_with("signer") {

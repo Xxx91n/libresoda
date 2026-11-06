@@ -231,7 +231,7 @@ fn build_hint(report: &StreamAccessReport) -> String {
     // 签名服务故障优先于「试听」的所有解释：它要停、要修，和曲目权益不是一件事。
     if report.signer_failed {
         return format!(
-            "签名服务调用失败（不是曲目权益问题）：{}；修好签名器后会重新走 App 端点",
+            "签名器调用失败（不是曲目权益问题）：{}；修好签名器后会重新走 App 端点",
             if report.app_error.is_empty() {
                 "（无错误信息）"
             } else {
@@ -347,7 +347,7 @@ mod tests {
         .expect("签名故障仍返回诊断报告");
         assert!(report.signer_failed);
         assert!(report.app_error.contains("connect to signer refused"));
-        assert!(report.hint.contains("签名服务调用失败"), "{}", report.hint);
+        assert!(report.hint.contains("签名器调用失败"), "{}", report.hint);
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         )
         .expect("非签名故障也返回诊断报告");
         assert!(!report.signer_failed);
-        assert!(!report.hint.contains("签名服务调用失败"), "{}", report.hint);
+        assert!(!report.hint.contains("签名器调用失败"), "{}", report.hint);
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
             ..Default::default()
         };
         let hint = build_hint(&report);
-        assert!(hint.contains("签名服务调用失败"), "{hint}");
+        assert!(hint.contains("签名器调用失败"), "{hint}");
         assert!(hint.contains("connect to signer refused"), "{hint}");
         assert!(
             !hint.contains("仅限会员"),
