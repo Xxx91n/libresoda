@@ -1041,10 +1041,10 @@ mod tests {
         );
     }
 
+    /// 票 #38 CodeRabbit 安全审查：扫描改成 O(n) 后，标记密集时行为不变。
+    /// 一条正文里塞大量 token=/Bearer 与 URL，逐个都要被换掉，诊断尾巴保留。
     #[test]
     fn dense_markers_are_all_redacted() {
-        // 票 #38 CodeRabbit 安全审查：扫描改成 O(n) 后，标记密集时行为不变——
-        // 一条正文里塞大量 token=/Bearer，逐个都要被换掉，诊断尾巴保留。
         let mut body = String::new();
         for i in 0..3000 {
             body.push_str(&format!("token=sekret{i} Bearer jwt{i} "));
