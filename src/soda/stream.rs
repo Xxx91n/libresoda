@@ -298,6 +298,7 @@ mod tests {
     use crate::soda::types::{Track, TrackPlayer, TrackV2Response};
     use std::sync::Arc;
 
+    /// 一条 web 端点能给出的播放流；短于整曲时长时就是试听。
     fn web_response(stream_seconds: f64) -> TrackV2Response {
         TrackV2Response {
             track: Track {
@@ -320,6 +321,7 @@ mod tests {
         }
     }
 
+    /// 设备指纹与签名提供者都就位的客户端（`can_sign` 成立）。
     fn signing_soda() -> Soda {
         let soda = Soda::new("sessionid_ss=test");
         soda.set_app_credentials(AppCredentials {

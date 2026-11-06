@@ -692,6 +692,7 @@ fn video_model_play_auth(values: &Map<String, Value>) -> String {
 mod tests {
     use super::*;
 
+    /// 一条最小的 web 曲目元数据（id 非空，长度 200 秒）。
     fn web_track() -> TrackV2Response {
         TrackV2Response {
             track: Track {

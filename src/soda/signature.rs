@@ -500,7 +500,9 @@ fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
 /// ureq 的错误文案会把配置里的地址原样打印出来，`?token=…` 这种签名服务 token
 /// 不能跟着进日志。
 fn signer_transport_error(url: &str, error: SodaError) -> SodaError {
-    let text = error.to_string();
+    // ureq 可能把配置的 URL 规范化（host 大小写、默认端口）后再打印；按
+    // 「文本里出现的 URL」整体脱敏，比只做一次精确替换可靠。
+    let text = redact_urls_in_text(&error.to_string());
     let redacted = if url.is_empty() {
         text
     } else {
@@ -511,6 +513,28 @@ fn signer_transport_error(url: &str, error: SodaError) -> SodaError {
         _ => SodaError::Http(redacted),
     };
     with_signer_context(error)
+}
+
+/// 把文本里出现的每个 `http(s)://…` 令牌交给 [`redact_url_for_error`]。
+fn redact_urls_in_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = [rest.find("http://"), rest.find("https://")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(index) = next else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        output.push_str(&redact_url_for_error(&tail[..end]));
+        rest = &tail[end..];
+    }
+    output
 }
 
 fn with_signer_context(error: SodaError) -> SodaError {
@@ -819,6 +843,7 @@ mod tests {
         assert_eq!(options.len(), 1);
     }
 
+    /// 固定失败的签名器；错误文案不含 `signer`，用来钉住补前缀行为。
     struct BrokenSignature;
 
     impl SignatureProvider for BrokenSignature {
@@ -844,6 +869,19 @@ mod tests {
             redact_url_for_error("http://host:1/sign#frag"),
             "http://host:1/sign#<redacted>"
         );
+    }
+
+    #[test]
+    fn transport_text_redacts_every_url_even_if_normalized() {
+        // ureq 可能把 host 改大小写、去掉默认端口；按文本里的 URL 整体脱敏，
+        // 不依赖与配置 URL 逐字相等。
+        let text = "http://TOKEN@Host.Example/Sign?token=secret: Connection Failed; \
+                    retry http://other.example/sign?token=two";
+        let redacted = redact_urls_in_text(text);
+        assert!(!redacted.contains("secret"), "{redacted}");
+        assert!(!redacted.contains("token=two"), "{redacted}");
+        assert!(redacted.contains("Host.Example"), "{redacted}");
+        assert_eq!(redacted.matches("<redacted>").count(), 3, "{redacted}");
     }
 
     #[test]

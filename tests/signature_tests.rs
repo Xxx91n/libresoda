@@ -502,6 +502,7 @@ fn http_signature_timeout_is_signer_failure() {
     assert!(error.to_string().starts_with("signer error:"), "{error}");
 }
 
+/// 固定返回一条错误的签名器；文案里不带 `signer` 前缀，用来钉住补前缀行为。
 struct FailingSigner(&'static str);
 
 impl SignatureProvider for FailingSigner {
