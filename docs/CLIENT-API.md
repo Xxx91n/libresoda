@@ -305,7 +305,7 @@ let hot = soda.suggest_words("default")?;         // 热搜词（实测 6 条）
 | 现象 | 含义 | 处理 |
 | --- | --- | --- |
 | `soda xxx returned empty body` | 缺应用级签名，或设备指纹与签名器不一致 | 配 `QISHUI_SIGNER_URL`/`TOKEN`，并让 `SODA_DEVICE_ID` 与签名器一致 |
-| `signer error: unauthorized（…QISHUI_SIGNER_TOKEN…）` | 签名服务要求鉴权但客户端没带 token | 设 `QISHUI_SIGNER_TOKEN`，或 `HttpSignature::with_token(..)` |
+| `signer error: unauthorized [code=unauthorized]（…QISHUI_SIGNER_TOKEN…）` | 签名服务要求鉴权但客户端没带 token | 设 `QISHUI_SIGNER_TOKEN`，或 `HttpSignature::with_token(..)` |
 | `signer error: http request failed: status …` | 签名服务返回非 2xx；响应头/体在文案里 | 按 `Retry-After` 退避或修服务，见 `SIGNER-SERVICE.md` §2.3 |
 | `signer error: …` / `signer exited …` | 签名器已配置但调用失败（连不上/超时/非 0 退出） | 修签名器；App 端点（取流与写操作）直接报错，不再降级成未签名请求/试听 |
 | `check_stream_access().signer_failed == true` | 同上；报告仍给出 web 侧候选 | 按签名服务故障处理，不要当成曲目权益问题 |

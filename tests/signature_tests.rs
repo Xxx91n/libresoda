@@ -243,6 +243,37 @@ fn soda_accepts_signature_provider() {
 // ---------------------------------------------------------------------------
 
 /// 起一个只回一次的迷你签名服务，验证 HttpSignature 的请求/解析。
+/// 读完一次 HTTP 请求：先读头部，再按 `Content-Length` 读完 body（ureq 可能分多次写）。
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut collected: Vec<u8> = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                collected.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&collected).to_string();
+                if let Some(index) = text.find("\r\n\r\n") {
+                    let content_length = text[..index]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if collected.len() >= index + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&collected).to_string()
+}
+
 fn spawn_signer_service(
     response_body: &'static str,
     expect_url: bool,
@@ -252,34 +283,7 @@ fn spawn_signer_service(
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        // ureq 可能分多次写：先读头部，再按 Content-Length 读完 body。
-        let mut collected: Vec<u8> = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    collected.extend_from_slice(&buffer[..read]);
-                    let text = String::from_utf8_lossy(&collected).to_string();
-                    if let Some(index) = text.find("\r\n\r\n") {
-                        let content_length = text[..index]
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|value| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if collected.len() >= index + 4 + content_length {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let request = String::from_utf8_lossy(&collected).to_string();
+        let request = read_request(&mut stream);
         if expect_url {
             assert!(
                 request.contains("\"url\"") && request.contains("track_v2"),
@@ -315,32 +319,7 @@ fn spawn_http_once(
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        let mut collected: Vec<u8> = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    collected.extend_from_slice(&buffer[..read]);
-                    let text = String::from_utf8_lossy(&collected).to_string();
-                    if let Some(index) = text.find("\r\n\r\n") {
-                        let content_length = text[..index]
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|value| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if collected.len() >= index + 4 + content_length {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let _ = read_request(&mut stream);
         let response = format!(
             "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
             body.len()
@@ -442,6 +421,42 @@ fn http_signature_ok_false_keeps_code_and_retry_after() {
         text.contains("[retry_after_seconds=1]"),
         "等待时长要留下来：{text}"
     );
+
+    // 回包把等待时长写成字符串时也要能读。
+    let error = HttpSignature::parse_response(
+        r#"{"ok":false,"error":"服务忙","code":"BUSY","retry_after_seconds":"2"}"#.as_bytes(),
+    )
+    .expect_err("ok:false 是签名故障");
+    assert!(
+        error.to_string().contains("[retry_after_seconds=2]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn http_signature_empty_success_is_a_signer_failure() {
+    // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
+    let url = spawn_signer_service("{}", false, None);
+    let error = HttpSignature::new(url)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("空签名回包要报错");
+    assert!(
+        error.to_string().contains("empty signature response"),
+        "{error}"
+    );
+}
+
+#[test]
+fn oversized_2xx_response_is_a_signer_failure() {
+    let body: &'static str = Box::leak("x".repeat(2 * 1024 * 1024).into_boxed_str());
+    let url = spawn_http_once("200 OK", "", body);
+    let error = HttpSignature::new(url)
+        .timeout_ms(5_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("超长 2xx 回包不能当签名");
+    let text = error.to_string();
+    assert!(text.starts_with("signer error:"), "{text}");
+    assert!(text.contains("body exceeds"), "{text}");
 }
 
 #[test]

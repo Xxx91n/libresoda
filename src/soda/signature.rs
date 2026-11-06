@@ -387,11 +387,33 @@ impl SignatureProvider for HttpSignature {
                 &reply,
             )));
         }
-        Self::parse_response(&reply.body)
+        let response = Self::parse_response(&reply.body)?;
+        if response.is_empty() {
+            // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
+            return Err(SodaError::http("signer error: empty signature response"));
+        }
+        Ok(response)
     }
 
     fn name(&self) -> &'static str {
         "http"
+    }
+}
+
+/// 错误文案里允许带的响应头：重试节奏与弃用/方法提示。其余头可能含凭据，一律不输出。
+const SIGNER_ERROR_HEADERS: &[&str] = &[
+    "retry-after",
+    "content-type",
+    "deprecation",
+    "sunset",
+    "allow",
+];
+
+/// 错误文案里的 URL 只留到 path：查询参数可能带签名服务的 token。
+fn redact_url_for_error(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
     }
 }
 
@@ -402,13 +424,19 @@ impl SignatureProvider for HttpSignature {
 /// 回包体与头值都截断，不让签名服务的错误页把日志撑爆。
 fn http_signature_failure_message(url: &str, reply: &crate::http::PostResponse) -> String {
     let mut message = format!(
-        "signer error: http request failed: status {} ({url})",
-        reply.status
+        "signer error: http request failed: status {} ({})",
+        reply.status,
+        redact_url_for_error(url)
     );
     let mut headers = Vec::new();
     for (name, value) in &reply.headers {
-        // 不把可能是凭据的 Set-Cookie 拼进错误文案；其余头原样保留。
-        if name.eq_ignore_ascii_case("set-cookie") {
+        // 只保留与「下一步怎么办」相关的头：`Retry-After` 是重试节奏，弃用与
+        // `Allow` 帮人定位配置问题。其余头可能含凭据（`Set-Cookie`、鉴权回显），
+        // 按仓库安全约定不写进错误文案/日志。
+        if !SIGNER_ERROR_HEADERS
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        {
             continue;
         }
         headers.push(format!("{name}: {}", truncate_for_error(value.trim(), 200)));
@@ -453,9 +481,12 @@ fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
 fn with_signer_context(error: SodaError) -> SodaError {
     let text = error.to_string();
     if text.to_ascii_lowercase().starts_with("signer") {
-        error
-    } else {
-        SodaError::Http(format!("signer error: {text}"))
+        return error;
+    }
+    // 保留原变体（Json 仍是 Json），只补前缀；分类只看文案开头。
+    match error {
+        SodaError::Json(_) => SodaError::Json(format!("signer error: {text}")),
+        _ => SodaError::Http(format!("signer error: {text}")),
     }
 }
 
@@ -558,8 +589,13 @@ impl SignatureProvider for CommandSignature {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))
+        let response: SignResponse = serde_json::from_slice(&output.stdout)
+            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+        if response.is_empty() {
+            // 外部签名器回空 JSON：等于没签，不能当成功继续。
+            return Err(SodaError::http("signer error: empty signature response"));
+        }
+        Ok(response)
     }
 
     fn name(&self) -> &'static str {

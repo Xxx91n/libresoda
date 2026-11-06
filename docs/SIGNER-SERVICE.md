@@ -112,16 +112,20 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 | 情况 | `sign()` | App 端点调用方 |
 | --- | --- | --- |
-| 没配置 provider，或 provider 明确回空（`NoopSignature`） | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
+| 没配置 provider，或 `NoopSignature` | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
 | 连接拒绝 / 超时 / 子进程非 0 退出 | `signer error: …` / `signer exited …` | 错误上抛；不再发未签名请求 |
-| HTTP 非 2xx | `signer error: http request failed: status {code} ({url}); headers: […]; body: …` | 同上；响应头整份保留，`Retry-After` 可读 |
+| HTTP 非 2xx | `signer error: http request failed: status {code} ({url?<redacted>}); headers: […]; body: …` | 同上；保留 `Retry-After` 等处置相关头 |
 | HTTP 2xx + `{"ok":false}` | `signer error: {error} [code=…] [retry_after_seconds=…]` | 同上；原因码与等待时长都在文案里 |
+| HTTP 2xx 但空签名回包 | `signer error: empty signature response` | 同上；配了签名器却等于没签 |
 | 签名成功、服务端只给试听 | `Ok` | `Ok + is_preview=true`（权益/曲目事实，不是签名故障） |
 
-非 2xx 的响应体最多保留 4096 个字符（超过时截断并标 `...(truncated)`）、每个头值最多
-200 字符（`Set-Cookie` 不进文案），避免签名服务的错误页把日志撑爆；回包体在读取时另有
-1 MiB 硬上限。**非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接
-报签名故障，不拿截断的 JSON 当签名。
+非 2xx 的错误文案只带与处置相关的响应头（`Retry-After` / `Content-Type` /
+`Deprecation` / `Sunset` / `Allow`），其余头（可能含凭据）不输出；URL 只保留到 path，
+查询参数里的 token 显示为 `<redacted>`。响应体最多保留 4096 个字符（超过时截断并标
+`...(truncated)`）、每个头值最多 200 字符；回包体在读取时另有 1 MiB 硬上限。
+**非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接报签名故障，
+不拿截断的 JSON 当签名。`CapturedSignature` 回空仍按「未签名」处理（它是用户显式
+回填的静态值，不是远程/子进程签名器）。
 
 `HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
 普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型
@@ -215,7 +219,7 @@ let provider = HttpSignature::new("http://signer.example.com:8921/sign")
 ```
 
 服务端开了鉴权而客户端没带 token 时，`sign()` 会返回带提示的错误
-（`signer error: unauthorized（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN…）`），
+（`signer error: unauthorized [code=unauthorized]（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN…）`），
 不会静默降级成试听流；连接拒绝、超时与非 2xx 同理（见 §2.3）。
 
 ## 4. 失败模式与自愈

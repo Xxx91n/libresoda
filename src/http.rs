@@ -241,15 +241,7 @@ pub(crate) fn get_raw(url: &str, options: &[RequestOption]) -> Result<RawRespons
     // 只收能读成文本的头：读不懂的 `Content-Range` 本来也不能当范围信息用，
     // 交给上层按「没带这个头」处理。`headers_names()` 不去重（同名几行返几个名字），
     // 而 `Response::header` 只认第一个匹配，所以按名收敛成第一行的值就在这里发生。
-    let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            response
-                .header(&name)
-                .map(|value| (name, value.to_string()))
-        })
-        .collect();
+    let headers = response_headers(&response);
     Ok(RawResponse {
         status,
         headers,
@@ -279,16 +271,12 @@ pub(crate) struct PostResponse {
     pub(crate) body_truncated: bool,
 }
 
-/// 签名服务回包体的硬上限。正常回包是几百字节；超过它的既不是签名结果，
+/// 读回来的响应体硬上限。签名服务回包正常只有几百字节，超过它不是正常结果，
 /// 也不该被整块读进内存或拼进错误文案。
-const MAX_SIGNER_RESPONSE_BODY: usize = 1024 * 1024;
+const MAX_POST_RESPONSE_BODY: usize = 1024 * 1024;
 
-/// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
-pub(crate) fn post_with_status(
-    url: &str,
-    body: &[u8],
-    options: &[RequestOption],
-) -> Result<PostResponse> {
+/// 发一次 POST，**4xx/5xx 也当响应交回**；传输层失败才返回 `Err`。
+fn send_post(url: &str, body: &[u8], options: &[RequestOption]) -> Result<ureq::Response> {
     let merged = merge_options(options);
     let mut request = ureq::post(url)
         .timeout(merged.timeout_value())
@@ -296,13 +284,15 @@ pub(crate) fn post_with_status(
     for (key, value) in merged.headers() {
         request = request.set(key, value);
     }
-    let response = match request.send_bytes(body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(err) => return Err(SodaError::http(err.to_string())),
-    };
-    let status = response.status();
-    let final_url = response.get_url().to_string();
+    match request.send_bytes(body) {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(_, response)) => Ok(response),
+        Err(err) => Err(SodaError::http(err.to_string())),
+    }
+}
+
+/// 把响应头收成可读文本：同名只留第一行，按名字排序（错误文案可复现）。
+fn response_headers(response: &ureq::Response) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = response
         .headers_names()
         .into_iter()
@@ -315,22 +305,35 @@ pub(crate) fn post_with_status(
     headers.sort_by(|(left, _), (right, _)| {
         left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
     });
+    headers
+}
+
+/// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
+pub(crate) fn post_with_status(
+    url: &str,
+    body: &[u8],
+    options: &[RequestOption],
+) -> Result<PostResponse> {
+    let response = send_post(url, body, options)?;
+    let status = response.status();
+    let final_url = response.get_url().to_string();
+    let headers = response_headers(&response);
     let mut data = Vec::new();
     response
         .into_reader()
-        .take((MAX_SIGNER_RESPONSE_BODY + 1) as u64)
+        .take((MAX_POST_RESPONSE_BODY + 1) as u64)
         .read_to_end(&mut data)
         .map_err(|err| SodaError::http(err.to_string()))?;
-    let body_truncated = data.len() > MAX_SIGNER_RESPONSE_BODY;
+    let body_truncated = data.len() > MAX_POST_RESPONSE_BODY;
     if body_truncated {
         // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限说明
         // 回包不是正常签名结果，不能拿截断的 JSON 当签名。
         if (200..300).contains(&status) {
             return Err(SodaError::http(format!(
-                "http response body exceeds {MAX_SIGNER_RESPONSE_BODY} bytes"
+                "http response body exceeds {MAX_POST_RESPONSE_BODY} bytes"
             )));
         }
-        data.truncate(MAX_SIGNER_RESPONSE_BODY);
+        data.truncate(MAX_POST_RESPONSE_BODY);
     }
     Ok(PostResponse {
         status,
@@ -343,25 +346,14 @@ pub(crate) fn post_with_status(
 
 /// POST 请求，返回完整响应（含 `Set-Cookie`），供 passport 登录流程使用。
 pub fn post_bytes(url: &str, body: &[u8], options: &[RequestOption]) -> Result<HttpResponse> {
-    let merged = merge_options(options);
-    let mut request = ureq::post(url)
-        .timeout(merged.timeout_value())
-        .set("User-Agent", DEFAULT_USER_AGENT);
-    for (key, value) in merged.headers() {
-        request = request.set(key, value);
-    }
-    let response = match request.send_bytes(body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            let final_url = response.get_url().to_string();
-            return Err(SodaError::http(format!(
-                "http request failed: status {status} ({final_url})"
-            )));
-        }
-        Err(err) => return Err(SodaError::http(err.to_string())),
-    };
+    let response = send_post(url, body, options)?;
     let status = response.status();
     let final_url = response.get_url().to_string();
+    if !(200..300).contains(&status) {
+        return Err(SodaError::http(format!(
+            "http request failed: status {status} ({final_url})"
+        )));
+    }
     let cookies = collect_cookies(&response);
     let mut data = Vec::new();
     response
