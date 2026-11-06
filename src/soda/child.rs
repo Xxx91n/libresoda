@@ -167,7 +167,7 @@ where
     };
 
     if !write_finished {
-        match collect(Some(write_rx), Instant::now() + THREAD_GRACE) {
+        match collect_write(Some(write_rx), Instant::now() + THREAD_GRACE) {
             Some(Some(err)) if err.kind() != ErrorKind::BrokenPipe => {
                 return Err(ChildError::Stdin(err));
             }
@@ -280,7 +280,7 @@ fn collect_stream(receiver: Option<Receiver<Vec<u8>>>, deadline: Instant) -> Vec
 }
 
 /// 等写线程的唯一一条结果（写完 / 写到一半的错误）。宽限到了还没来按「没交全」处理。
-fn collect<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
+fn collect_write<T>(receiver: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
     let receiver = receiver?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     receiver.recv_timeout(remaining).ok()
@@ -539,26 +539,31 @@ mod tests {
     /// 票 #26：写线程被 helper 攥住吃满一个宽限时，stdout/stderr 仍各自拿得到宽限。
     ///
     /// 直接子进程（python）不读 stdin 就退出；fork 出来的 helper 继承 stdin 的读端，所以两百万
-    /// 字节的载荷写不完，写线程要耗掉一整个 1 s 宽限。helper 同时继承了 stdout/stderr，等到
-    /// 1.5 s 才写两份标记 —— 旧实现三个流共用一个截止时间，stdout/stderr 的截止点已经过去，
+    /// 字节的载荷写不完，写线程要耗掉一整个 1 s 宽限。helper 同时继承了 stdout/stderr，等过
+    /// 1.5 个宽限才写两份标记 —— 旧实现三个流共用一个截止时间，stdout/stderr 的截止点已经过去，
     /// 标记全部丢失；现在各自计时（从开始收它起算），两份都能交回来。用 python 而不是
     /// `sh -c '(...) &'`：POSIX 会把非交互 shell 的后台列表的 stdin 接到 /dev/null，读端就没了。
     #[cfg(unix)]
     #[test]
     fn streams_get_their_own_grace_when_the_write_is_stuck() {
-        const HOLD_STDIN_SCRIPT: &str = r#"
+        let grace = THREAD_GRACE.as_secs_f64();
+        let script = format!(
+            r#"
 import os, time
 if os.fork() == 0:
-    time.sleep(1.5)
+    time.sleep({marker_delay})
     os.write(1, b"out")
     os.write(2, b"err")
-    time.sleep(1)
+    time.sleep({exit_after})
     os._exit(0)
 os._exit(0)
-"#;
-        let output = run_with_watchdog(Duration::from_secs(5), || {
+"#,
+            marker_delay = grace * 1.5,
+            exit_after = grace,
+        );
+        let output = run_with_watchdog(Duration::from_secs(5), move || {
             let mut command = Command::new("python3");
-            command.args(["-c", HOLD_STDIN_SCRIPT]);
+            command.args(["-c", script.as_str()]);
             command
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
