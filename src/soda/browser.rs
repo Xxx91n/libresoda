@@ -155,8 +155,11 @@ impl CommandRequester {
             ChildError::StdinUnavailable => SodaError::http("requester stdin unavailable"),
             ChildError::Stdin(err) => SodaError::http(format!("requester stdin write: {err}")),
             ChildError::Wait(err) => SodaError::http(format!("requester wait: {err}")),
-            ChildError::Timeout { stderr } => {
-                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            ChildError::Timeout {
+                stderr,
+                stderr_truncated,
+            } => {
+                let stderr = child::timeout_diagnostic(&stderr, stderr_truncated);
                 SodaError::http(if stderr.is_empty() {
                     format!("requester timed out after {} ms", self.timeout_ms)
                 } else {
@@ -183,14 +186,17 @@ impl CommandRequester {
             return Err(SodaError::http(format!(
                 "requester exited with {}: {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
         if output.request_write_failed {
             return Err(SodaError::http(format!(
                 "requester exited without reading the request: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
+        }
+        if let Some(message) = output.truncation_message() {
+            return Err(SodaError::http(format!("requester {message}")));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
@@ -203,8 +209,11 @@ impl BrowserRequester for CommandRequester {
         let text = self.exec(payload)?;
         let parsed: BrowserResponse = serde_json::from_str(text.trim()).map_err(|err| {
             SodaError::json(format!(
-                "requester 返回无法解析: {err}（输出: {}）",
-                text.trim()
+                "requester 返回无法解析: {:?} at line {} column {}（输出长度: {} 字节）",
+                err.classify(),
+                err.line(),
+                err.column(),
+                text.len()
             ))
         })?;
         if !parsed.ok || parsed.error.is_empty() && parsed.status == 0 {
@@ -248,5 +257,19 @@ mod tests {
         let requester = CommandRequester::new("unused");
         let error = requester.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "requester stdin write: boom");
+    }
+
+    #[test]
+    fn timeout_with_truncated_stderr_keeps_timeout_classification() {
+        let requester = CommandRequester::new("unused").timeout_ms(200);
+        let error = requester.map_child_error(ChildError::Timeout {
+            stderr: vec![b'x'; 8_388_608],
+            stderr_truncated: true,
+        });
+        assert!(matches!(error, SodaError::Http(_)));
+        assert_eq!(
+            error.to_string(),
+            "requester timed out after 200 ms: stderr output truncated at 8388608 bytes"
+        );
     }
 }

@@ -668,8 +668,19 @@
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
     stdout/stderr 移入排空线程；主线程持有 `Child` 与进程树容器（Windows 的作业句柄），
     负责终止与 `wait` 收尸。
-  - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
-    「按对端产出的量无限增长」的来源（AGENTS.md 内存安全铁律 2）；正常签名回包远小于这个数。
+  - **输出上限（票 [`#27`](https://github.com/sodahub-org/libresoda/issues/27)）**：stdout/stderr
+    各最多留 8 MiB，超出部分继续读走但丢弃；只有实际丢掉字节才置对应的 `stdout_truncated` /
+    `stderr_truncated`，刚好 8 MiB 不算截断。截断通知只发一次，不等 EOF，宽限到点也能交出已经
+    收到的标志；未超限但因宽限耗尽而没收全的输出不冒充「超过字节上限」，仍沿用 #26 的口径。
+    签名器和请求器在任一流截断时均报 `SodaError::Http`，不解析 stdout、不交出半包；错误包含
+    `stdout output truncated at 8388608 bytes` / `stderr output truncated at 8388608 bytes`，
+    两流都超限时为 `stdout and stderr output truncated at 8388608 bytes`。
+    非零退出和未读完请求仍用原来的冻结文案前缀，附上截断信息；超时仍以 `timed out` 为准，
+    只收 stderr 并报告其截断，不等 stdout。非断管写入错误分类不变。
+    错误里的 stderr 在 4096 字节以内保留原文，超过只报告收集长度；请求器 JSON 解析错误只带
+    错误类别、行列和转成文本后的字节长度，不回显 stdout 或可能包含大字段值的解析错误全文。
+    新增离线用例覆盖上限前/刚好上限/超限一字节、块内跨界与 EOF 前标志交付、两端正常与非零
+    退出下的截断错误，以及大字段类型错误的有界诊断。没有新依赖或公开 API 变化。
   - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
     `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
     这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码

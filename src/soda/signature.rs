@@ -699,8 +699,11 @@ impl CommandSignature {
             ChildError::StdinUnavailable => SodaError::http("signer stdin unavailable"),
             ChildError::Stdin(err) => SodaError::http(format!("signer stdin write: {err}")),
             ChildError::Wait(err) => SodaError::http(format!("signer wait: {err}")),
-            ChildError::Timeout { stderr } => {
-                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            ChildError::Timeout {
+                stderr,
+                stderr_truncated,
+            } => {
+                let stderr = child::timeout_diagnostic(&stderr, stderr_truncated);
                 SodaError::http(if stderr.is_empty() {
                     format!("signer timed out after {} ms", self.timeout_ms)
                 } else {
@@ -730,15 +733,18 @@ impl SignatureProvider for CommandSignature {
             return Err(SodaError::http(format!(
                 "signer exited with {}: {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
         if output.request_write_failed {
             // 请求根本没写进去，它回 0 加合法 JSON 也不是按这次请求算出来的，不能当签名用。
             return Err(SodaError::http(format!(
                 "signer exited without reading the request: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
+        }
+        if let Some(message) = output.truncation_message() {
+            return Err(SodaError::http(format!("signer {message}")));
         }
         let response: SignResponse = serde_json::from_slice(&output.stdout)
             .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
@@ -931,6 +937,20 @@ mod tests {
         let provider = CommandSignature::new("unused");
         let error = provider.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "signer stdin write: boom");
+    }
+
+    #[test]
+    fn timeout_with_truncated_stderr_keeps_timeout_classification() {
+        let provider = CommandSignature::new("unused").timeout_ms(200);
+        let error = provider.map_child_error(ChildError::Timeout {
+            stderr: vec![b'x'; 8_388_608],
+            stderr_truncated: true,
+        });
+        assert!(matches!(error, SodaError::Http(_)));
+        assert_eq!(
+            error.to_string(),
+            "signer timed out after 200 ms: stderr output truncated at 8388608 bytes"
+        );
     }
 
     #[test]

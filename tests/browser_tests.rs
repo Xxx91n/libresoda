@@ -103,8 +103,7 @@ fn command_requester_attributes_broken_pipe_to_exit_status() {
 fn command_requester_drains_and_parses_large_response() {
     // 固定 128 KiB body（外层 JSON 因此超过 64 KiB 默认管道容量）：只有边写边排空，
     // 子进程才能写完并以 0 退出，回包才能完整解析成 BrowserResponse。
-    // 超过 `child` 的 8 MiB 收集上限时 stdout 会被截断（超出读走但丢弃，
-    // 上限本身由 `src/soda/child.rs` 的单元用例钉住），解析会失败而不是交出半包。
+    // 超过 `child` 的 8 MiB 收集上限时直接报截断，不再解析前缀回包。
     const LARGE_RESPONSE_SCRIPT: &str = concat!(
         // 先把请求读干净再回包：避免子进程抢在写入之前退出，被误判成「没读请求」。
         "cat >/dev/null; ",
@@ -121,6 +120,88 @@ fn command_requester_drains_and_parses_large_response() {
     assert!(response.ok);
     assert_eq!(response.status, 200);
     assert_eq!(response.body.len(), 128 * 1024);
+}
+
+/// 完整 JSON 加空白在上限内可用，超出一字节即报截断而非交出前缀回包。
+#[test]
+fn command_requester_distinguishes_complete_and_truncated_stdout() {
+    let json = r#"{"ok":true,"status":200,"body":"test-body"}"#;
+    for total in [8_388_607, 8_388_608, 8_388_609] {
+        let script = format!(
+            "cat >/dev/null; printf '%s' '{json}'; printf '%{}s' ''",
+            total - json.len()
+        );
+        let requester = CommandRequester::new("sh")
+            .args(["-c", &script])
+            .timeout_ms(15_000);
+        let result = run_with_watchdog(Duration::from_secs(20), move || {
+            requester.request(&BrowserRequest::default())
+        });
+        if total <= 8_388_608 {
+            assert_eq!(result.expect("未超限的完整回包").body, "test-body");
+        } else {
+            let error = result.expect_err("超限不能当作完整回包");
+            assert!(matches!(error, libresoda::SodaError::Http(_)));
+            assert_eq!(
+                error.to_string(),
+                "requester stdout output truncated at 8388608 bytes"
+            );
+        }
+    }
+}
+
+/// stderr 超限与非零退出同时存在时，仍应带出退出码而不带整份输出。
+#[test]
+fn command_requester_reports_truncated_stderr_without_large_diagnostics() {
+    for exit in [0, 7] {
+        let script = format!(
+            "cat >/dev/null; printf '%8388609s' '' >&2; printf '%s' '{{\"ok\":true,\"status\":200}}'; exit {exit}"
+        );
+        let requester = CommandRequester::new("sh")
+            .args(["-c", &script])
+            .timeout_ms(15_000);
+        let error = run_with_watchdog(Duration::from_secs(20), move || {
+            requester.request(&BrowserRequest::default())
+        })
+        .expect_err("stderr 超限不能静默成功");
+        assert!(matches!(error, libresoda::SodaError::Http(_)));
+        let text = error.to_string();
+        assert!(
+            text.contains("stderr output truncated at 8388608 bytes"),
+            "{text}"
+        );
+        assert!(text.len() < 256, "错误串必须有界");
+        if exit != 0 {
+            assert!(text.starts_with("requester exited with "), "{text}");
+            assert!(
+                text.contains("exit status: 7:") || text.contains("exit code: 7:"),
+                "{text}"
+            );
+        }
+    }
+}
+
+/// 数据类型错误本身也可能含长字符串，不能只删掉错误后面的 stdout。
+#[test]
+fn command_requester_bounds_malformed_response_diagnostics() {
+    let script =
+        "cat >/dev/null; printf '{\"ok\":\"'; printf '%131072s' ''; printf 'private-marker\"}'";
+    let requester = CommandRequester::new("sh")
+        .args(["-c", script])
+        .timeout_ms(15_000);
+    let error = run_with_watchdog(Duration::from_secs(20), move || {
+        requester.request(&BrowserRequest::default())
+    })
+    .expect_err("错误类型的字段不能解析");
+    assert!(matches!(error, libresoda::SodaError::Json(_)));
+    let text = error.to_string();
+    assert!(
+        text.starts_with("requester 返回无法解析: Data at line 1 column "),
+        "{text}"
+    );
+    assert!(text.contains("输出长度: 131095 字节"), "{text}");
+    assert!(!text.contains("private-marker"), "{text}");
+    assert!(text.len() < 256, "错误串必须有界");
 }
 
 /// 超时用例的驻留探针：先打 stderr 标记，再 `exec sleep 30` 驻留。
