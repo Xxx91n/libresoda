@@ -180,7 +180,8 @@ pub trait SignatureProvider: Send + Sync {
     /// 为一次请求生成签名参数/头。
     ///
     /// 出错时返回 `Err`：取流链路会把它当**签名故障**上抛（文案带 `signer`），
-    /// 不会退化为未签名请求。只有「根本没配置提供者」才走未签名路径
+    /// 不会退化为未签名请求。只有「根本没配置提供者」，或提供者显式声明允许空响应
+    /// （[`SignatureProvider::allows_empty_signature`]），才走未签名路径
     /// （见 [`apply_stream_signature`]）。
     ///
     /// 返回空的 [`SignResponse`] 默认同样算签名故障：配了提供者却拿不到任何签名，
@@ -213,6 +214,7 @@ impl SignatureProvider for NoopSignature {
     fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
         Ok(SignResponse::default())
     }
+    /// 显式 no-op：空签名就是它的正常结果。
     fn allows_empty_signature(&self) -> bool {
         true
     }
@@ -237,8 +239,8 @@ impl SignatureProvider for CapturedSignature {
             headers: self.headers.clone(),
         })
     }
-    // 抓包回填是用户显式给的静态值：全空表示「这次不签」，不是远程/子进程
-    // 签名器算不出来；保持 `Ok(None)` 的既有语义（见票 #39）。
+    /// 抓包回填是用户显式给的静态值：全空表示「这次不签」，不是远程/子进程
+    /// 签名器算不出来；保持 `Ok(None)` 的既有语义（见票 #39）。
     fn allows_empty_signature(&self) -> bool {
         true
     }
@@ -917,6 +919,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// 断言调用方的原始请求头还在：失败与未签名路径都不该改写 `options`。
+    fn assert_header_preserved(options: &[crate::http::RequestOption], name: &str, value: &str) {
+        let merged = crate::http::merge_options(options);
+        assert!(
+            merged
+                .headers()
+                .iter()
+                .any(|(header, got)| header.eq_ignore_ascii_case(name) && got.as_str() == value),
+            "原始请求头 {name}: {value} 应原样保留"
+        );
+    }
+
     #[test]
     fn stream_signature_injects_helios_and_medusa_headers() {
         let soda = super::super::Soda::new("sessionid_ss=test");
@@ -1018,14 +1032,7 @@ mod tests {
         assert_eq!(error.to_string(), "signer error: empty signature response");
         assert!(error.is_signer_failure(), "{error}");
         // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
-        let merged = crate::http::merge_options(&options);
-        assert!(
-            merged
-                .headers()
-                .iter()
-                .any(|(name, value)| name.eq_ignore_ascii_case("X-Test") && value.as_str() == "1"),
-            "原始请求头应原样保留"
-        );
+        assert_header_preserved(&options, "X-Test", "1");
     }
 
     /// 票 #39：只有显式声明允许空响应的 provider 才保留未签名路径。
@@ -1047,15 +1054,7 @@ mod tests {
             )
             .expect("显式 no-op 不是签名故障");
             assert!(signed.is_none());
-            let merged = crate::http::merge_options(&options);
-            assert!(
-                merged
-                    .headers()
-                    .iter()
-                    .any(|(name, value)| name.eq_ignore_ascii_case("X-Test")
-                        && value.as_str() == "1"),
-                "未签名路径也要保留调用方的原始请求头"
-            );
+            assert_header_preserved(&options, "X-Test", "1");
         }
     }
 
@@ -1190,6 +1189,6 @@ mod tests {
         assert!(text.starts_with("signer error:"), "{text}");
         assert!(text.contains("connect to signer refused"), "{text}");
         // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
-        assert_eq!(options.len(), 1);
+        assert_header_preserved(&options, "X-Test", "1");
     }
 }

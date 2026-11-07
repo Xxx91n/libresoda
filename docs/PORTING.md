@@ -848,8 +848,9 @@
   回空签名都会报 `signer error: empty signature response`，要保留旧行为必须显式覆写
   该方法。空签名文案抽成 `empty_signature_error()` 一处，三处共用防漂移。**测试**：
   `src/soda/signature.rs` 两条（自定义 provider 回空 → 报错且请求头原样保留；
-  `NoopSignature` / `CapturedSignature` 回空 → `Ok(None)`）、`src/soda/track.rs` 一条
-  （空签名后零次 App POST）；既有「未配置 provider」用例保持通过。全部离线。
+  `NoopSignature` / `CapturedSignature` 回空 → `Ok(None)`）、`src/soda/track.rs` 两条
+  （空签名后零次 App POST、签名成功时闭包确实被调用）；既有「未配置 provider」用例
+  保持通过。全部离线。
 
 ## 未移植项
 
