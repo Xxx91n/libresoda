@@ -697,7 +697,7 @@
     一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。旧用例在同一条里同时压住
     2 MiB 写入与 256 KiB stdout；现在拆成「写入阻塞」（2 MiB + 不读 stdin 的超时用例）与
     「stdout 排空」（128 KiB 成功用例）两个方向，各自有证据。
-    `tests/browser_tests.rs` 十条 —— 非 0 退出、断管归因、两条超时（200 ms 的 `exec sleep 30`；
+    `tests/browser_tests.rs` 十三条 —— 非 0 退出、断管归因、两条超时（200 ms 的 `exec sleep 30`；
     2 s 的标记先行 + `exec sleep`）、128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
     后台 helper 后驻留到超时 —— 写端没关是 helper 活着的唯一证据；整棵树被终止时两个写端都
     关掉，读线程立刻拿到 EOF，探针写下的标记随之交回。票 #26 起「标记存在」不再充分（宽限到点
@@ -715,7 +715,7 @@
     `setsid()` 逃出进程组并攥着 stderr 睡 6 s；直接子进程先往 stderr 写标记再驻留到超时。旧实现
     拿不到 EOF 就把缓冲整块丢掉，超时错误里没有 stderr 标记；现在宽限到点交出已收到的部分，
     断言 `requester timed out` 里带得出 `marker-before-timeout`。
-    `src/soda/child.rs` 十一条单元用例（其中一条只在 Windows 上编译、两条只在 Unix 上跑）—— 钉 8 MiB
+    `src/soda/child.rs` 十三条单元用例（其中一条只在 Windows 上编译、两条只在 Unix 上跑）—— 钉 8 MiB
     收集上限（超出字节读走但丢弃）、钉票 #26 的两条：宽限到点交出已读到的部分（读线程故意拖过
     宽限才给 EOF，并断言 1.5 s 内返回 —— 等 EOF 的实现要到 2 s 才回）、写线程被 helper 攥住时
     stdout/stderr 仍各自拿到宽限（旧实现两者都是 0 ms；
