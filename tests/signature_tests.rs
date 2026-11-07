@@ -235,6 +235,65 @@ fn command_signature_drains_large_response() {
     assert_eq!(response.ms_token.len(), 2048 * 64);
 }
 
+/// 合法 JSON 后的空白也计入字节上限，超限不能因为前缀能解析就交出签名。
+#[test]
+fn command_signature_distinguishes_complete_and_truncated_stdout() {
+    let json = r#"{"msToken":"test-token"}"#;
+    for total in [8_388_607, 8_388_608, 8_388_609] {
+        let script = format!(
+            "cat >/dev/null; printf '%s' '{json}'; printf '%{}s' ''",
+            total - json.len()
+        );
+        let provider = CommandSignature::new("sh")
+            .args(["-c", &script])
+            .timeout_ms(15_000);
+        let result = run_with_watchdog(std::time::Duration::from_secs(20), move || {
+            provider.sign(&SignRequest::default())
+        });
+        if total <= 8_388_608 {
+            assert_eq!(result.expect("未超限的完整回包").ms_token, "test-token");
+        } else {
+            let error = result.expect_err("超限不能当作完整签名");
+            assert!(matches!(error, libresoda::SodaError::Http(_)));
+            assert_eq!(
+                error.to_string(),
+                "signer stdout output truncated at 8388608 bytes"
+            );
+        }
+    }
+}
+
+/// stderr 超限必须报错；非零退出仍保留原退出码归因。
+#[test]
+fn command_signature_reports_truncated_stderr_without_large_diagnostics() {
+    for exit in [0, 7] {
+        let script = format!(
+            "cat >/dev/null; printf '%8388609s' '' >&2; printf '%s' '{{\"msToken\":\"test-token\"}}'; exit {exit}"
+        );
+        let provider = CommandSignature::new("sh")
+            .args(["-c", &script])
+            .timeout_ms(15_000);
+        let error = run_with_watchdog(std::time::Duration::from_secs(20), move || {
+            provider.sign(&SignRequest::default())
+        })
+        .expect_err("stderr 超限不能静默成功");
+        assert!(matches!(error, libresoda::SodaError::Http(_)));
+        let text = error.to_string();
+        assert!(
+            text.contains("stderr output truncated at 8388608 bytes"),
+            "{text}"
+        );
+        assert!(text.len() < 256, "错误串必须有界");
+        if exit != 0 {
+            assert!(text.starts_with("signer exited with "), "{text}");
+            assert!(
+                text.contains("exit status: 7:") || text.contains("exit code: 7:"),
+                "{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn apply_signature_to_url_keeps_existing_query() {
     let url = "https://api.qishui.com/passport/web/check_qrconnect/?aid=386088&token=abc";
@@ -431,6 +490,27 @@ fn http_signature_non_2xx_keeps_status_headers_and_body() {
     );
     assert!(text.contains("BUSY"), "响应体要可读：{text}");
     assert!(text.contains("服务忙"), "响应体原文要保留：{text}");
+}
+
+/// 票 #27：回包解码失败只报类别/行列/长度，不回显可能含大字段值的错误全文。
+#[test]
+fn signature_decode_error_is_bounded_and_does_not_echo_large_field_values() {
+    let raw = format!(r#"{{"ok":true,"ms_token":{}"#, "9".repeat(131_072));
+    let error =
+        HttpSignature::parse_response(raw.as_bytes()).expect_err("截断的 JSON 不能解析成签名");
+    assert!(matches!(error, libresoda::SodaError::Json(_)));
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer response decode: "),
+        "前缀要保留：{text}"
+    );
+    assert!(text.contains("at line 1 column "), "要有行列：{text}");
+    assert!(
+        text.contains(&format!("（输出长度: {} 字节）", raw.len())),
+        "{text}"
+    );
+    assert!(!text.contains("999999999"), "不回显大字段值：{text}");
+    assert!(text.len() < 256, "错误串必须有界：{}", text.len());
 }
 
 #[test]

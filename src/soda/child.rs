@@ -51,8 +51,53 @@ pub(crate) struct ChildOutput {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
     /// 请求没有完整交给子进程：stdin 撞上断管，或子进程退出时写入仍未结束。
     pub(crate) request_write_failed: bool,
+}
+
+impl ChildOutput {
+    /// 截断时给出的可区分文案；两个流都没截断时为 `None`。
+    pub(crate) fn truncation_message(&self) -> Option<String> {
+        let streams = match (self.stdout_truncated, self.stderr_truncated) {
+            (true, true) => "stdout and stderr",
+            (true, false) => "stdout",
+            (false, true) => "stderr",
+            (false, false) => return None,
+        };
+        Some(format!(
+            "{streams} output truncated at {MAX_CAPTURE_BYTES} bytes"
+        ))
+    }
+
+    /// 有界的错误诊断：stderr 摘要（超过 4096 字节只报长度）加截断说明。
+    pub(crate) fn diagnostic(&self) -> String {
+        let stderr = output_summary(&self.stderr);
+        match self.truncation_message() {
+            Some(message) if stderr.is_empty() => message,
+            Some(message) => format!("{stderr}; {message}"),
+            None => stderr,
+        }
+    }
+}
+
+/// stderr 的摘要：4096 字节以内保留原文，超过只报告收集到的长度。
+fn output_summary(bytes: &[u8]) -> String {
+    if bytes.len() > 4096 {
+        format!("[{} bytes of output omitted]", bytes.len())
+    } else {
+        String::from_utf8_lossy(bytes).trim().to_string()
+    }
+}
+
+/// 超时错误的 stderr 诊断：截断时只报截断，否则给有界的摘要。
+pub(crate) fn timeout_diagnostic(stderr: &[u8], truncated: bool) -> String {
+    if truncated {
+        format!("stderr output truncated at {MAX_CAPTURE_BYTES} bytes")
+    } else {
+        output_summary(stderr)
+    }
 }
 
 pub(crate) enum ChildError {
@@ -64,7 +109,19 @@ pub(crate) enum ChildError {
     /// 到点仍未退出；已终止整棵树并 wait 回收，`stderr` 是终止前已排空的部分。
     Timeout {
         stderr: Vec<u8>,
+        stderr_truncated: bool,
     },
+}
+
+enum StreamChunk {
+    Bytes(Vec<u8>),
+    Truncated,
+}
+
+#[derive(Default)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 /// 跑一次子进程：写入 `payload`，排空 stdout/stderr，`timeout_ms` 内不退出就终止并回收。
@@ -176,7 +233,10 @@ where
             return Err(ChildError::Wait(err));
         }
         let stderr = collect_stream(stderr, Instant::now() + THREAD_GRACE);
-        return Err(ChildError::Timeout { stderr });
+        return Err(ChildError::Timeout {
+            stderr: stderr.bytes,
+            stderr_truncated: stderr.truncated,
+        });
     };
 
     if !write_finished {
@@ -199,8 +259,10 @@ where
 
     Ok(ChildOutput {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
         request_write_failed: write_error.is_some() || write_incomplete,
     })
 }
@@ -244,26 +306,31 @@ fn attach_or_abort(
 ///
 /// 不攒到 EOF 才交（票 #26）：宽限到点时收集方要能拿到已经读到的部分。8 MiB 上限照旧，
 /// 超出的字节继续读走（排空）但不再发送。
-fn spawn_reader<R>(mut pipe: R) -> Receiver<Vec<u8>>
+fn spawn_reader<R>(mut pipe: R) -> Receiver<StreamChunk>
 where
     R: Read + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut captured_bytes = 0_usize;
+        let mut truncated = false;
         let mut buffer = [0_u8; READ_CHUNK_BYTES];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
                     let room = MAX_CAPTURE_BYTES.saturating_sub(captured_bytes);
-                    if room == 0 {
-                        continue;
-                    }
                     let take = read.min(room);
                     captured_bytes += take;
                     // 收集方已经走了也要继续读走：排空是读线程的职责，发送失败只是没人收。
-                    let _ = tx.send(buffer[..take].to_vec());
+                    if take > 0 {
+                        let _ = tx.send(StreamChunk::Bytes(buffer[..take].to_vec()));
+                    }
+                    if take < read && !truncated {
+                        // 只通知一次且不等 EOF，避免无限输出撑大队列或宽限到点丢失标志。
+                        truncated = true;
+                        let _ = tx.send(StreamChunk::Truncated);
+                    }
                 }
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -277,20 +344,21 @@ where
 ///
 /// 到点时交出**已收到**的部分（票 #26）；`None`（没有这个管道）按空输出处理。
 /// 总量上限由发送方 `spawn_reader` 夹在 `MAX_CAPTURE_BYTES` 以内，这里不再重复夹紧。
-fn collect_stream(receiver: Option<Receiver<Vec<u8>>>, deadline: Instant) -> Vec<u8> {
+fn collect_stream(receiver: Option<Receiver<StreamChunk>>, deadline: Instant) -> CapturedStream {
     let Some(receiver) = receiver else {
-        return Vec::new();
+        return CapturedStream::default();
     };
-    let mut collected = Vec::new();
+    let mut collected = CapturedStream::default();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
-            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Ok(StreamChunk::Bytes(chunk)) => collected.bytes.extend_from_slice(&chunk),
+            Ok(StreamChunk::Truncated) => collected.truncated = true,
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     debug_assert!(
-        collected.len() <= MAX_CAPTURE_BYTES,
+        collected.bytes.len() <= MAX_CAPTURE_BYTES,
         "发送方应已夹紧上限（见 reader_caps_capture_and_keeps_draining）"
     );
     collected
@@ -498,15 +566,69 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
         );
         assert_eq!(
-            collected.len(),
+            collected.bytes.len(),
             MAX_CAPTURE_BYTES,
             "内存里只留上限以内的字节"
         );
+        assert!(collected.truncated);
         assert_eq!(
             read.load(Ordering::Relaxed),
             total,
             "超出上限的字节也必须读走（排空）"
         );
+    }
+
+    /// 只有实际丢掉字节才算截断，刚好到达上限仍是完整输出。
+    #[test]
+    fn reader_marks_only_output_beyond_the_limit() {
+        for (total, truncated) in [
+            (MAX_CAPTURE_BYTES - 1, false),
+            (MAX_CAPTURE_BYTES, false),
+            (MAX_CAPTURE_BYTES + 1, true),
+        ] {
+            let collected = collect_stream(
+                Some(spawn_reader(Cursor::new(vec![b'x'; total]))),
+                Instant::now() + Duration::from_secs(5),
+            );
+            assert_eq!(collected.bytes.len(), total.min(MAX_CAPTURE_BYTES));
+            assert_eq!(collected.truncated, truncated, "total={total}");
+        }
+    }
+
+    struct EofGate {
+        ready: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Read for EofGate {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.ready.send(()).expect("通知已读完数据");
+            self.release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("释放 EOF");
+            Ok(0)
+        }
+    }
+
+    /// 截断发生在块内，且管道尚未 EOF 时，宽限耗尽也应交回标志。
+    #[test]
+    fn reader_delivers_truncation_before_eof() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = Cursor::new(vec![b'x'])
+            .chain(Cursor::new(vec![b'x'; MAX_CAPTURE_BYTES]))
+            .chain(EofGate {
+                ready: ready_tx,
+                release: release_rx,
+            });
+        let receiver = spawn_reader(reader);
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("读线程应先排空数据");
+        let collected = collect_stream(Some(receiver), Instant::now());
+        release_tx.send(()).expect("放行读线程");
+        assert_eq!(collected.bytes.len(), 8_388_608);
+        assert!(collected.truncated, "不应等到 EOF 才发送截断标志");
     }
 
     /// 票 #26：宽限到点时读线程还没看到 EOF，也必须交出已经读到的部分。
@@ -536,10 +658,11 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert_eq!(
-            collected,
+            collected.bytes,
             b"marker".to_vec(),
             "宽限到点也要交出已读到的字节"
         );
+        assert!(!collected.truncated, "宽限耗尽不等于超过字节上限");
         assert!(
             elapsed < Duration::from_millis(1_500),
             "宽限到点就该返回，不能等到 2 s 的 EOF：{elapsed:?}"

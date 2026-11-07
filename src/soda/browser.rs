@@ -155,8 +155,11 @@ impl CommandRequester {
             ChildError::StdinUnavailable => SodaError::http("requester stdin unavailable"),
             ChildError::Stdin(err) => SodaError::http(format!("requester stdin write: {err}")),
             ChildError::Wait(err) => SodaError::http(format!("requester wait: {err}")),
-            ChildError::Timeout { stderr } => {
-                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            ChildError::Timeout {
+                stderr,
+                stderr_truncated,
+            } => {
+                let stderr = child::timeout_diagnostic(&stderr, stderr_truncated);
                 SodaError::http(if stderr.is_empty() {
                     format!("requester timed out after {} ms", self.timeout_ms)
                 } else {
@@ -183,16 +186,33 @@ impl CommandRequester {
             return Err(SodaError::http(format!(
                 "requester exited with {}: {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
         if output.request_write_failed {
             return Err(SodaError::http(format!(
                 "requester exited without reading the request: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
+        if let Some(message) = output.truncation_message() {
+            return Err(SodaError::http(format!("requester {message}")));
+        }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// 有界的回包解析错误（票 #27）：只带错误类别、行列与转成文本后的字节长度。
+    ///
+    /// 不回显 stdout，也不回显可能含大字段值的解析错误全文 —— 类型错误本身可能带着
+    /// 一整个超长字符串值。`request` 与 `close_session` 共用同一口径。
+    fn parse_error(&self, context: &str, text: &str, err: &serde_json::Error) -> SodaError {
+        SodaError::json(format!(
+            "{context}: {:?} at line {} column {}（输出长度: {} 字节）",
+            err.classify(),
+            err.line(),
+            err.column(),
+            text.len()
+        ))
     }
 }
 
@@ -201,12 +221,8 @@ impl BrowserRequester for CommandRequester {
         let payload = serde_json::to_vec(request)
             .map_err(|err| SodaError::json(format!("browser request encode: {err}")))?;
         let text = self.exec(payload)?;
-        let parsed: BrowserResponse = serde_json::from_str(text.trim()).map_err(|err| {
-            SodaError::json(format!(
-                "requester 返回无法解析: {err}（输出: {}）",
-                text.trim()
-            ))
-        })?;
+        let parsed: BrowserResponse = serde_json::from_str(text.trim())
+            .map_err(|err| self.parse_error("requester 返回无法解析", &text, &err))?;
         if !parsed.ok || parsed.error.is_empty() && parsed.status == 0 {
             return Err(SodaError::http(if parsed.error.is_empty() {
                 "签名服务未返回结果".to_string()
@@ -224,7 +240,7 @@ impl BrowserRequester for CommandRequester {
         let payload = serde_json::json!({ "op": "close", "sessionKey": session_key });
         let text = self.exec(payload.to_string().into_bytes())?;
         let parsed: BrowserResponse = serde_json::from_str(text.trim())
-            .map_err(|err| SodaError::json(format!("close session 返回无法解析: {err}")))?;
+            .map_err(|err| self.parse_error("close session 返回无法解析", &text, &err))?;
         if !parsed.ok {
             return Err(SodaError::http("签名服务关闭会话失败"));
         }
@@ -248,5 +264,20 @@ mod tests {
         let requester = CommandRequester::new("unused");
         let error = requester.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "requester stdin write: boom");
+    }
+
+    /// 票 #27：超时路径的 stderr 截断仍归到超时（`timed out` 前缀），不伪装成退出或截断错误。
+    #[test]
+    fn timeout_with_truncated_stderr_keeps_timeout_classification() {
+        let requester = CommandRequester::new("unused").timeout_ms(200);
+        let error = requester.map_child_error(ChildError::Timeout {
+            stderr: vec![b'x'; 8_388_608],
+            stderr_truncated: true,
+        });
+        assert!(matches!(error, SodaError::Http(_)));
+        assert_eq!(
+            error.to_string(),
+            "requester timed out after 200 ms: stderr output truncated at 8388608 bytes"
+        );
     }
 }

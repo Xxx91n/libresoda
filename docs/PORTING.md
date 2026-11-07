@@ -668,8 +668,23 @@
   - **Stdio 归属**：`child.stdin` 移入写线程，写完即 drop（子进程靠 EOF 判断请求读完）；
     stdout/stderr 移入排空线程；主线程持有 `Child` 与进程树容器（Windows 的作业句柄），
     负责终止与 `wait` 收尸。
-  - **输出上限**：stdout/stderr 各最多留 8 MiB，超出部分继续读走（排空）但丢弃。管道是
-    「按对端产出的量无限增长」的来源（AGENTS.md 内存安全铁律 2）；正常签名回包远小于这个数。
+  - **输出上限（票 [`#27`](https://github.com/sodahub-org/libresoda/issues/27)）**：stdout/stderr
+    各最多留 8 MiB，超出部分继续读走但丢弃；只有实际丢掉字节才置对应的 `stdout_truncated` /
+    `stderr_truncated`，刚好 8 MiB 不算截断。截断通知只发一次，不等 EOF，宽限到点也能交出已经
+    收到的标志；未超限但因宽限耗尽而没收全的输出不冒充「超过字节上限」，仍沿用 #26 的口径。
+    签名器和请求器在任一流截断时均报 `SodaError::Http`，不解析 stdout、不交出半包；错误包含
+    `stdout output truncated at 8388608 bytes` / `stderr output truncated at 8388608 bytes`，
+    两流都超限时为 `stdout and stderr output truncated at 8388608 bytes`。
+    非零退出和未读完请求仍用原来的冻结文案前缀，附上截断信息；超时仍以 `timed out` 为准，
+    只收 stderr 并报告其截断，不等 stdout。非断管写入错误分类不变。
+    错误里的 stderr 在 4096 字节以内保留原文，超过只报告收集长度；请求器 JSON 解析错误只带
+    错误类别、行列和转成文本后的字节长度，不回显 stdout 或可能包含大字段值的解析错误全文
+    （`request` 与 `close_session` 共用同一口径，两处都不回显解析错误全文）。签名器的
+    `signer response decode` 同口径：只带类别、行列与原始字节长度，不回显可能含大字段值的
+    解析错误全文（`HttpSignature::parse_response` 与 `CommandSignature::sign` 三处共用
+    `decode_error`）。
+    新增离线用例覆盖上限前/刚好上限/超限一字节、块内跨界与 EOF 前标志交付、两端正常与非零
+    退出下的截断错误，以及大字段类型错误的有界诊断。没有新依赖或公开 API 变化。
   - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认
     `240_000 ms`（`tools/qishui-signer/signer-server.mjs` 的 fetch 上限是 180 s，再留页面导航余量）。
     这是给公开 struct 加字段（原本只有 `program`/`args`），外部用结构体字面量直接构造的代码
@@ -686,8 +701,9 @@
     一个核。排空证据因此从超时用例移到成功用例，不与时限捆绑。旧用例在同一条里同时压住
     2 MiB 写入与 256 KiB stdout；现在拆成「写入阻塞」（2 MiB + 不读 stdin 的超时用例）与
     「stdout 排空」（128 KiB 成功用例）两个方向，各自有证据。
-    `tests/browser_tests.rs` 十条 —— 非 0 退出、断管归因、两条超时（200 ms 的 `exec sleep 30`；
-    2 s 的标记先行 + `exec sleep`）、128 KiB 回包完整解析，以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
+    `tests/browser_tests.rs` 十四条 —— 非 0 退出、断管归因、两条超时（200 ms 的 `exec sleep 30`；
+    2 s 的标记先行 + `exec sleep`）、128 KiB 回包完整解析，票 #27 的三条（上限前/刚好上限/超限
+    一字节、stderr 超限带退出码、大字段类型错误的有界诊断），以及票 #25 的三条：`sh` 用 `sleep 30 &` 拉起一个继承 stdout/stderr 的
     后台 helper 后驻留到超时 —— 写端没关是 helper 活着的唯一证据；整棵树被终止时两个写端都
     关掉，读线程立刻拿到 EOF，探针写下的标记随之交回。票 #26 起「标记存在」不再充分（宽限到点
     也会交回已读到的部分），判据是**标记存在 + 返回时间**：时限 2 s 不含宽限，只杀直接子进程时
@@ -704,7 +720,7 @@
     `setsid()` 逃出进程组并攥着 stderr 睡 6 s；直接子进程先往 stderr 写标记再驻留到超时。旧实现
     拿不到 EOF 就把缓冲整块丢掉，超时错误里没有 stderr 标记；现在宽限到点交出已收到的部分，
     断言 `requester timed out` 里带得出 `marker-before-timeout`。
-    `src/soda/child.rs` 十一条单元用例（其中一条只在 Windows 上编译、两条只在 Unix 上跑）—— 钉 8 MiB
+    `src/soda/child.rs` 十三条单元用例（其中一条只在 Windows 上编译、两条只在 Unix 上跑）—— 钉 8 MiB
     收集上限（超出字节读走但丢弃）、钉票 #26 的两条：宽限到点交出已读到的部分（读线程故意拖过
     宽限才给 EOF，并断言 1.5 s 内返回 —— 等 EOF 的实现要到 2 s 才回）、写线程被 helper 攥住时
     stdout/stderr 仍各自拿到宽限（旧实现两者都是 0 ms；

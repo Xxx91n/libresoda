@@ -311,8 +311,8 @@ impl HttpSignature {
     /// （`code`）与等待时长（`retry_after_seconds`）一并留在文案里，供上层
     /// 区分「可重试（带等待时长）」与「不可重试」（libmssdk 的失败契约）。
     pub fn parse_response(raw: &[u8]) -> Result<SignResponse> {
-        let value: serde_json::Value = serde_json::from_slice(raw)
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(raw).map_err(|err| decode_error(raw.len(), &err))?;
         if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
             let message = value
                 .get("error")
@@ -340,8 +340,8 @@ impl HttpSignature {
             }
             return Err(SodaError::http(detail));
         }
-        let mut response: SignResponse = serde_json::from_value(value.clone())
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+        let mut response: SignResponse =
+            serde_json::from_value(value.clone()).map_err(|err| decode_error(raw.len(), &err))?;
         // 兼容 {"ok":true,"X-Helios":"…","X-Medusa":"…"}
         for (alias, canonical) in [
             ("X-Helios", "x-helios"),
@@ -629,6 +629,18 @@ fn redact_bare_credentials(text: &str) -> String {
     output
 }
 
+/// 有界的回包解码错误（票 #27）：只带错误类别、行列与文本字节长度。
+///
+/// 不回显可能含大字段值的解析错误全文 —— 类型错误本身可能带着一整个超长字符串值。
+fn decode_error(byte_len: usize, err: &serde_json::Error) -> SodaError {
+    SodaError::json(format!(
+        "signer response decode: {:?} at line {} column {}（输出长度: {byte_len} 字节）",
+        err.classify(),
+        err.line(),
+        err.column()
+    ))
+}
+
 fn with_signer_context(error: SodaError) -> SodaError {
     let text = error.to_string();
     if text.to_ascii_lowercase().starts_with("signer") {
@@ -699,8 +711,11 @@ impl CommandSignature {
             ChildError::StdinUnavailable => SodaError::http("signer stdin unavailable"),
             ChildError::Stdin(err) => SodaError::http(format!("signer stdin write: {err}")),
             ChildError::Wait(err) => SodaError::http(format!("signer wait: {err}")),
-            ChildError::Timeout { stderr } => {
-                let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            ChildError::Timeout {
+                stderr,
+                stderr_truncated,
+            } => {
+                let stderr = child::timeout_diagnostic(&stderr, stderr_truncated);
                 SodaError::http(if stderr.is_empty() {
                     format!("signer timed out after {} ms", self.timeout_ms)
                 } else {
@@ -730,18 +745,21 @@ impl SignatureProvider for CommandSignature {
             return Err(SodaError::http(format!(
                 "signer exited with {}: {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
         if output.request_write_failed {
             // 请求根本没写进去，它回 0 加合法 JSON 也不是按这次请求算出来的，不能当签名用。
             return Err(SodaError::http(format!(
                 "signer exited without reading the request: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.diagnostic()
             )));
         }
+        if let Some(message) = output.truncation_message() {
+            return Err(SodaError::http(format!("signer {message}")));
+        }
         let response: SignResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+            .map_err(|err| decode_error(output.stdout.len(), &err))?;
         if response.is_empty() {
             // 外部签名器回空 JSON：等于没签，不能当成功继续。
             return Err(SodaError::http("signer error: empty signature response"));
@@ -931,6 +949,21 @@ mod tests {
         let provider = CommandSignature::new("unused");
         let error = provider.map_child_error(ChildError::Stdin(std::io::Error::other("boom")));
         assert_eq!(error.to_string(), "signer stdin write: boom");
+    }
+
+    /// 票 #27：超时路径的 stderr 截断仍归到超时（`timed out` 前缀），不伪装成退出或截断错误。
+    #[test]
+    fn timeout_with_truncated_stderr_keeps_timeout_classification() {
+        let provider = CommandSignature::new("unused").timeout_ms(200);
+        let error = provider.map_child_error(ChildError::Timeout {
+            stderr: vec![b'x'; 8_388_608],
+            stderr_truncated: true,
+        });
+        assert!(matches!(error, SodaError::Http(_)));
+        assert_eq!(
+            error.to_string(),
+            "signer timed out after 200 ms: stderr output truncated at 8388608 bytes"
+        );
     }
 
     #[test]
