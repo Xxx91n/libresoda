@@ -58,6 +58,7 @@ pub(crate) struct ChildOutput {
 }
 
 impl ChildOutput {
+    /// 截断时给出的可区分文案；两个流都没截断时为 `None`。
     pub(crate) fn truncation_message(&self) -> Option<String> {
         let streams = match (self.stdout_truncated, self.stderr_truncated) {
             (true, true) => "stdout and stderr",
@@ -70,6 +71,7 @@ impl ChildOutput {
         ))
     }
 
+    /// 有界的错误诊断：stderr 摘要（超过 4096 字节只报长度）加截断说明。
     pub(crate) fn diagnostic(&self) -> String {
         let stderr = output_summary(&self.stderr);
         match self.truncation_message() {
@@ -80,7 +82,8 @@ impl ChildOutput {
     }
 }
 
-pub(crate) fn output_summary(bytes: &[u8]) -> String {
+/// stderr 的摘要：4096 字节以内保留原文，超过只报告收集到的长度。
+fn output_summary(bytes: &[u8]) -> String {
     if bytes.len() > 4096 {
         format!("[{} bytes of output omitted]", bytes.len())
     } else {
@@ -88,6 +91,7 @@ pub(crate) fn output_summary(bytes: &[u8]) -> String {
     }
 }
 
+/// 超时错误的 stderr 诊断：截断时只报截断，否则给有界的摘要。
 pub(crate) fn timeout_diagnostic(stderr: &[u8], truncated: bool) -> String {
     if truncated {
         format!("stderr output truncated at {MAX_CAPTURE_BYTES} bytes")

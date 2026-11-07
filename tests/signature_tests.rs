@@ -492,6 +492,27 @@ fn http_signature_non_2xx_keeps_status_headers_and_body() {
     assert!(text.contains("服务忙"), "响应体原文要保留：{text}");
 }
 
+/// 票 #27：回包解码失败只报类别/行列/长度，不回显可能含大字段值的错误全文。
+#[test]
+fn signature_decode_error_is_bounded_and_does_not_echo_large_field_values() {
+    let raw = format!(r#"{{"ok":true,"ms_token":{}"#, "9".repeat(131_072));
+    let error =
+        HttpSignature::parse_response(raw.as_bytes()).expect_err("截断的 JSON 不能解析成签名");
+    assert!(matches!(error, libresoda::SodaError::Json(_)));
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer response decode: "),
+        "前缀要保留：{text}"
+    );
+    assert!(text.contains("at line 1 column "), "要有行列：{text}");
+    assert!(
+        text.contains(&format!("（输出长度: {} 字节）", raw.len())),
+        "{text}"
+    );
+    assert!(!text.contains("999999999"), "不回显大字段值：{text}");
+    assert!(text.len() < 256, "错误串必须有界：{}", text.len());
+}
+
 #[test]
 fn http_signature_ok_false_keeps_code_and_retry_after() {
     let error = HttpSignature::parse_response(

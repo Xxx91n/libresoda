@@ -679,7 +679,10 @@
     只收 stderr 并报告其截断，不等 stdout。非断管写入错误分类不变。
     错误里的 stderr 在 4096 字节以内保留原文，超过只报告收集长度；请求器 JSON 解析错误只带
     错误类别、行列和转成文本后的字节长度，不回显 stdout 或可能包含大字段值的解析错误全文
-    （`request` 与 `close_session` 共用同一口径，两处都不回显解析错误全文）。
+    （`request` 与 `close_session` 共用同一口径，两处都不回显解析错误全文）。签名器的
+    `signer response decode` 同口径：只带类别、行列与原始字节长度，不回显可能含大字段值的
+    解析错误全文（`HttpSignature::parse_response` 与 `CommandSignature::sign` 三处共用
+    `decode_error`）。
     新增离线用例覆盖上限前/刚好上限/超限一字节、块内跨界与 EOF 前标志交付、两端正常与非零
     退出下的截断错误，以及大字段类型错误的有界诊断。没有新依赖或公开 API 变化。
   - **请求器的等待上限**：`CommandRequester` 新增 `timeout_ms` 字段与 builder，默认

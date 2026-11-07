@@ -311,8 +311,8 @@ impl HttpSignature {
     /// （`code`）与等待时长（`retry_after_seconds`）一并留在文案里，供上层
     /// 区分「可重试（带等待时长）」与「不可重试」（libmssdk 的失败契约）。
     pub fn parse_response(raw: &[u8]) -> Result<SignResponse> {
-        let value: serde_json::Value = serde_json::from_slice(raw)
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(raw).map_err(|err| decode_error(raw.len(), &err))?;
         if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
             let message = value
                 .get("error")
@@ -340,8 +340,8 @@ impl HttpSignature {
             }
             return Err(SodaError::http(detail));
         }
-        let mut response: SignResponse = serde_json::from_value(value.clone())
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+        let mut response: SignResponse =
+            serde_json::from_value(value.clone()).map_err(|err| decode_error(raw.len(), &err))?;
         // 兼容 {"ok":true,"X-Helios":"…","X-Medusa":"…"}
         for (alias, canonical) in [
             ("X-Helios", "x-helios"),
@@ -629,6 +629,18 @@ fn redact_bare_credentials(text: &str) -> String {
     output
 }
 
+/// 有界的回包解码错误（票 #27）：只带错误类别、行列与文本字节长度。
+///
+/// 不回显可能含大字段值的解析错误全文 —— 类型错误本身可能带着一整个超长字符串值。
+fn decode_error(byte_len: usize, err: &serde_json::Error) -> SodaError {
+    SodaError::json(format!(
+        "signer response decode: {:?} at line {} column {}（输出长度: {byte_len} 字节）",
+        err.classify(),
+        err.line(),
+        err.column()
+    ))
+}
+
 fn with_signer_context(error: SodaError) -> SodaError {
     let text = error.to_string();
     if text.to_ascii_lowercase().starts_with("signer") {
@@ -747,7 +759,7 @@ impl SignatureProvider for CommandSignature {
             return Err(SodaError::http(format!("signer {message}")));
         }
         let response: SignResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
+            .map_err(|err| decode_error(output.stdout.len(), &err))?;
         if response.is_empty() {
             // 外部签名器回空 JSON：等于没签，不能当成功继续。
             return Err(SodaError::http("signer error: empty signature response"));
@@ -939,6 +951,7 @@ mod tests {
         assert_eq!(error.to_string(), "signer stdin write: boom");
     }
 
+    /// 票 #27：超时路径的 stderr 截断仍归到超时（`timed out` 前缀），不伪装成退出或截断错误。
     #[test]
     fn timeout_with_truncated_stderr_keeps_timeout_classification() {
         let provider = CommandSignature::new("unused").timeout_ms(200);

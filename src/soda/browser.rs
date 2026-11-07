@@ -266,6 +266,7 @@ mod tests {
         assert_eq!(error.to_string(), "requester stdin write: boom");
     }
 
+    /// 票 #27：超时路径的 stderr 截断仍归到超时（`timed out` 前缀），不伪装成退出或截断错误。
     #[test]
     fn timeout_with_truncated_stderr_keeps_timeout_classification() {
         let requester = CommandRequester::new("unused").timeout_ms(200);
