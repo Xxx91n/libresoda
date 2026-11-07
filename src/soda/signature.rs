@@ -185,7 +185,7 @@ pub trait SignatureProvider: Send + Sync {
     ///
     /// 返回空的 [`SignResponse`] 默认同样算签名故障：配了提供者却拿不到任何签名，
     /// 静默改发未签名请求正是票 #39 要堵住的口子。确实以「不签名」为正常语义的
-    /// 提供者（[`NoopSignature`]、空回填的 [`CapturedSignature`]）必须覆写
+    /// 提供者（[`NoopSignature`]、抓包回填的 [`CapturedSignature`]）必须覆写
     /// [`SignatureProvider::allows_empty_signature`] 显式声明。
     fn sign(&self, request: &SignRequest) -> Result<SignResponse>;
 
@@ -194,7 +194,9 @@ pub trait SignatureProvider: Send + Sync {
     /// 默认 `false`：`apply_stream_signature` 会把空响应当成
     /// `signer error: empty signature response`。只有「不签名」本身就是这个提供者
     /// 的正常职责（显式 no-op）时才覆写成 `true`；不要靠 [`Self::name`] 的字符串
-    /// 猜，名字只是日志用的。
+    /// 猜，名字只是日志用的。内置的 [`HttpSignature`] / [`CommandSignature`]
+    /// 在 `sign()` 里已经直接把空回包当错误，不读取这个标记；覆写只对手写
+    /// provider 生效。
     fn allows_empty_signature(&self) -> bool {
         false
     }
@@ -408,7 +410,7 @@ impl SignatureProvider for HttpSignature {
         let response = Self::parse_response(&reply.body)?;
         if response.is_empty() {
             // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
-            return Err(SodaError::http("signer error: empty signature response"));
+            return Err(empty_signature_error());
         }
         Ok(response)
     }
@@ -665,6 +667,14 @@ fn with_signer_context(error: SodaError) -> SodaError {
     }
 }
 
+/// 配了签名器却回空签名时的冻结文案。
+///
+/// `is_signer_failure()` 只看文案是否以 `signer` 开头；HTTP、命令与自定义 provider
+/// 兜底三处共用这一句，避免文案漂移。
+fn empty_signature_error() -> SodaError {
+    SodaError::http("signer error: empty signature response")
+}
+
 /// 外部命令签名：把 [`SignRequest`] 的 JSON 写到子进程 stdin，
 /// 从 stdout 读回 [`SignResponse`] 的 JSON。
 ///
@@ -768,7 +778,7 @@ impl SignatureProvider for CommandSignature {
             .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
         if response.is_empty() {
             // 外部签名器回空 JSON：等于没签，不能当成功继续。
-            return Err(SodaError::http("signer error: empty signature response"));
+            return Err(empty_signature_error());
         }
         Ok(response)
     }
@@ -857,7 +867,7 @@ pub fn sign_request_with_headers(
 /// 两种成功形态（`None` 只说明**URL 没被改写**，不说明没签名）：
 ///
 /// * `Ok(None)` —— 没有配置签名器；提供者显式声明允许空响应（[`NoopSignature`]、
-///   空回填的 [`CapturedSignature`]）；或只回请求头（头已写进 `options`）。
+///   抓包回填的 [`CapturedSignature`]）；或只回请求头（头已写进 `options`）。
 ///   调用方按原 URL 继续；
 /// * `Ok(Some(url))` —— 签名成功，URL 被 `msToken` / `a_bogus` 改写。
 ///
@@ -885,7 +895,7 @@ pub(crate) fn apply_stream_signature(
             return Ok(None);
         }
         // 配了 provider 却拿不到任何签名：这是签名故障，不是"URL 未改写"。
-        return Err(SodaError::http("signer error: empty signature response"));
+        return Err(empty_signature_error());
     }
 
     // 先整体覆盖成合并后的头，避免调用方再关心顺序。
@@ -1008,7 +1018,14 @@ mod tests {
         assert_eq!(error.to_string(), "signer error: empty signature response");
         assert!(error.is_signer_failure(), "{error}");
         // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
-        assert_eq!(options.len(), 1);
+        let merged = crate::http::merge_options(&options);
+        assert!(
+            merged
+                .headers()
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("X-Test") && value.as_str() == "1"),
+            "原始请求头应原样保留"
+        );
     }
 
     /// 票 #39：只有显式声明允许空响应的 provider 才保留未签名路径。
