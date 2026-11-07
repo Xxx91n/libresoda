@@ -68,8 +68,8 @@ stdout: {"ms_token":"...","a_bogus":"...","headers":{"bd-ticket-guard-version":"
 （含 `Retry-After`）。只有"根本没配置签名器"才走未签名路径 —— 这两件事不能混为一谈
 （票 [`#36`](https://github.com/sodahub-org/libresoda/issues/36)）。自定义 provider
 返回空签名默认也按签名故障处理（`signer error: empty signature response`）；只有
-`NoopSignature` 和 `CapturedSignature` 这类显式 no-op 通过
-`SignatureProvider::allows_empty_signature()` 声明后，才保留"按未签名继续"
+`NoopSignature`（显式 no-op）和 `CapturedSignature`（用户显式回填的静态值，可能整体
+为空）通过 `SignatureProvider::allows_empty_signature()` 声明后，才保留"按未签名继续"
 （票 [`#39`](https://github.com/sodahub-org/libresoda/issues/39)）。
 
 ### 桥接器实现示例（Windows，Python + ctypes 调 mssdk DLL）

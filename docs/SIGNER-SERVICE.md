@@ -112,7 +112,7 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 | 情况 | `sign()` | App 端点调用方 |
 | --- | --- | --- |
-| 没配置 provider；或 `NoopSignature` / `CapturedSignature`（显式 no-op） | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
+| 没配置 provider；或 `NoopSignature`（显式 no-op）/ `CapturedSignature`（抓包回填可能为空） | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
 | 连接拒绝 / 超时 / 子进程非 0 退出 | `signer error: …` / `signer exited …` | 错误上抛；不再发未签名请求 |
 | HTTP 非 2xx | `signer error: http request failed: status {code} ({url?<redacted>}); headers: […]; body: …` | 同上；保留 `Retry-After` 等处置相关头 |
 | HTTP 2xx + `{"ok":false}` | `signer error: {error} [code=…] [retry_after_seconds=…]` | 同上；原因码与等待时长都在文案里 |

@@ -769,7 +769,8 @@
     `signer error:` / `signer request encode:` 前缀（直接调用 `HttpSignature::sign` 的
     调用方同样能判出签名故障）。`HttpSignature` / `CommandSignature` 回**空签名**
     改为 `signer error: empty signature response`：配了远程或子进程签名器却等于没签，
-    不能悄悄改发未签名请求（`NoopSignature` 与自定义 no-op 仍按未签名继续）。
+    不能悄悄改发未签名请求（当时 `NoopSignature` 与自定义 no-op 仍按未签名继续；
+    票 #39 起自定义 no-op 必须显式声明，见下一条）。
     前缀补写只保留 `Json` 变体；`Api` / `InvalidInput` / `Io` 等统一成 `Http` ——
     `Api` 的 Display 会带 `status_code=` 前缀，无法满足「以 `signer` 开头」的判定。
     `ok:false` 的等待时长从回包体读（libmssdk 头/体各写一份；2xx 分支只拿到体）。

@@ -1047,7 +1047,15 @@ mod tests {
             )
             .expect("显式 no-op 不是签名故障");
             assert!(signed.is_none());
-            assert_eq!(options.len(), 1);
+            let merged = crate::http::merge_options(&options);
+            assert!(
+                merged
+                    .headers()
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("X-Test")
+                        && value.as_str() == "1"),
+                "未签名路径也要保留调用方的原始请求头"
+            );
         }
     }
 

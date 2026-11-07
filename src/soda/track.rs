@@ -702,7 +702,7 @@ fn video_model_play_auth(values: &Map<String, Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soda::signature::{SignRequest, SignResponse, SignatureProvider};
+    use crate::soda::signature::{CapturedSignature, SignRequest, SignResponse, SignatureProvider};
     use std::sync::Arc;
 
     /// 固定失败的签名器，用来证明签名失败发生在 App POST 之前。
@@ -759,6 +759,28 @@ mod tests {
             error.to_string().contains("empty signature response"),
             "{error}"
         );
+    }
+
+    /// 空签名用例的阳性对照：签名成功时闭包必须被调用。
+    ///
+    /// 没有这条，「零次 App POST」可能只是因为闭包接线错了，而不是签名守卫生效。
+    #[test]
+    fn pc_track_v2_posts_when_signature_succeeds() {
+        let soda = Soda::new("sessionid_ss=test");
+        let mut captured = CapturedSignature::default();
+        captured
+            .headers
+            .insert("x-helios".to_string(), "test-helios".to_string());
+        soda.set_signature_provider(Arc::new(captured));
+
+        let posted = std::cell::Cell::new(false);
+        let response = fetch_pc_track_v2_with(&soda, "7501674235158431760", |_, _, _| {
+            posted.set(true);
+            Ok(b"{}".to_vec())
+        })
+        .expect("签名成功时应发出 App POST");
+        assert!(posted.get(), "签名成功时闭包必须被调用");
+        assert_eq!(response, TrackV2Response::default());
     }
 
     /// 一条最小的 web 曲目元数据（id 非空，长度 200 秒）。
