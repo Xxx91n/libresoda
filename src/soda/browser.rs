@@ -200,6 +200,20 @@ impl CommandRequester {
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+
+    /// 有界的回包解析错误（票 #27）：只带错误类别、行列与转成文本后的字节长度。
+    ///
+    /// 不回显 stdout，也不回显可能含大字段值的解析错误全文 —— 类型错误本身可能带着
+    /// 一整个超长字符串值。`request` 与 `close_session` 共用同一口径。
+    fn parse_error(&self, context: &str, text: &str, err: &serde_json::Error) -> SodaError {
+        SodaError::json(format!(
+            "{context}: {:?} at line {} column {}（输出长度: {} 字节）",
+            err.classify(),
+            err.line(),
+            err.column(),
+            text.len()
+        ))
+    }
 }
 
 impl BrowserRequester for CommandRequester {
@@ -207,15 +221,8 @@ impl BrowserRequester for CommandRequester {
         let payload = serde_json::to_vec(request)
             .map_err(|err| SodaError::json(format!("browser request encode: {err}")))?;
         let text = self.exec(payload)?;
-        let parsed: BrowserResponse = serde_json::from_str(text.trim()).map_err(|err| {
-            SodaError::json(format!(
-                "requester 返回无法解析: {:?} at line {} column {}（输出长度: {} 字节）",
-                err.classify(),
-                err.line(),
-                err.column(),
-                text.len()
-            ))
-        })?;
+        let parsed: BrowserResponse = serde_json::from_str(text.trim())
+            .map_err(|err| self.parse_error("requester 返回无法解析", &text, &err))?;
         if !parsed.ok || parsed.error.is_empty() && parsed.status == 0 {
             return Err(SodaError::http(if parsed.error.is_empty() {
                 "签名服务未返回结果".to_string()
@@ -233,7 +240,7 @@ impl BrowserRequester for CommandRequester {
         let payload = serde_json::json!({ "op": "close", "sessionKey": session_key });
         let text = self.exec(payload.to_string().into_bytes())?;
         let parsed: BrowserResponse = serde_json::from_str(text.trim())
-            .map_err(|err| SodaError::json(format!("close session 返回无法解析: {err}")))?;
+            .map_err(|err| self.parse_error("close session 返回无法解析", &text, &err))?;
         if !parsed.ok {
             return Err(SodaError::http("签名服务关闭会话失败"));
         }

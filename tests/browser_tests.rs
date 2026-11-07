@@ -204,6 +204,29 @@ fn command_requester_bounds_malformed_response_diagnostics() {
     assert!(text.len() < 256, "错误串必须有界");
 }
 
+/// `close_session` 与 `request` 同口径：解析错误同样只带类别/行列/长度，不回显大字段值。
+#[test]
+fn command_requester_bounds_close_session_diagnostics() {
+    let script =
+        "cat >/dev/null; printf '{\"ok\":\"'; printf '%131072s' ''; printf 'private-marker\"}'";
+    let requester = CommandRequester::new("sh")
+        .args(["-c", script])
+        .timeout_ms(15_000);
+    let error = run_with_watchdog(Duration::from_secs(20), move || {
+        requester.close_session("session-under-test")
+    })
+    .expect_err("错误类型的字段不能解析");
+    assert!(matches!(error, libresoda::SodaError::Json(_)));
+    let text = error.to_string();
+    assert!(
+        text.starts_with("close session 返回无法解析: Data at line 1 column "),
+        "{text}"
+    );
+    assert!(text.contains("输出长度: 131095 字节"), "{text}");
+    assert!(!text.contains("private-marker"), "{text}");
+    assert!(text.len() < 256, "错误串必须有界");
+}
+
 /// 超时用例的驻留探针：先打 stderr 标记，再 `exec sleep 30` 驻留。
 ///
 /// 票 #29：标记不排在「写完 256 KiB」之后（慢机/抢核时探针自己可能跑不到标记），驻留也
