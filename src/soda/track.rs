@@ -731,6 +731,36 @@ mod tests {
         assert!(error.is_signer_failure(), "{error}");
     }
 
+    /// 票 #39：provider 回空签名时同样在 App POST 之前中断。
+    struct EmptyProvider;
+
+    impl SignatureProvider for EmptyProvider {
+        fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
+            Ok(SignResponse::default())
+        }
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+    }
+
+    #[test]
+    fn pc_track_v2_does_not_post_when_signer_returns_empty() {
+        let soda = Soda::new("sessionid_ss=test");
+        soda.set_signature_provider(Arc::new(EmptyProvider));
+        let posted = std::cell::Cell::new(false);
+        let error = fetch_pc_track_v2_with(&soda, "7501674235158431760", |_, _, _| {
+            posted.set(true);
+            Ok(Vec::new())
+        })
+        .expect_err("空签名必须中断");
+        assert!(!posted.get(), "空签名后不得再发 App POST");
+        assert!(error.is_signer_failure(), "{error}");
+        assert!(
+            error.to_string().contains("empty signature response"),
+            "{error}"
+        );
+    }
+
     /// 一条最小的 web 曲目元数据（id 非空，长度 200 秒）。
     fn web_track() -> TrackV2Response {
         TrackV2Response {

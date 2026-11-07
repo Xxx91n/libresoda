@@ -748,8 +748,9 @@
   「签名器已配置但调用失败」拆开：
 
   - `apply_stream_signature` 由 `Option<String>` 改成 `Result<Option<String>>`：没配置
-    provider、provider 明确回空（`NoopSignature`）或只回请求头时仍是 `Ok(None)`
-    （语义是「URL 没被改写」，不是「没签名」）；provider 的 `sign()` 返回 `Err` 时上抛，
+    provider、provider 显式声明允许空响应（`NoopSignature`、空回填的 `CapturedSignature`）
+    或只回请求头时仍是 `Ok(None)`（语义是「URL 没被改写」，不是「没签名」）；provider 的
+    `sign()` 返回 `Err` 时上抛，
     文案保证以 `signer` 开头。提供者已经以 `signer` 开头的文案原样保留，其余补
     `signer error: ` 前缀。`fetch_pc_track_v2` / `pc_post_json` 用 `?` 传播，**不再发
     未签名请求** —— 影响所有 App 端点调用（取流与收藏/歌单/推荐流/播放上报等写操作）。
@@ -769,7 +770,11 @@
     `signer error:` / `signer request encode:` 前缀（直接调用 `HttpSignature::sign` 的
     调用方同样能判出签名故障）。`HttpSignature` / `CommandSignature` 回**空签名**
     改为 `signer error: empty signature response`：配了远程或子进程签名器却等于没签，
-    不能悄悄改发未签名请求（`NoopSignature` 与自定义 no-op 仍按未签名继续）。
+    不能悄悄改发未签名请求。票 #39 把这条判据上移到 `apply_stream_signature`：
+    `SignatureProvider` 新增默认返回 `false` 的 `allows_empty_signature()`，只有
+    `NoopSignature` 与空回填的 `CapturedSignature` 覆写为 `true`；其余自定义 provider
+    （包括第三方自己实现的 no-op）回空签名都会报 `signer error: empty signature response`，
+    要保留旧行为必须显式覆写该方法。
     前缀补写只保留 `Json` 变体；`Api` / `InvalidInput` / `Io` 等统一成 `Http` ——
     `Api` 的 Display 会带 `status_code=` 前缀，无法满足「以 `signer` 开头」的判定。
     `ok:false` 的等待时长从回包体读（libmssdk 头/体各写一份；2xx 分支只拿到体）。
