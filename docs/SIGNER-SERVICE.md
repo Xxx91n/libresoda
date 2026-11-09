@@ -112,11 +112,12 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 
 | 情况 | `sign()` | App 端点调用方 |
 | --- | --- | --- |
-| 没配置 provider，或 `NoopSignature` | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
+| 没配置 provider；或 `NoopSignature`（显式 no-op）/ `CapturedSignature`（抓包回填可能为空） | 不调用 / `Ok(empty)` | 按未签名继续（允许的降级） |
 | 连接拒绝 / 超时 / 子进程非 0 退出 | `signer error: …` / `signer exited …` | 错误上抛；不再发未签名请求 |
 | HTTP 非 2xx | `signer error: http request failed: status {code} ({url?<redacted>}); headers: […]; body: …` | 同上；保留 `Retry-After` 等处置相关头 |
 | HTTP 2xx + `{"ok":false}` | `signer error: {error} [code=…] [retry_after_seconds=…]` | 同上；原因码与等待时长都在文案里 |
 | HTTP 2xx 但空签名回包 | `signer error: empty signature response` | 同上；配了签名器却等于没签 |
+| 自定义 provider 回空签名，且没声明允许空响应 | `Ok(empty)` | 库统一报 `signer error: empty signature response`，不静默发未签名请求 |
 | 签名成功、服务端只给试听 | `Ok` | `Ok + is_preview=true`（权益/曲目事实，不是签名故障） |
 
 非 2xx 的错误文案只带与处置相关的响应头（`Retry-After` / `Content-Type` /
@@ -131,7 +132,10 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 **非 2xx 超过上限仍保留状态码与响应头**，只截断响应体；2xx 超过上限则直接报签名故障，
 不拿截断的 JSON 当签名。`2xx + {"ok":false}` 的等待时长从回包体读
 （libmssdk 要求头/体各写一份；2xx 分支只拿得到体）。`CapturedSignature` 回空仍按
-「未签名」处理（它是用户显式回填的静态值，不是远程/子进程签名器）。
+「未签名」处理（它是用户显式回填的静态值，不是远程/子进程签名器）；自定义 provider
+想保留这个行为，必须覆写 `SignatureProvider::allows_empty_signature()` 返回 `true`。
+默认 `false`：配了 provider 却回空签名就是签名故障，不再静默改发未签名请求
+（票 [`#39`](https://github.com/sodahub-org/libresoda/issues/39)）。
 
 `HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
 普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型

@@ -769,7 +769,8 @@
     `signer error:` / `signer request encode:` 前缀（直接调用 `HttpSignature::sign` 的
     调用方同样能判出签名故障）。`HttpSignature` / `CommandSignature` 回**空签名**
     改为 `signer error: empty signature response`：配了远程或子进程签名器却等于没签，
-    不能悄悄改发未签名请求（`NoopSignature` 与自定义 no-op 仍按未签名继续）。
+    不能悄悄改发未签名请求（当时 `NoopSignature` 与自定义 no-op 仍按未签名继续；
+    票 #39 起自定义 no-op 必须显式声明，见下一条）。
     前缀补写只保留 `Json` 变体；`Api` / `InvalidInput` / `Io` 等统一成 `Http` ——
     `Api` 的 Display 会带 `status_code=` 前缀，无法满足「以 `signer` 开头」的判定。
     `ok:false` 的等待时长从回包体读（libmssdk 头/体各写一份；2xx 分支只拿到体）。
@@ -833,6 +834,23 @@
   诊断内容仍存活——最后一条用「先截断再脱敏会切掉它」锁住顺序本身）；
   `src/soda/signature.rs` 两条（兜底边界：`&` 分隔、闭合引号、`bearers` 不误伤、空值、
   多空白；密集标记下 token/Bearer/URL 逐个全脱敏、诊断尾巴保留）。全部离线，无新依赖。
+
+* **签名错误透传收尾：自定义 provider 回空签名的口径（`soda::signature`，上游无对应）**：
+  实现票 [`#39`](https://github.com/sodahub-org/libresoda/issues/39)，#36 合入时记录的
+  第二条非阻断后续。此前 `apply_stream_signature` 对任意 provider 的
+  `Ok(SignResponse::default())` 都返回 `Ok(None)`，配错的自定义 provider 会静默改发
+  未签名请求。口径选票面方案一：在 `apply_stream_signature` **统一兜底**（内置
+  `HttpSignature` / `CommandSignature` 原有的空回包检查保留，直接调用 `sign()` 的
+  公开路径仍报错；删掉它们不在本票范围），`SignatureProvider` 新增默认返回 `false`
+  的 `allows_empty_signature()` 作为可判定的显式 no-op 标记，不按 `name()` 字符串猜。
+  `NoopSignature` 与 `CapturedSignature` 覆写为 `true`（抓包回填是用户显式给的静态值，
+  可能整体为空，沿用既有「不签名」语义）；其余 provider（包括第三方自己实现的 no-op）
+  回空签名都会报 `signer error: empty signature response`，要保留旧行为必须显式覆写
+  该方法。空签名文案抽成 `empty_signature_error()` 一处，三处共用防漂移。**测试**：
+  `src/soda/signature.rs` 两条（自定义 provider 回空 → 报错且请求头原样保留；
+  `NoopSignature` / `CapturedSignature` 回空 → `Ok(None)`）、`src/soda/track.rs` 两条
+  （空签名后零次 App POST、签名成功时闭包确实被调用）；既有「未配置 provider」用例
+  保持通过。全部离线。
 
 ## 未移植项
 

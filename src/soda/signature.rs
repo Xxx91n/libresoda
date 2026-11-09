@@ -180,9 +180,28 @@ pub trait SignatureProvider: Send + Sync {
     /// 为一次请求生成签名参数/头。
     ///
     /// 出错时返回 `Err`：取流链路会把它当**签名故障**上抛（文案带 `signer`），
-    /// 不会退化为未签名请求。只有「根本没配置提供者」才走未签名路径
+    /// 不会退化为未签名请求。只有「根本没配置提供者」，或提供者显式声明允许空响应
+    /// （[`SignatureProvider::allows_empty_signature`]），才走未签名路径
     /// （见 [`apply_stream_signature`]）。
+    ///
+    /// 返回空的 [`SignResponse`] 默认同样算签名故障：配了提供者却拿不到任何签名，
+    /// 静默改发未签名请求正是票 #39 要堵住的口子。确实以「不签名」为正常语义的
+    /// 提供者（[`NoopSignature`]、抓包回填的 [`CapturedSignature`]）必须覆写
+    /// [`SignatureProvider::allows_empty_signature`] 显式声明。
     fn sign(&self, request: &SignRequest) -> Result<SignResponse>;
+
+    /// 本提供者返回空签名时，是否按「未签名继续」而不是报签名故障。
+    ///
+    /// 默认 `false`：`apply_stream_signature` 会把空响应当成
+    /// `signer error: empty signature response`。只有「不签名」本身就是这个提供者
+    /// 的正常职责（显式 no-op）时才覆写成 `true`；不要靠 [`Self::name`] 的字符串
+    /// 猜，名字只是日志用的。内置的 [`HttpSignature`] / [`CommandSignature`]
+    /// 在 `sign()` 里已经直接把空回包当错误，不读取这个标记；覆写只对手写
+    /// provider 生效。
+    fn allows_empty_signature(&self) -> bool {
+        false
+    }
+
     /// 名称，便于日志与诊断。
     fn name(&self) -> &'static str;
 }
@@ -194,6 +213,10 @@ pub struct NoopSignature;
 impl SignatureProvider for NoopSignature {
     fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
         Ok(SignResponse::default())
+    }
+    /// 显式 no-op：空签名就是它的正常结果。
+    fn allows_empty_signature(&self) -> bool {
+        true
     }
     fn name(&self) -> &'static str {
         "noop"
@@ -215,6 +238,11 @@ impl SignatureProvider for CapturedSignature {
             a_bogus: self.a_bogus.clone(),
             headers: self.headers.clone(),
         })
+    }
+    /// 抓包回填是用户显式给的静态值：全空表示「这次不签」，不是远程/子进程
+    /// 签名器算不出来；保持 `Ok(None)` 的既有语义（见票 #39）。
+    fn allows_empty_signature(&self) -> bool {
+        true
     }
     fn name(&self) -> &'static str {
         "captured"
@@ -384,7 +412,7 @@ impl SignatureProvider for HttpSignature {
         let response = Self::parse_response(&reply.body)?;
         if response.is_empty() {
             // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
-            return Err(SodaError::http("signer error: empty signature response"));
+            return Err(empty_signature_error());
         }
         Ok(response)
     }
@@ -641,6 +669,14 @@ fn with_signer_context(error: SodaError) -> SodaError {
     }
 }
 
+/// 配了签名器却回空签名时的冻结文案。
+///
+/// `is_signer_failure()` 只看文案是否以 `signer` 开头；HTTP、命令与自定义 provider
+/// 兜底三处共用这一句，避免文案漂移。
+fn empty_signature_error() -> SodaError {
+    SodaError::http("signer error: empty signature response")
+}
+
 /// 外部命令签名：把 [`SignRequest`] 的 JSON 写到子进程 stdin，
 /// 从 stdout 读回 [`SignResponse`] 的 JSON。
 ///
@@ -744,7 +780,7 @@ impl SignatureProvider for CommandSignature {
             .map_err(|err| SodaError::json(format!("signer response decode: {err}")))?;
         if response.is_empty() {
             // 外部签名器回空 JSON：等于没签，不能当成功继续。
-            return Err(SodaError::http("signer error: empty signature response"));
+            return Err(empty_signature_error());
         }
         Ok(response)
     }
@@ -832,13 +868,16 @@ pub fn sign_request_with_headers(
 ///
 /// 两种成功形态（`None` 只说明**URL 没被改写**，不说明没签名）：
 ///
-/// * `Ok(None)` —— 没有配置签名器、签名器明确回空（如 [`NoopSignature`]），
-///   或只回请求头（头已写进 `options`）。调用方按原 URL 继续；
+/// * `Ok(None)` —— 没有配置签名器；提供者显式声明允许空响应（[`NoopSignature`]、
+///   抓包回填的 [`CapturedSignature`]）；或只回请求头（头已写进 `options`）。
+///   调用方按原 URL 继续；
 /// * `Ok(Some(url))` —— 签名成功，URL 被 `msToken` / `a_bogus` 改写。
 ///
 /// `provider` 已配置但 `sign()` 失败时返回 `Err`，文案带 `signer`：
 /// **调用方不得再发未签名请求**。签名器已配置却失败不是"没配置"，把它降级成
 /// 未签名请求会让风控回 `HTTP 200 + 0 字节`，最后看起来像一次成功的试听。
+/// 同理，自定义 provider 回空签名而没声明 [`SignatureProvider::allows_empty_signature`]
+/// 时也返回 `signer error: empty signature response`，不再静默按未签名继续。
 pub(crate) fn apply_stream_signature(
     soda: &super::Soda,
     url: &str,
@@ -854,7 +893,11 @@ pub(crate) fn apply_stream_signature(
     let request = sign_request_with_headers(url, "POST", body, merged.headers());
     let response = provider.sign(&request).map_err(with_signer_context)?;
     if response.is_empty() {
-        return Ok(None);
+        if provider.allows_empty_signature() {
+            return Ok(None);
+        }
+        // 配了 provider 却拿不到任何签名：这是签名故障，不是"URL 未改写"。
+        return Err(empty_signature_error());
     }
 
     // 先整体覆盖成合并后的头，避免调用方再关心顺序。
@@ -875,6 +918,18 @@ pub(crate) fn apply_stream_signature(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// 断言调用方的原始请求头还在：失败与未签名路径都不该改写 `options`。
+    fn assert_header_preserved(options: &[crate::http::RequestOption], name: &str, value: &str) {
+        let merged = crate::http::merge_options(options);
+        assert!(
+            merged
+                .headers()
+                .iter()
+                .any(|(header, got)| header.eq_ignore_ascii_case(name) && got.as_str() == value),
+            "原始请求头 {name}: {value} 应原样保留"
+        );
+    }
 
     #[test]
     fn stream_signature_injects_helios_and_medusa_headers() {
@@ -947,6 +1002,60 @@ mod tests {
         .expect("未配置签名器不是错误");
         assert!(signed.is_none());
         assert_eq!(options.len(), 1);
+    }
+
+    /// 自定义 provider 回空签名：默认按签名故障上抛，不能静默改发未签名请求。
+    struct EmptySignature;
+
+    impl SignatureProvider for EmptySignature {
+        fn sign(&self, _request: &SignRequest) -> Result<SignResponse> {
+            Ok(SignResponse::default())
+        }
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+    }
+
+    #[test]
+    fn custom_provider_empty_response_is_a_signer_failure() {
+        let soda = super::super::Soda::new("sessionid_ss=test");
+        soda.set_signature_provider(Arc::new(EmptySignature));
+        let mut options = vec![crate::http::RequestOption::new().header("X-Test", "1")];
+
+        let error = apply_stream_signature(
+            &soda,
+            "https://api.qishui.com/luna/pc/track_v2?aid=386088",
+            "{}",
+            &mut options,
+        )
+        .expect_err("配了 provider 却回空签名必须报错");
+        assert_eq!(error.to_string(), "signer error: empty signature response");
+        assert!(error.is_signer_failure(), "{error}");
+        // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
+        assert_header_preserved(&options, "X-Test", "1");
+    }
+
+    /// 票 #39：只有显式声明允许空响应的 provider 才保留未签名路径。
+    #[test]
+    fn explicit_noop_providers_keep_the_unsigned_path() {
+        let providers: [Arc<dyn SignatureProvider>; 2] = [
+            Arc::new(NoopSignature),
+            Arc::new(CapturedSignature::default()),
+        ];
+        for provider in providers {
+            let soda = super::super::Soda::new("sessionid_ss=test");
+            soda.set_signature_provider(provider);
+            let mut options = vec![crate::http::RequestOption::new().header("X-Test", "1")];
+            let signed = apply_stream_signature(
+                &soda,
+                "https://api.qishui.com/luna/pc/track_v2?aid=386088",
+                "{}",
+                &mut options,
+            )
+            .expect("显式 no-op 不是签名故障");
+            assert!(signed.is_none());
+            assert_header_preserved(&options, "X-Test", "1");
+        }
     }
 
     /// 固定失败的签名器；错误文案不含 `signer`，用来钉住补前缀行为。
@@ -1080,6 +1189,6 @@ mod tests {
         assert!(text.starts_with("signer error:"), "{text}");
         assert!(text.contains("connect to signer refused"), "{text}");
         // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
-        assert_eq!(options.len(), 1);
+        assert_header_preserved(&options, "X-Test", "1");
     }
 }
