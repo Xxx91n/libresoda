@@ -1,7 +1,7 @@
 //! 汽水音频解密：`play_auth`（spade）密钥还原 + MP4/CENC 样本解密。
 //!
 //! 多轨文件按每条 `trak` 的 `stsc` + `stco`/`co64` 定位样本；没有 `senc` 的轨
-//! （文字轨）原样透传，`mdat` 里的间隙也不改动（票 #42）。
+//! （文字轨）原样透传。所有轨的样本必须刚好铺满 `mdat`，中间留空就报错（票 #42）。
 //!
 //! 逐函数对应上游 `soda/crypto.go`。
 
@@ -316,8 +316,11 @@ fn plan_decryption(
     let mut track_data = Vec::with_capacity(tracks.len());
     let mut all_have_tables = true;
     let mut any_senc = false;
+    // 老代码先在整个 moov 里找直接的 `senc` 子 box；标准布局不在那里，但保留这条兜底，
+    // 只给第一条轨用，免得把别的轨也当成加密轨。
+    let moov_level_senc = find_box(data, b"senc", moov.offset + 8, moov_end);
 
-    for trak in &tracks {
+    for (track_index, trak) in tracks.iter().enumerate() {
         let mdia = child_box(data, b"mdia", trak)
             .ok_or_else(|| SodaError::crypto("mdia box not found"))?;
         let minf = child_box(data, b"minf", &mdia)
@@ -330,7 +333,14 @@ fn plan_decryption(
         let sizes = parse_stsz(stsz.data);
 
         let senc = child_box(data, b"senc", &stbl)
-            .or_else(|| find_box_deep(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size));
+            .or_else(|| find_box_deep(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
+            .or_else(|| {
+                if track_index == 0 {
+                    moov_level_senc
+                } else {
+                    None
+                }
+            });
         let (senc_samples, has_senc) = match senc {
             Some(senc) => {
                 let iv_size =
@@ -372,6 +382,9 @@ fn plan_decryption(
         return Err(SodaError::crypto("senc box not found"));
     }
 
+    let mdat_end = mdat_payload_start
+        .checked_add(mdat_payload_len)
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut planned = Vec::new();
     if all_have_tables {
         for (track_index, track) in track_data.iter().enumerate() {
@@ -392,9 +405,6 @@ fn plan_decryption(
         }
     } else {
         // 老口径：所有轨按 trak 顺序首尾相接，样本必须刚好铺满 mdat。
-        let mdat_end = mdat_payload_start
-            .checked_add(mdat_payload_len)
-            .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
         let mut cursor = mdat_payload_start;
         for (track_index, track) in track_data.iter().enumerate() {
             for (sample_index, size) in track.sizes.iter().enumerate() {
@@ -416,9 +426,6 @@ fn plan_decryption(
     }
 
     planned.sort_unstable_by_key(|sample| sample.offset);
-    let mdat_end = mdat_payload_start
-        .checked_add(mdat_payload_len)
-        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     // 所有轨的样本合起来必须刚好铺满 mdat：中间留空就说明还有我们没认出来的数据
     // （可能是密文），原样透传会写出不完整的文件，所以宁可报错。
     let mut expected_offset = mdat_payload_start;
@@ -461,7 +468,9 @@ fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<
     find_box(data, kind, parent.offset + 8, parent.offset + parent.size)
 }
 
-/// 等价 `parseStsc`（只取解密需要的两个字段）。
+/// 读 `stsc`（sample-to-chunk）表，只取解密需要的两个字段。
+///
+/// 上游没有对应的独立函数；这是票 #42 多轨修复新增的解析件。
 fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
     if data.len() < 8 {
         return Vec::new();

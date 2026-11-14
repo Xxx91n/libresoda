@@ -165,21 +165,23 @@ enum FixtureTrack {
     Text,
 }
 
-/// 构造一条轨的 `stbl`：`stsd` + `stsz` + `stsc` + `stco`（或 `co64`），加密轨再加 `senc`/`tenc`。
-///
-/// 素材里每个 chunk 只装一个样本，所以 `stsc` 固定写「从第 1 个 chunk 起、每 chunk 1 个样本」。
-fn track_stbl(
-    sample_sizes: &[u32],
-    senc_payload: Option<&[u8]>,
-    chunk_offsets: &[u64],
-    use_co64: bool,
+/// 一条轨在测试素材里的参数。
+struct TrackFixture<'a> {
+    sizes: &'a [u32],
+    senc: Option<&'a [u8]>,
+    /// `(first_chunk, samples_per_chunk)`，写进 `stsc` 的条目。
+    stsc: &'a [(u32, u32)],
     encrypted: bool,
-) -> Vec<u8> {
+}
+
+/// 构造一条轨的完整 `stbl` box：`stsd` + `stsz` + `stsc` + `stco`（或 `co64`），
+/// 加密轨再加 `senc`/`tenc`。
+fn track_stbl(track: &TrackFixture<'_>, chunk_offsets: &[u64], use_co64: bool) -> Vec<u8> {
     let mut payload = Vec::new();
 
     let mut stsd_payload = vec![0u8; 4];
     stsd_payload.extend_from_slice(&1u32.to_be_bytes());
-    if encrypted {
+    if track.encrypted {
         let frma = mp4_box(b"frma", b"mp4a");
         let mut enca_payload = vec![0u8; 28];
         enca_payload.extend_from_slice(&frma);
@@ -190,17 +192,19 @@ fn track_stbl(
     payload.extend_from_slice(&mp4_box(b"stsd", &stsd_payload));
 
     let mut stsz_payload = vec![0u8; 12];
-    stsz_payload[8..12].copy_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    for size in sample_sizes {
+    stsz_payload[8..12].copy_from_slice(&(track.sizes.len() as u32).to_be_bytes());
+    for size in track.sizes {
         stsz_payload.extend_from_slice(&size.to_be_bytes());
     }
     payload.extend_from_slice(&mp4_box(b"stsz", &stsz_payload));
 
     let mut stsc_payload = vec![0u8; 8];
-    stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
-    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
-    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload[4..8].copy_from_slice(&(track.stsc.len() as u32).to_be_bytes());
+    for (first_chunk, samples_per_chunk) in track.stsc {
+        stsc_payload.extend_from_slice(&first_chunk.to_be_bytes());
+        stsc_payload.extend_from_slice(&samples_per_chunk.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    }
     payload.extend_from_slice(&mp4_box(b"stsc", &stsc_payload));
 
     let mut chunk_payload = vec![0u8; 8];
@@ -217,7 +221,7 @@ fn track_stbl(
         payload.extend_from_slice(&mp4_box(b"stco", &chunk_payload));
     }
 
-    if let Some(senc_payload) = senc_payload {
+    if let Some(senc_payload) = track.senc {
         payload.extend_from_slice(&mp4_box(b"senc", senc_payload));
         let mut tenc_payload = vec![0u8; 8];
         tenc_payload[7] = 8;
@@ -227,16 +231,35 @@ fn track_stbl(
         payload.extend_from_slice(&sinf);
     }
 
-    payload
+    mp4_box(b"stbl", &payload)
+}
+
+/// 按 `stsc` 的条目把样本分组成 chunk，取每块第一个样本的偏移当 chunk 偏移。
+fn track_chunk_offsets(sample_offsets: &[u64], stsc: &[(u32, u32)]) -> Vec<u64> {
+    let mut chunks = Vec::new();
+    let mut sample_index = 0usize;
+    let mut chunk_number = 1u32;
+    for (index, (first_chunk, samples_per_chunk)) in stsc.iter().enumerate() {
+        let next_first = stsc
+            .get(index + 1)
+            .map(|(first, _)| *first)
+            .unwrap_or(u32::MAX);
+        chunk_number = chunk_number.max(*first_chunk);
+        while chunk_number < next_first && sample_index < sample_offsets.len() {
+            chunks.push(sample_offsets[sample_index]);
+            sample_index += (*samples_per_chunk).max(1) as usize;
+            chunk_number += 1;
+        }
+    }
+    chunks
 }
 
 /// 组装一个 `ftyp + moov(两条 trak) + mdat` 的文件。
 ///
 /// `stco`/`co64` 里是绝对文件偏移，所以先拿占位偏移量出 `moov` 大小，再用真实偏移重建一遍。
 fn build_multitrack_mp4(
-    audio_sizes: &[u32],
-    audio_senc: &[u8],
-    text_sizes: &[u32],
+    audio: &TrackFixture<'_>,
+    text: &TrackFixture<'_>,
     layout: &[FixtureTrack],
     mdat_payload: &[u8],
     use_co64: bool,
@@ -251,24 +274,27 @@ fn build_multitrack_mp4(
         match track {
             FixtureTrack::Audio => {
                 audio_offsets.push(relative as u64);
-                relative += audio_sizes[audio_index] as usize;
+                relative += audio.sizes[audio_index] as usize;
                 audio_index += 1;
             }
             FixtureTrack::Text => {
                 text_offsets.push(relative as u64);
-                relative += text_sizes[text_index] as usize;
+                relative += text.sizes[text_index] as usize;
                 text_index += 1;
             }
         }
     }
-    assert_eq!(audio_index, audio_sizes.len(), "布局要用完音频样本");
-    assert_eq!(text_index, text_sizes.len(), "布局要用完文字样本");
+    assert_eq!(audio_index, audio.sizes.len(), "布局要用完音频样本");
+    assert_eq!(text_index, text.sizes.len(), "布局要用完文字样本");
     assert_eq!(relative, mdat_payload.len(), "布局要刚好铺满 mdat");
+
+    let audio_chunk_rel = track_chunk_offsets(&audio_offsets, audio.stsc);
+    let text_chunk_rel = track_chunk_offsets(&text_offsets, text.stsc);
 
     let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
     let build_moov = |audio_chunks: &[u64], text_chunks: &[u64]| -> Vec<u8> {
-        let audio_stbl = track_stbl(audio_sizes, Some(audio_senc), audio_chunks, use_co64, true);
-        let text_stbl = track_stbl(text_sizes, None, text_chunks, use_co64, false);
+        let audio_stbl = track_stbl(audio, audio_chunks, use_co64);
+        let text_stbl = track_stbl(text, text_chunks, use_co64);
         let mut moov_payload = Vec::new();
         moov_payload.extend_from_slice(&mp4_box(
             b"trak",
@@ -282,15 +308,15 @@ fn build_multitrack_mp4(
     };
 
     let placeholder = build_moov(
-        &vec![0u64; audio_offsets.len()],
-        &vec![0u64; text_offsets.len()],
+        &vec![0u64; audio_chunk_rel.len()],
+        &vec![0u64; text_chunk_rel.len()],
     );
     let mdat_start = (ftyp.len() + placeholder.len() + 8) as u64;
-    let audio_chunks: Vec<u64> = audio_offsets
+    let audio_chunks: Vec<u64> = audio_chunk_rel
         .iter()
         .map(|offset| mdat_start + *offset)
         .collect();
-    let text_chunks: Vec<u64> = text_offsets
+    let text_chunks: Vec<u64> = text_chunk_rel
         .iter()
         .map(|offset| mdat_start + *offset)
         .collect();
@@ -303,41 +329,13 @@ fn build_multitrack_mp4(
     file
 }
 
-/// 返回（加密后的文件，期望的 mdat 明文载荷）。
-///
-/// 音频 3 个样本、文字 2 个样本按 `A1, T1, A2, T2, A3` 交错排列：
-/// 只按第一条轨的顺序读，会把文字样本当成音频，必须靠各自的 chunk 偏移取数。
-fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
-    let ivs: [[u8; 8]; 3] = [[11; 8], [12; 8], [13; 8]];
-    let audio_plain: Vec<Vec<u8>> = vec![
-        (0..64u8).collect(),
-        (0..96u8).map(|value| value.wrapping_mul(3)).collect(),
-        (0..48u8).map(|value| value.wrapping_add(9)).collect(),
-    ];
-    let audio_sizes: Vec<u32> = audio_plain
-        .iter()
-        .map(|sample| sample.len() as u32)
-        .collect();
-
-    let mut senc_payload = vec![0u8; 8];
-    senc_payload[4..8].copy_from_slice(&(ivs.len() as u32).to_be_bytes());
-    for iv in &ivs {
-        senc_payload.extend_from_slice(iv);
-    }
-
-    let text_samples: Vec<Vec<u8>> = vec![vec![b'x'; 14], vec![b'y'; 14]];
-    let text_sizes: Vec<u32> = text_samples
-        .iter()
-        .map(|sample| sample.len() as u32)
-        .collect();
-
-    let layout = [
-        FixtureTrack::Audio,
-        FixtureTrack::Text,
-        FixtureTrack::Audio,
-        FixtureTrack::Text,
-        FixtureTrack::Audio,
-    ];
+/// 从明文样本构造加密后的 mdat 载荷与期望明文。
+fn payload_and_plaintext(
+    audio_plain: &[Vec<u8>],
+    ivs: &[[u8; 8]],
+    text_samples: &[Vec<u8>],
+    layout: &[FixtureTrack],
+) -> (Vec<u8>, Vec<u8>) {
     let mut mdat_payload = Vec::new();
     let mut expected = Vec::new();
     let mut audio_index = 0usize;
@@ -358,15 +356,120 @@ fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
             }
         }
     }
+    (mdat_payload, expected)
+}
 
-    let file = build_multitrack_mp4(
-        &audio_sizes,
-        &senc_payload,
-        &text_sizes,
-        &layout,
-        &mdat_payload,
-        use_co64,
-    );
+fn senc_payload_for(ivs: &[[u8; 8]]) -> Vec<u8> {
+    let mut senc_payload = vec![0u8; 8];
+    senc_payload[4..8].copy_from_slice(&(ivs.len() as u32).to_be_bytes());
+    for iv in ivs {
+        senc_payload.extend_from_slice(iv);
+    }
+    senc_payload
+}
+
+/// 交错排列的素材：`A1, T1, A2, T2, A3`，每个 chunk 只装一个样本。
+///
+/// 只按第一条轨的顺序读，会把文字样本当成音频，必须靠各自的 chunk 偏移取数。
+fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
+    let ivs: [[u8; 8]; 3] = [[11; 8], [12; 8], [13; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..64u8).collect(),
+        (0..96u8).map(|value| value.wrapping_mul(3)).collect(),
+        (0..48u8).map(|value| value.wrapping_add(9)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'x'; 14], vec![b'y'; 14]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    let layout = [
+        FixtureTrack::Audio,
+        FixtureTrack::Text,
+        FixtureTrack::Audio,
+        FixtureTrack::Text,
+        FixtureTrack::Audio,
+    ];
+    let (mdat_payload, expected) =
+        payload_and_plaintext(&audio_plain, &ivs, &text_samples, &layout);
+
+    let audio_stsc = [(1u32, 1u32)];
+    let text_stsc = [(1u32, 1u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+        encrypted: true,
+    };
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+        encrypted: false,
+    };
+    let file = build_multitrack_mp4(&audio, &text, &layout, &mdat_payload, use_co64);
+    (file, expected)
+}
+
+/// 真实汽水文件的常见形状：音频样本先连续排、文字样本跟在后面。
+///
+/// 音频前两个 chunk 各装 1 个样本，之后每 chunk 装 2 个（最后一块只装 1 个）；
+/// 文字一个 chunk 装 2 个。这张表有多条 `stsc` 记录，chunk 内偏移要按样本大小累加。
+fn multi_stsc_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
+    let ivs: [[u8; 8]; 5] = [[21; 8], [22; 8], [23; 8], [24; 8], [25; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..32u8).collect(),
+        (0..48u8).map(|value| value.wrapping_mul(5)).collect(),
+        (0..64u8).map(|value| value.wrapping_add(3)).collect(),
+        (0..40u8).map(|value| value.wrapping_mul(7)).collect(),
+        (0..56u8).map(|value| value.wrapping_add(11)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'a'; 14], vec![b'b'; 14]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    let layout = [
+        FixtureTrack::Audio,
+        FixtureTrack::Audio,
+        FixtureTrack::Audio,
+        FixtureTrack::Audio,
+        FixtureTrack::Audio,
+        FixtureTrack::Text,
+        FixtureTrack::Text,
+    ];
+    let (mdat_payload, expected) =
+        payload_and_plaintext(&audio_plain, &ivs, &text_samples, &layout);
+
+    let audio_stsc = [(1u32, 1u32), (3u32, 2u32)];
+    let text_stsc = [(1u32, 2u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+        encrypted: true,
+    };
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+        encrypted: false,
+    };
+    let file = build_multitrack_mp4(&audio, &text, &layout, &mdat_payload, use_co64);
     (file, expected)
 }
 
@@ -474,6 +577,33 @@ fn decrypt_handles_text_track_with_chunk_offsets() {
         );
 
         for step in [1usize, 3, 7, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 多条 `stsc` 记录、一个 chunk 装多个样本（最后一块可能只装一个）时，
+/// chunk 内偏移要按样本大小累加。
+#[test]
+fn decrypt_handles_multiple_stsc_entries() {
+    for use_co64 in [false, true] {
+        let (file, expected) = multi_stsc_fixture(use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("多条 stsc 应能整块解密");
+        let mdat = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
+        assert_eq!(mdat.data, expected.as_slice(), "use_co64={use_co64}");
+
+        for step in [1usize, 5, 4096] {
             let mut input = Dribble {
                 data: &file,
                 pos: 0,
