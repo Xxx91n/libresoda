@@ -1,0 +1,41 @@
+# 临时工作流：只给票 #42 的一次性验证用。
+# 按用户要求，本地不编译；在 Windows CI 上把测试可执行文件编出来，上传后下载到本机直接运行。
+# 用完删除这个文件与 ci/42-test-binaries 分支，不要合进任何 PR。
+name: CI test binaries (temporary)
+
+on:
+  push:
+    branches: [ci/42-test-binaries]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: windows test executables
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RUST: 1.99.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ticket/42-multitrack-decrypt
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST" -c clippy --profile minimal
+          rustup default "$RUST"
+
+      - name: Build test executables
+        shell: bash
+        run: cargo test --locked --no-run
+
+      - name: Upload test executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-exes
+          path: target/debug/deps/*.exe
+          if-no-files-found: error
