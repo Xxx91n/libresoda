@@ -438,7 +438,7 @@ fn single_track_fixture(padding: usize, use_co64: bool) -> (Vec<u8>, Vec<u8>) {
         mdat_payload.extend_from_slice(&ctr_apply(plain, &ivs[index]));
         expected.extend_from_slice(plain);
     }
-    mdat_payload.extend(std::iter::repeat(0xEEu8).take(padding));
+    mdat_payload.resize(mdat_payload.len() + padding, 0xEEu8);
 
     let stsc = [(1u32, 2u32)];
     let track = TrackFixture {
