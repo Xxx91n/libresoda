@@ -390,13 +390,13 @@ fn plan_decryption(
     }
     // 有的轨有 chunk 表、有的没有：这说明文件缺表，不能把有表的那条轨也退回首尾相接。
     // 没有样本的轨不参与这项判断，它本来就不需要表。
-    let any_ready = track_data
+    let any_with_tables = track_data
         .iter()
         .any(|track| !track.sizes.is_empty() && track.samples.is_some());
-    let any_absent = track_data
+    let any_without_tables = track_data
         .iter()
         .any(|track| !track.sizes.is_empty() && track.samples.is_none());
-    if any_ready && any_absent {
+    if any_with_tables && any_without_tables {
         return Err(SodaError::crypto("incomplete sample table"));
     }
 
@@ -404,7 +404,7 @@ fn plan_decryption(
         .checked_add(mdat_payload_len)
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut planned = Vec::new();
-    if !any_absent {
+    if !any_without_tables {
         for (track_index, track) in track_data.iter().enumerate() {
             for (sample_index, (offset, size)) in track
                 .samples

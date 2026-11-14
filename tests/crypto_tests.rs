@@ -168,10 +168,10 @@ enum FixtureTrack {
 /// 一条轨在测试素材里的参数。
 struct TrackFixture<'a> {
     sizes: &'a [u32],
+    /// 有 `senc` 就是加密轨，`stsd` 写 `enca`；没有就是明文轨，写普通采样条目。
     senc: Option<&'a [u8]>,
     /// `(first_chunk, samples_per_chunk)`，写进 `stsc` 的条目。
     stsc: &'a [(u32, u32)],
-    encrypted: bool,
 }
 
 /// 构造一条轨的完整 `stbl` box：`stsd` + `stsz` + `stsc` + `stco`（或 `co64`），
@@ -181,7 +181,7 @@ fn track_stbl(track: &TrackFixture<'_>, chunk_offsets: &[u64], use_co64: bool) -
 
     let mut stsd_payload = vec![0u8; 4];
     stsd_payload.extend_from_slice(&1u32.to_be_bytes());
-    if track.encrypted {
+    if track.senc.is_some() {
         let frma = mp4_box(b"frma", b"mp4a");
         let mut enca_payload = vec![0u8; 28];
         enca_payload.extend_from_slice(&frma);
@@ -445,7 +445,6 @@ fn single_track_fixture(padding: usize, use_co64: bool) -> (Vec<u8>, Vec<u8>) {
         sizes: &audio_sizes,
         senc: Some(&senc_payload),
         stsc: &stsc,
-        encrypted: true,
     };
     let file = build_single_track_mp4(&track, &mdat_payload, padding, use_co64);
     (file, expected)
@@ -489,13 +488,11 @@ fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
         sizes: &audio_sizes,
         senc: Some(&senc_payload),
         stsc: &audio_stsc,
-        encrypted: true,
     };
     let text = TrackFixture {
         sizes: &text_sizes,
         senc: None,
         stsc: &text_stsc,
-        encrypted: false,
     };
     let file = build_multitrack_mp4(&audio, &text, &layout, &mdat_payload, use_co64);
     (file, expected)
@@ -544,13 +541,11 @@ fn multi_stsc_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
         sizes: &audio_sizes,
         senc: Some(&senc_payload),
         stsc: &audio_stsc,
-        encrypted: true,
     };
     let text = TrackFixture {
         sizes: &text_sizes,
         senc: None,
         stsc: &text_stsc,
-        encrypted: false,
     };
     let file = build_multitrack_mp4(&audio, &text, &layout, &mdat_payload, use_co64);
     (file, expected)
@@ -748,6 +743,63 @@ fn decrypt_rejects_unaccounted_mdat_bytes() {
         decrypt_stream(&mut input, &KEY, &mut out).is_err(),
         "流式解密应拒绝没认出来的 mdat 字节"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 损坏的样本表 / 加密表：宁可报错，不把密文当明文交出去
+// ---------------------------------------------------------------------------
+
+/// 加密表少一条：不能把剩下的样本当明文透传。
+#[test]
+fn decrypt_rejects_short_senc() {
+    let (mut file, _) = single_track_fixture(0, false);
+    let senc = find_box_deep(&file, b"senc", 0, file.len()).expect("senc");
+    let count_offset = senc.offset + 12; // 8 字节 box 头 + 4 字节 version/flags
+    let count = u32::from_be_bytes(
+        file[count_offset..count_offset + 4]
+            .try_into()
+            .expect("count bytes"),
+    );
+    file[count_offset..count_offset + 4].copy_from_slice(&(count - 1).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("senc 少一条应报错");
+    assert!(
+        err.to_string().contains("senc sample count mismatch"),
+        "{err}"
+    );
+}
+
+/// 有 `stsc` 没 `stco`：表只缺一半，按损坏处理。
+#[test]
+fn decrypt_rejects_incomplete_sample_table() {
+    let (mut file, _) = single_track_fixture(0, false);
+    let stco = find_box_deep(&file, b"stco", 0, file.len()).expect("stco");
+    file[stco.offset + 4..stco.offset + 8].copy_from_slice(b"junk");
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("缺 stco 应报错");
+    assert!(err.to_string().contains("incomplete sample table"), "{err}");
+}
+
+/// 把 `stsc` 的条目数改成 0：表还在，但对不上样本，按损坏处理。
+#[test]
+fn decrypt_rejects_invalid_sample_table() {
+    let (mut file, _) = single_track_fixture(0, false);
+    let stsc = find_box_deep(&file, b"stsc", 0, file.len()).expect("stsc");
+    let count_offset = stsc.offset + 12; // 8 字节 box 头 + 4 字节 version/flags
+    file[count_offset..count_offset + 4].copy_from_slice(&0u32.to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("stsc 对不上应报错");
+    assert!(err.to_string().contains("invalid sample table"), "{err}");
+}
+
+/// moov 里一条 trak 都没有：明确报出来，不 panic。
+#[test]
+fn decrypt_rejects_moov_without_trak() {
+    let mut file = mp4_box(b"moov", &[]);
+    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 16]));
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("没有 trak 应报错");
+    assert!(err.to_string().contains("trak box not found"), "{err}");
 }
 
 /// 表格模式下的截断仍要报错，不能把半截文件当成功。
