@@ -334,12 +334,10 @@ fn plan_decryption(
 
         let senc = child_box(data, b"senc", &stbl)
             .or_else(|| find_box_deep(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
-            .or_else(|| {
-                if track_index == 0 {
-                    moov_level_senc
-                } else {
-                    None
-                }
+            .or(if track_index == 0 {
+                moov_level_senc
+            } else {
+                None
             });
         let (senc_samples, has_senc) = match senc {
             Some(senc) => {
@@ -479,7 +477,7 @@ fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
     let available = data.len().saturating_sub(8) / 12;
     let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
     data[8..]
-        .chunks_exact(12)
+        .chunks(12)
         .take(count)
         .map(|entry| StscEntry {
             first_chunk: u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]),
@@ -497,7 +495,7 @@ fn parse_stco(data: &[u8]) -> Vec<u64> {
     let available = data.len().saturating_sub(8) / 4;
     let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
     data[8..]
-        .chunks_exact(4)
+        .chunks(4)
         .take(count)
         .map(|entry| u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as u64)
         .collect()
@@ -512,7 +510,7 @@ fn parse_co64(data: &[u8]) -> Vec<u64> {
     let available = data.len().saturating_sub(8) / 8;
     let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
     data[8..]
-        .chunks_exact(8)
+        .chunks(8)
         .take(count)
         .map(|entry| {
             let mut bytes = [0u8; 8];
