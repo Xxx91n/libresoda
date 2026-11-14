@@ -753,8 +753,10 @@ fn decrypt_rejects_unaccounted_mdat_bytes() {
 #[test]
 fn decrypt_rejects_short_senc() {
     let (mut file, _) = single_track_fixture(0, false);
-    let senc = find_box_deep(&file, b"senc", 0, file.len()).expect("senc");
-    let count_offset = senc.offset + 12; // 8 字节 box 头 + 4 字节 version/flags
+    let senc_offset = find_box_deep(&file, b"senc", 0, file.len())
+        .expect("senc")
+        .offset;
+    let count_offset = senc_offset + 12; // 8 字节 box 头 + 4 字节 version/flags
     let count = u32::from_be_bytes(
         file[count_offset..count_offset + 4]
             .try_into()
@@ -773,8 +775,10 @@ fn decrypt_rejects_short_senc() {
 #[test]
 fn decrypt_rejects_incomplete_sample_table() {
     let (mut file, _) = single_track_fixture(0, false);
-    let stco = find_box_deep(&file, b"stco", 0, file.len()).expect("stco");
-    file[stco.offset + 4..stco.offset + 8].copy_from_slice(b"junk");
+    let stco_offset = find_box_deep(&file, b"stco", 0, file.len())
+        .expect("stco")
+        .offset;
+    file[stco_offset + 4..stco_offset + 8].copy_from_slice(b"junk");
 
     let err = decrypt_audio_with_key(&file, &KEY).expect_err("缺 stco 应报错");
     assert!(err.to_string().contains("incomplete sample table"), "{err}");
@@ -784,8 +788,10 @@ fn decrypt_rejects_incomplete_sample_table() {
 #[test]
 fn decrypt_rejects_invalid_sample_table() {
     let (mut file, _) = single_track_fixture(0, false);
-    let stsc = find_box_deep(&file, b"stsc", 0, file.len()).expect("stsc");
-    let count_offset = stsc.offset + 12; // 8 字节 box 头 + 4 字节 version/flags
+    let stsc_offset = find_box_deep(&file, b"stsc", 0, file.len())
+        .expect("stsc")
+        .offset;
+    let count_offset = stsc_offset + 12; // 8 字节 box 头 + 4 字节 version/flags
     file[count_offset..count_offset + 4].copy_from_slice(&0u32.to_be_bytes());
 
     let err = decrypt_audio_with_key(&file, &KEY).expect_err("stsc 对不上应报错");
