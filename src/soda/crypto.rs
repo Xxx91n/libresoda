@@ -335,7 +335,7 @@ fn plan_decryption(
         // 样本数不可能超过 mdat 的字节数（每个样本至少占 1 字节）。固定长 `stsz`
         // 的声明值只受 MAX_SAMPLE_ENTRIES 约束，这里先用载荷长度兜住，
         // 免得一个很小的文件先把位置表按几百万条分配出来。
-        let max_samples = mdat_payload_len.max(1).min(MAX_SAMPLE_ENTRIES);
+        let max_samples = mdat_payload_len.clamp(1, MAX_SAMPLE_ENTRIES);
         if sizes.len() > max_samples {
             return Err(SodaError::crypto("decrypted size mismatch"));
         }
