@@ -314,7 +314,6 @@ fn plan_decryption(
     }
 
     let mut track_data = Vec::with_capacity(tracks.len());
-    let mut all_have_tables = true;
     let mut any_senc = false;
     // 老代码先在整个 moov 里找直接的 `senc` 子 box；标准布局不在那里，但保留这条兜底，
     // 只给第一条轨用，免得把别的轨也当成加密轨。
@@ -348,26 +347,36 @@ fn plan_decryption(
             None => (Vec::new(), false),
         };
         any_senc |= has_senc;
+        // 有 `senc` 的轨，每个样本都该有一条解密记录。少一条就说明加密表被截断，
+        // 再往下走会把剩下几个样本的密文原样写出去。
+        if has_senc && senc_samples.len() < sizes.len() {
+            return Err(SodaError::crypto("senc sample count mismatch"));
+        }
 
         let stsd = child_box(data, b"stsd", &stbl)
             .map(|stsd| (stsd.offset, (stsd.offset + stsd.size).min(data.len())));
 
-        // 没有样本的轨不需要 chunk 表；有样本时才要求 stsc + stco/co64 齐全。
+        // 没有样本的轨不需要 chunk 表；有样本时 stsc 与 stco/co64 要么都齐全，
+        // 要么都没有（老合成文件走首尾相接的兜底）。只缺一半、或表本身对不上，都按损坏处理。
         let table_samples = if sizes.is_empty() {
             Some(Vec::new())
         } else {
-            let chunks = child_box(data, b"co64", &stbl)
+            let co64 = child_box(data, b"co64", &stbl);
+            let stco = child_box(data, b"stco", &stbl);
+            let stsc = child_box(data, b"stsc", &stbl);
+            let chunks = co64
                 .map(|co64| parse_co64(co64.data))
-                .or_else(|| child_box(data, b"stco", &stbl).map(|stco| parse_stco(stco.data)));
-            let stsc = child_box(data, b"stsc", &stbl).map(|stsc| parse_stsc(stsc.data));
-            match (chunks.as_deref(), stsc.as_deref()) {
-                (Some(chunks), Some(stsc)) => table_sample_locations(&sizes, stsc, chunks),
-                _ => None,
+                .or_else(|| stco.map(|stco| parse_stco(stco.data)));
+            let stsc = stsc.map(|stsc| parse_stsc(stsc.data));
+            match (chunks, stsc) {
+                (None, None) => None,
+                (Some(chunks), Some(stsc)) => Some(
+                    table_sample_locations(&sizes, &stsc, &chunks)
+                        .ok_or_else(|| SodaError::crypto("invalid sample table"))?,
+                ),
+                _ => return Err(SodaError::crypto("incomplete sample table")),
             }
         };
-        if table_samples.is_none() {
-            all_have_tables = false;
-        }
         track_data.push(TrackData {
             sizes,
             senc: senc_samples,
@@ -379,12 +388,23 @@ fn plan_decryption(
     if !any_senc {
         return Err(SodaError::crypto("senc box not found"));
     }
+    // 有的轨有 chunk 表、有的没有：这说明文件缺表，不能把有表的那条轨也退回首尾相接。
+    // 没有样本的轨不参与这项判断，它本来就不需要表。
+    let any_ready = track_data
+        .iter()
+        .any(|track| !track.sizes.is_empty() && track.samples.is_some());
+    let any_absent = track_data
+        .iter()
+        .any(|track| !track.sizes.is_empty() && track.samples.is_none());
+    if any_ready && any_absent {
+        return Err(SodaError::crypto("incomplete sample table"));
+    }
 
     let mdat_end = mdat_payload_start
         .checked_add(mdat_payload_len)
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut planned = Vec::new();
-    if all_have_tables {
+    if !any_absent {
         for (track_index, track) in track_data.iter().enumerate() {
             for (sample_index, (offset, size)) in track
                 .samples
