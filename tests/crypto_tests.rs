@@ -111,6 +111,36 @@ fn decrypt_audio_rejects_truncated_file_quickly() {
     assert!(result.is_err(), "截断文件应报错而不是硬撑");
 }
 
+/// 回归：定长 `stsz` 声明 4M 条、mdat 只有 16 字节时，不能先按 4M 条分配位置表。
+#[test]
+fn decrypt_rejects_impossible_fixed_sample_count_quickly() {
+    let mut stsz_payload = vec![0u8; 12];
+    stsz_payload[4..8].copy_from_slice(&1u32.to_be_bytes()); // 定长 1 字节
+    stsz_payload[8..12].copy_from_slice(&4_000_000u32.to_be_bytes());
+    let stsz = mp4_box(b"stsz", &stsz_payload);
+    let senc = mp4_box(b"senc", &[0u8; 8]);
+    let mut stbl_payload = Vec::new();
+    stbl_payload.extend_from_slice(&stsz);
+    stbl_payload.extend_from_slice(&senc);
+    let stbl = mp4_box(b"stbl", &stbl_payload);
+    let minf = mp4_box(b"minf", &stbl);
+    let mdia = mp4_box(b"mdia", &minf);
+    let trak = mp4_box(b"trak", &mdia);
+    let moov = mp4_box(b"moov", &trak);
+    let mut file = moov;
+    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 16]));
+
+    let started = std::time::Instant::now();
+    assert!(
+        decrypt_audio_with_key(&file, &KEY).is_err(),
+        "样本数超过 mdat 字节数应报错"
+    );
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "不能先按声明值分配几百万条位置"
+    );
+}
+
 #[test]
 fn parse_senc_reads_ivs_and_subsamples() {
     let mut senc = vec![0u8; 8 + 8 + 2 + 6];

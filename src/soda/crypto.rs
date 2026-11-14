@@ -285,6 +285,8 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
 /// 没有时退回老口径：按 `trak` 出现顺序把样本首尾相接铺进 `mdat`，并要求刚好铺满。
 /// 没有 `senc` 的轨（例如文字轨）不参与解密，它的样本仍然要在计划里占位，流式路径才能
 /// 按文件顺序把这段字节原样写出去。
+///
+/// 上游没有这条多轨计划；票 #42 新增。
 fn plan_decryption(
     data: &[u8],
     moov: &Mp4Box<'_>,
@@ -330,6 +332,13 @@ fn plan_decryption(
         let stsz = child_box(data, b"stsz", &stbl)
             .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
         let sizes = parse_stsz(stsz.data);
+        // 样本数不可能超过 mdat 的字节数（每个样本至少占 1 字节）。固定长 `stsz`
+        // 的声明值只受 MAX_SAMPLE_ENTRIES 约束，这里先用载荷长度兜住，
+        // 免得一个很小的文件先把位置表按几百万条分配出来。
+        let max_samples = mdat_payload_len.max(1).min(MAX_SAMPLE_ENTRIES);
+        if sizes.len() > max_samples {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
 
         let senc = child_box(data, b"senc", &stbl)
             .or_else(|| find_box_deep(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
@@ -482,20 +491,32 @@ fn plan_decryption(
 
 /// 取 `parent` 的直接子 box。起点是 `parent.offset + 8`，不能从 `parent.offset` 开始 ——
 /// 那样第一步读到的就是 `parent` 自己，`pos += size` 直接跳过整个父 box。
+///
+/// 上游没有这个辅助；票 #42 新增。
 fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<Mp4Box<'a>> {
     find_box(data, kind, parent.offset + 8, parent.offset + parent.size)
 }
 
-/// 读 `stsc`（sample-to-chunk）表，只取解密需要的两个字段。
+/// 表类 box 的公共头：版本/标志后跟条目数，按实际可读条目与硬上限夹紧。
 ///
-/// 上游没有对应的独立函数；这是票 #42 多轨修复新增的解析件。
-fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
+/// 上游没有这个夹紧辅助；票 #42 新增。
+fn table_entry_count(data: &[u8], entry_size: usize) -> usize {
     if data.len() < 8 {
-        return Vec::new();
+        return 0;
     }
     let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let available = data.len().saturating_sub(8) / 12;
-    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
+    let available = data.len().saturating_sub(8) / entry_size;
+    declared.min(available).min(MAX_SAMPLE_ENTRIES)
+}
+
+/// 读 `stsc`（sample-to-chunk）表，只取解密需要的两个字段。
+///
+/// 上游没有对应的独立函数；票 #42 多轨修复新增。
+fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
+    let count = table_entry_count(data, 12);
+    if count == 0 {
+        return Vec::new();
+    }
     data[8..]
         .chunks(12)
         .take(count)
@@ -507,13 +528,13 @@ fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
 }
 
 /// `stco`：32 位 chunk 偏移表。
+///
+/// 上游没有对应的独立函数；票 #42 新增。
 fn parse_stco(data: &[u8]) -> Vec<u64> {
-    if data.len() < 8 {
+    let count = table_entry_count(data, 4);
+    if count == 0 {
         return Vec::new();
     }
-    let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let available = data.len().saturating_sub(8) / 4;
-    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
     data[8..]
         .chunks(4)
         .take(count)
@@ -522,13 +543,13 @@ fn parse_stco(data: &[u8]) -> Vec<u64> {
 }
 
 /// `co64`：64 位 chunk 偏移表。
+///
+/// 上游没有对应的独立函数；票 #42 新增。
 fn parse_co64(data: &[u8]) -> Vec<u64> {
-    if data.len() < 8 {
+    let count = table_entry_count(data, 8);
+    if count == 0 {
         return Vec::new();
     }
-    let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let available = data.len().saturating_sub(8) / 8;
-    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
     data[8..]
         .chunks(8)
         .take(count)
@@ -542,7 +563,10 @@ fn parse_co64(data: &[u8]) -> Vec<u64> {
 
 /// 按 `stsc` 把每个 chunk 展开成样本，再用 `stco`/`co64` 的 chunk 偏移算出每个样本的绝对位置。
 ///
-/// 表本身不自洽（样本数对不上、chunk 号越界、偏移溢出）时返回 `None`，由调用方退回老口径。
+/// 表本身不自洽（样本数对不上、chunk 号越界、偏移溢出）时返回 `None`，
+/// 由调用方按损坏文件报错，不再猜测样本位置。
+///
+/// 上游没有对应的展开逻辑；票 #42 新增。
 fn table_sample_locations(
     sizes: &[u32],
     stsc: &[StscEntry],
@@ -590,6 +614,8 @@ fn table_sample_locations(
 }
 
 /// 把 `stsd` 里的 `enca` 还原成 `frma` 指向的原始编码格式。
+///
+/// 上游把这段写在 `DecryptAudio` 里；抽出来是为了给每条轨各做一遍（票 #42）。
 fn restore_original_format(data: &mut [u8], start: usize, end: usize) {
     let end = end.min(data.len());
     if start >= end {
