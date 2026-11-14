@@ -1,5 +1,8 @@
 //! 汽水音频解密：`play_auth`（spade）密钥还原 + MP4/CENC 样本解密。
 //!
+//! 多轨文件按每条 `trak` 的 `stsc` + `stco`/`co64` 定位样本；没有 `senc` 的轨
+//! （文字轨）原样透传，`mdat` 里的间隙也不改动（票 #42）。
+//!
 //! 逐函数对应上游 `soda/crypto.go`。
 
 use crate::error::{Result, SodaError};
@@ -26,6 +29,41 @@ const MAX_SAMPLE_ENTRIES: usize = 4 * 1024 * 1024;
 /// 伪造的 box size 让 `vec![0; size]` 直接申请几个 GB（整块路径有同样的风险，
 /// 但那条路本来就是「整个文件进内存」，流式路径不能退化成那样）。
 const MAX_PREFIX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 防御性上限：单个样本允许的最大字节数。
+///
+/// `stsz` 里的样本大小同样来自文件头。损坏或被伪造的文件可以声明一个几 GB 的样本，
+/// `vec![0u8; size]` 会直接申请同样大的内存；音频的单个样本（AAC 帧、ALAC/FLAC 块）
+/// 实际只有几 KB 到几百 KB，32MB 已经非常宽裕。
+const MAX_SAMPLE_BYTES: usize = 32 * 1024 * 1024;
+
+/// 一个样本在文件里的位置，以及它属于哪条轨、是这条轨的第几个样本。
+#[derive(Debug, Clone, Copy)]
+struct PlannedSample {
+    offset: usize,
+    size: usize,
+    track: usize,
+    index: usize,
+}
+
+/// 一条轨的解密材料。样本位置统一放在 `DecryptPlan::samples` 里按文件偏移排好。
+struct TrackPlan {
+    senc: Vec<SencSample>,
+    stsd: Option<(usize, usize)>,
+}
+
+/// 两条解密路径共用的计划：哪些字节要解、用哪条轨的哪个 `senc` 样本解。
+struct DecryptPlan {
+    tracks: Vec<TrackPlan>,
+    samples: Vec<PlannedSample>,
+}
+
+/// `stsc` 的一条记录：从 `first_chunk` 起，每个 chunk 装 `samples_per_chunk` 个样本。
+#[derive(Debug, Clone, Copy)]
+struct StscEntry {
+    first_chunk: u32,
+    samples_per_chunk: u32,
+}
 
 /// MP4 box 视图（相对 `data` 的偏移/长度 + 内容切片）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,75 +102,41 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
     let data = file_data;
     let moov = find_box(data, b"moov", 0, data.len())
         .ok_or_else(|| SodaError::crypto("moov box not found"))?;
-
-    let mut stbl = find_box(data, b"stbl", moov.offset, moov.offset + moov.size);
-    if stbl.is_none() {
-        // 退化路径：moov → trak → mdia → minf → stbl
-        if let Some(trak) = find_box(data, b"trak", moov.offset + 8, moov.offset + moov.size) {
-            if let Some(mdia) = find_box(data, b"mdia", trak.offset + 8, trak.offset + trak.size) {
-                if let Some(minf) =
-                    find_box(data, b"minf", mdia.offset + 8, mdia.offset + mdia.size)
-                {
-                    stbl = find_box(data, b"stbl", minf.offset + 8, minf.offset + minf.size);
-                }
-            }
-        }
-    }
-    let stbl = stbl.ok_or_else(|| SodaError::crypto("stbl box not found"))?;
-
-    let stsz = find_box(data, b"stsz", stbl.offset + 8, stbl.offset + stbl.size)
-        .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
-    let sample_sizes = parse_stsz(stsz.data);
-
-    let senc = find_box(data, b"senc", moov.offset + 8, moov.offset + moov.size)
-        .or_else(|| find_box(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
-        .ok_or_else(|| SodaError::crypto("senc box not found"))?;
-    let per_sample_iv_size = default_per_sample_iv_size(data, stbl.offset, stbl.offset + stbl.size);
-    let senc_samples = parse_senc(senc.data, per_sample_iv_size);
-
     let mdat = find_box(data, b"mdat", 0, data.len())
         .ok_or_else(|| SodaError::crypto("mdat box not found"))?;
-
-    let mut decrypted_data = data.to_vec();
-
-    let mut read_ptr = mdat.offset + 8;
-    // 防御：mdat 的长度同样来自文件头，不能直接拿来预分配 —— 以真实文件长度为上限。
-    let mdat_capacity = mdat.size.saturating_sub(8).min(data.len());
-    let mut decrypted_mdat: Vec<u8> = Vec::with_capacity(mdat_capacity);
-
-    for (index, size) in sample_sizes.iter().enumerate() {
-        let size = *size as usize;
-        if read_ptr + size > decrypted_data.len() {
-            break;
-        }
-        let chunk = &decrypted_data[read_ptr..read_ptr + size];
-
-        if let Some(sample) = senc_samples.get(index) {
-            let decrypted = decrypt_senc_sample(key_bytes, chunk, sample);
-            decrypted_mdat.extend_from_slice(&decrypted);
-        } else {
-            decrypted_mdat.extend_from_slice(chunk);
-        }
-        read_ptr += size;
-    }
-
-    if decrypted_mdat.len() == mdat.size - 8 {
-        let start = mdat.offset + 8;
-        decrypted_data[start..start + decrypted_mdat.len()].copy_from_slice(&decrypted_mdat);
-    } else {
+    // 整块路径同样要求声明的 mdat 载荷完整到位：只缺尾部填充也要报错，
+    // 不能和流式路径给出两种结果。
+    let mdat_end = mdat
+        .offset
+        .checked_add(mdat.size)
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    if mdat_end > data.len() {
         return Err(SodaError::crypto("decrypted size mismatch"));
     }
 
-    // 把 stsd 里的 `enca` 还原成原始编码格式（`frma` 指向的 4 字节）
-    if let Some(stsd) = find_box(data, b"stsd", stbl.offset + 8, stbl.offset + stbl.size) {
-        let start = stsd.offset;
-        let end = stsd.offset + stsd.size;
-        if let Some(index) = find_subslice(&decrypted_data[start..end], b"enca") {
-            let original = encrypted_sample_original_format(&decrypted_data[start..end]);
-            let target = start + index;
-            if target + 4 <= decrypted_data.len() {
-                decrypted_data[target..target + 4].copy_from_slice(&original);
-            }
+    let plan = plan_decryption(data, &moov, mdat.offset + 8, mdat.size.saturating_sub(8))?;
+
+    let mut decrypted_data = data.to_vec();
+    for sample in &plan.samples {
+        let Some(senc_sample) = plan.tracks[sample.track].senc.get(sample.index) else {
+            continue;
+        };
+        let end = sample
+            .offset
+            .checked_add(sample.size)
+            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        if end > decrypted_data.len() {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+        let plain =
+            decrypt_senc_sample(key_bytes, &decrypted_data[sample.offset..end], senc_sample);
+        decrypted_data[sample.offset..end].copy_from_slice(&plain);
+    }
+
+    // 把每条轨 stsd 里的 `enca` 还原成原始编码格式（`frma` 指向的 4 字节）
+    for track in &plan.tracks {
+        if let Some((start, end)) = track.stsd {
+            restore_original_format(&mut decrypted_data, start, end);
         }
     }
 
@@ -220,45 +224,19 @@ pub fn decrypt_stream<R: Read, W: Write>(
         return Ok(());
     }
 
-    // 3) 从前导 box 里解出样本表 / 初始化向量 / 编码改写
+    // 3) 从前导 box 里解出「每个样本在哪、用哪条轨的哪个 senc 样本解」
     let moov = find_box(&prefix, b"moov", 0, prefix.len())
         .ok_or_else(|| SodaError::crypto("moov box not found"))?;
-    let mut stbl = find_box(&prefix, b"stbl", moov.offset, moov.offset + moov.size);
-    if stbl.is_none() {
-        if let Some(trak) = find_box(&prefix, b"trak", moov.offset + 8, moov.offset + moov.size) {
-            if let Some(mdia) = find_box(&prefix, b"mdia", trak.offset + 8, trak.offset + trak.size)
-            {
-                if let Some(minf) =
-                    find_box(&prefix, b"minf", mdia.offset + 8, mdia.offset + mdia.size)
-                {
-                    stbl = find_box(&prefix, b"stbl", minf.offset + 8, minf.offset + minf.size);
-                }
-            }
-        }
-    }
-    let stbl = stbl.ok_or_else(|| SodaError::crypto("stbl box not found"))?;
-
-    let stsz = find_box(&prefix, b"stsz", stbl.offset + 8, stbl.offset + stbl.size)
-        .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
-    let sample_sizes = parse_stsz(stsz.data);
-
-    let senc = find_box(&prefix, b"senc", moov.offset + 8, moov.offset + moov.size)
-        .or_else(|| find_box(&prefix, b"senc", stbl.offset + 8, stbl.offset + stbl.size))
-        .ok_or_else(|| SodaError::crypto("senc box not found"))?;
-    let per_sample_iv_size =
-        default_per_sample_iv_size(&prefix, stbl.offset, stbl.offset + stbl.size);
-    let senc_samples = parse_senc(senc.data, per_sample_iv_size);
+    let mdat_payload_start = prefix
+        .len()
+        .checked_add(mdat_header.len())
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    let plan = plan_decryption(&prefix, &moov, mdat_payload_start, mdat_payload_len)?;
 
     // stsd 里的 `enca` 还原成 `frma` 指向的原始编码格式（与整块解密一致）
-    if let Some(stsd) = find_box(&prefix, b"stsd", stbl.offset + 8, stbl.offset + stbl.size) {
-        let start = stsd.offset;
-        let end = stsd.offset + stsd.size;
-        if let Some(index) = find_subslice(&prefix[start..end], b"enca") {
-            let original = encrypted_sample_original_format(&prefix[start..end]);
-            let target = start + index;
-            if target + 4 <= prefix.len() {
-                prefix[target..target + 4].copy_from_slice(&original);
-            }
+    for track in &plan.tracks {
+        if let Some((start, end)) = track.stsd {
+            restore_original_format(&mut prefix, start, end);
         }
     }
 
@@ -267,22 +245,16 @@ pub fn decrypt_stream<R: Read, W: Write>(
     out.write_all(&mdat_header)
         .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
 
-    // 4) 逐样本解密 mdat
-    let mut remaining = mdat_payload_len;
-    for (index, size) in sample_sizes.iter().enumerate() {
-        let size = *size as usize;
-        if size > remaining {
-            return Err(SodaError::crypto("decrypted size mismatch"));
-        }
-        let mut chunk = vec![0u8; size];
+    // 4) 逐样本解密 mdat。计划已经确认所有轨的样本按文件偏移刚好铺满载荷，
+    //    没有需要原样透传的间隙。
+    for sample in &plan.samples {
+        let mut chunk = vec![0u8; sample.size];
         input
             .read_exact(&mut chunk)
             .map_err(|err| SodaError::crypto(format!("read mdat failed: {err}")))?;
-        remaining -= size;
-
-        match senc_samples.get(index) {
-            Some(sample) => {
-                let plain = decrypt_senc_sample(key_bytes, &chunk, sample);
+        match plan.tracks[sample.track].senc.get(sample.index) {
+            Some(senc_sample) => {
+                let plain = decrypt_senc_sample(key_bytes, &chunk, senc_sample);
                 out.write_all(&plain)
                     .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
             }
@@ -290,11 +262,6 @@ pub fn decrypt_stream<R: Read, W: Write>(
                 .write_all(&chunk)
                 .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?,
         }
-    }
-
-    // 样本没覆盖满 mdat：与整块解密一样视为错误，避免写出半截文件
-    if remaining > 0 {
-        return Err(SodaError::crypto("decrypted size mismatch"));
     }
 
     // mdat 之后可能还有其它 box（如 udta / free），原样透传，保证输出与整块解密一致
@@ -310,6 +277,304 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
 ) -> Result<()> {
     let key_bytes = key_bytes_from_play_auth(play_auth)?;
     decrypt_stream(input, &key_bytes, out)
+}
+
+/// 按每条 `trak` 的样本表算出「`mdat` 里哪些字节是哪个样本」。
+///
+/// 有 `stsc` + `stco`/`co64` 时按真实偏移走（多轨文件的样本可以按轨交错排列）；
+/// 没有时退回老口径：按 `trak` 出现顺序把样本首尾相接铺进 `mdat`，并要求刚好铺满。
+/// 没有 `senc` 的轨（例如文字轨）不参与解密，它的样本仍然要在计划里占位，流式路径才能
+/// 按文件顺序把这段字节原样写出去。
+fn plan_decryption(
+    data: &[u8],
+    moov: &Mp4Box<'_>,
+    mdat_payload_start: usize,
+    mdat_payload_len: usize,
+) -> Result<DecryptPlan> {
+    let moov_end = (moov.offset + moov.size).min(data.len());
+    let mut tracks = Vec::new();
+    let mut pos = moov.offset + 8;
+    while let Some(trak) = find_box(data, b"trak", pos, moov_end) {
+        tracks.push(trak);
+        let next = trak.offset + trak.size;
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    if tracks.is_empty() {
+        return Err(SodaError::crypto("trak box not found"));
+    }
+
+    struct TrackData {
+        sizes: Vec<u32>,
+        senc: Vec<SencSample>,
+        stsd: Option<(usize, usize)>,
+        samples: Option<Vec<(usize, usize)>>,
+    }
+
+    let mut track_data = Vec::with_capacity(tracks.len());
+    let mut all_have_tables = true;
+    let mut any_senc = false;
+
+    for trak in &tracks {
+        let mdia = child_box(data, b"mdia", trak)
+            .ok_or_else(|| SodaError::crypto("mdia box not found"))?;
+        let minf = child_box(data, b"minf", &mdia)
+            .ok_or_else(|| SodaError::crypto("minf box not found"))?;
+        let stbl = child_box(data, b"stbl", &minf)
+            .ok_or_else(|| SodaError::crypto("stbl box not found"))?;
+
+        let stsz = child_box(data, b"stsz", &stbl)
+            .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
+        let sizes = parse_stsz(stsz.data);
+
+        let senc = child_box(data, b"senc", &stbl)
+            .or_else(|| find_box_deep(data, b"senc", stbl.offset + 8, stbl.offset + stbl.size));
+        let (senc_samples, has_senc) = match senc {
+            Some(senc) => {
+                let iv_size =
+                    default_per_sample_iv_size(data, stbl.offset, stbl.offset + stbl.size);
+                (parse_senc(senc.data, iv_size), true)
+            }
+            None => (Vec::new(), false),
+        };
+        any_senc |= has_senc;
+
+        let stsd = child_box(data, b"stsd", &stbl)
+            .map(|stsd| (stsd.offset, (stsd.offset + stsd.size).min(data.len())));
+
+        // 没有样本的轨不需要 chunk 表；有样本时才要求 stsc + stco/co64 齐全。
+        let table_samples = if sizes.is_empty() {
+            Some(Vec::new())
+        } else {
+            let chunks = child_box(data, b"co64", &stbl)
+                .map(|co64| parse_co64(co64.data))
+                .or_else(|| child_box(data, b"stco", &stbl).map(|stco| parse_stco(stco.data)));
+            let stsc = child_box(data, b"stsc", &stbl).map(|stsc| parse_stsc(stsc.data));
+            match (chunks.as_deref(), stsc.as_deref()) {
+                (Some(chunks), Some(stsc)) => table_sample_locations(&sizes, stsc, chunks),
+                _ => None,
+            }
+        };
+        if table_samples.is_none() {
+            all_have_tables = false;
+        }
+        track_data.push(TrackData {
+            sizes,
+            senc: senc_samples,
+            stsd,
+            samples: table_samples,
+        });
+    }
+
+    if !any_senc {
+        return Err(SodaError::crypto("senc box not found"));
+    }
+
+    let mut planned = Vec::new();
+    if all_have_tables {
+        for (track_index, track) in track_data.iter().enumerate() {
+            for (sample_index, (offset, size)) in track
+                .samples
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                planned.push(PlannedSample {
+                    offset: *offset,
+                    size: *size,
+                    track: track_index,
+                    index: sample_index,
+                });
+            }
+        }
+    } else {
+        // 老口径：所有轨按 trak 顺序首尾相接，样本必须刚好铺满 mdat。
+        let mdat_end = mdat_payload_start
+            .checked_add(mdat_payload_len)
+            .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+        let mut cursor = mdat_payload_start;
+        for (track_index, track) in track_data.iter().enumerate() {
+            for (sample_index, size) in track.sizes.iter().enumerate() {
+                let size = *size as usize;
+                planned.push(PlannedSample {
+                    offset: cursor,
+                    size,
+                    track: track_index,
+                    index: sample_index,
+                });
+                cursor = cursor
+                    .checked_add(size)
+                    .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+            }
+        }
+        if cursor != mdat_end {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+    }
+
+    planned.sort_unstable_by_key(|sample| sample.offset);
+    let mdat_end = mdat_payload_start
+        .checked_add(mdat_payload_len)
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    // 所有轨的样本合起来必须刚好铺满 mdat：中间留空就说明还有我们没认出来的数据
+    // （可能是密文），原样透传会写出不完整的文件，所以宁可报错。
+    let mut expected_offset = mdat_payload_start;
+    for sample in &planned {
+        if sample.size > MAX_SAMPLE_BYTES {
+            return Err(SodaError::crypto("sample size is unreasonably large"));
+        }
+        if sample.offset != expected_offset {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+        expected_offset = sample
+            .offset
+            .checked_add(sample.size)
+            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        if expected_offset > mdat_end {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+    }
+    if expected_offset != mdat_end {
+        return Err(SodaError::crypto("decrypted size mismatch"));
+    }
+
+    let tracks = track_data
+        .into_iter()
+        .map(|track| TrackPlan {
+            senc: track.senc,
+            stsd: track.stsd,
+        })
+        .collect();
+
+    Ok(DecryptPlan {
+        tracks,
+        samples: planned,
+    })
+}
+
+/// 取 `parent` 的直接子 box。起点是 `parent.offset + 8`，不能从 `parent.offset` 开始 ——
+/// 那样第一步读到的就是 `parent` 自己，`pos += size` 直接跳过整个父 box。
+fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<Mp4Box<'a>> {
+    find_box(data, kind, parent.offset + 8, parent.offset + parent.size)
+}
+
+/// 等价 `parseStsc`（只取解密需要的两个字段）。
+fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
+    if data.len() < 8 {
+        return Vec::new();
+    }
+    let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let available = data.len().saturating_sub(8) / 12;
+    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
+    data[8..]
+        .chunks_exact(12)
+        .take(count)
+        .map(|entry| StscEntry {
+            first_chunk: u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]),
+            samples_per_chunk: u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]),
+        })
+        .collect()
+}
+
+/// `stco`：32 位 chunk 偏移表。
+fn parse_stco(data: &[u8]) -> Vec<u64> {
+    if data.len() < 8 {
+        return Vec::new();
+    }
+    let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let available = data.len().saturating_sub(8) / 4;
+    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
+    data[8..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|entry| u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as u64)
+        .collect()
+}
+
+/// `co64`：64 位 chunk 偏移表。
+fn parse_co64(data: &[u8]) -> Vec<u64> {
+    if data.len() < 8 {
+        return Vec::new();
+    }
+    let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let available = data.len().saturating_sub(8) / 8;
+    let count = declared.min(available).min(MAX_SAMPLE_ENTRIES);
+    data[8..]
+        .chunks_exact(8)
+        .take(count)
+        .map(|entry| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(entry);
+            u64::from_be_bytes(bytes)
+        })
+        .collect()
+}
+
+/// 按 `stsc` 把每个 chunk 展开成样本，再用 `stco`/`co64` 的 chunk 偏移算出每个样本的绝对位置。
+///
+/// 表本身不自洽（样本数对不上、chunk 号越界、偏移溢出）时返回 `None`，由调用方退回老口径。
+fn table_sample_locations(
+    sizes: &[u32],
+    stsc: &[StscEntry],
+    chunks: &[u64],
+) -> Option<Vec<(usize, usize)>> {
+    if sizes.is_empty() || stsc.is_empty() || chunks.is_empty() {
+        return None;
+    }
+
+    let mut locations = Vec::with_capacity(sizes.len());
+    let mut sample_index = 0usize;
+    let mut entry_index = 0usize;
+    for (chunk_index, chunk_offset) in chunks.iter().enumerate() {
+        let chunk_number = chunk_index + 1;
+        while entry_index + 1 < stsc.len()
+            && stsc[entry_index + 1].first_chunk as usize <= chunk_number
+        {
+            entry_index += 1;
+        }
+        let entry = &stsc[entry_index];
+        if entry.first_chunk as usize > chunk_number || entry.samples_per_chunk == 0 {
+            return None;
+        }
+
+        let mut offset = usize::try_from(*chunk_offset).ok()?;
+        for _ in 0..entry.samples_per_chunk {
+            if sample_index >= sizes.len() {
+                break;
+            }
+            let size = sizes[sample_index] as usize;
+            locations.push((offset, size));
+            offset = offset.checked_add(size)?;
+            sample_index += 1;
+        }
+        if sample_index >= sizes.len() {
+            break;
+        }
+    }
+
+    if sample_index == sizes.len() {
+        Some(locations)
+    } else {
+        None
+    }
+}
+
+/// 把 `stsd` 里的 `enca` 还原成 `frma` 指向的原始编码格式。
+fn restore_original_format(data: &mut [u8], start: usize, end: usize) {
+    let end = end.min(data.len());
+    if start >= end {
+        return;
+    }
+    if let Some(index) = find_subslice(&data[start..end], b"enca") {
+        let original = encrypted_sample_original_format(&data[start..end]);
+        let target = start + index;
+        if target + 4 <= data.len() {
+            data[target..target + 4].copy_from_slice(&original);
+        }
+    }
 }
 
 /// 从 `play_auth` 还原出 16 字节 AES 密钥。

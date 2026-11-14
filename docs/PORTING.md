@@ -80,7 +80,7 @@
 | `soda_user_playlist_test.go`（需 Cookie） | `tests/network_tests.rs::user_playlists_online` |
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
-| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返 |
+| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返；票 #42 另补带文字轨的多轨 MP4（`stco` 与 `co64` 各走一遍，覆盖交错样本、文字轨透传、截断报错） |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
 | （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**#8 那一批不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口当时还是 `pub(crate)` —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以那批用例放在 `soda` 这一层的兄弟模块里，只能看见 `pub(crate)`。对外入口落地后（#9），`tests/` 那份由下一行补上 |
@@ -98,6 +98,14 @@
   音频流专用 Agent 使用建连 10s + 单次读取空闲 20s，不设整首下载总时限，
   避免慢 CDN 上的大体积无损文件被 30s 整体超时截断
   （见 [`sodahub-org/sodam#12`](https://github.com/sodahub-org/sodam/issues/12)）。
+
+* **多轨 MP4 解密（`crypto::{decrypt_audio_with_key, decrypt_stream}`，票 #42）**：上游只按第一条
+  `trak` 的 `stsz` 顺序解 `mdat`，遇到带 `text` 轨的曲目会把文字轨的 28 字节当成多余数据，
+  报 `decrypted size mismatch`。Rust 侧改为按每条 `trak` 的 `stsc` + `stco`/`co64` 算出每个样本
+  的真实偏移，逐样本解密；没有 `senc` 的轨（文字轨）原样透传。所有轨的样本合起来必须刚好
+  铺满 `mdat`，中间留空就报错，避免把没认出来的密文原样写出去。没有 `stsc`/`stco`/`co64`
+  的旧合成文件退回「按 `trak` 顺序首尾相接」的老口径，同样要求刚好铺满。两条路径
+  （整块 / 流式）共用同一份计划，输出逐字节一致。
 
 * **断点续传的判据（`soda::resume`，上游无对应）**：判断函数与 `Content-Range` 解析都只做
   纯计算，不碰网络与磁盘；`pub(crate)` 不对外，因为公开它等于对判断规则做出承诺

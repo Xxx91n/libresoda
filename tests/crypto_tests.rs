@@ -155,6 +155,222 @@ fn find_box_and_find_box_deep_locate_nested_boxes() {
 }
 
 // ---------------------------------------------------------------------------
+// 多轨文件素材：音频轨（加密）+ 文字轨（明文），带 stsc/stco/co64
+// ---------------------------------------------------------------------------
+
+/// 多轨素材里每个样本属于哪条轨（按 mdat 里的排列顺序）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureTrack {
+    Audio,
+    Text,
+}
+
+/// 构造一条轨的 `stbl`：`stsd` + `stsz` + `stsc` + `stco`（或 `co64`），加密轨再加 `senc`/`tenc`。
+///
+/// 素材里每个 chunk 只装一个样本，所以 `stsc` 固定写「从第 1 个 chunk 起、每 chunk 1 个样本」。
+fn track_stbl(
+    sample_sizes: &[u32],
+    senc_payload: Option<&[u8]>,
+    chunk_offsets: &[u64],
+    use_co64: bool,
+    encrypted: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+
+    let mut stsd_payload = vec![0u8; 4];
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+    if encrypted {
+        let frma = mp4_box(b"frma", b"mp4a");
+        let mut enca_payload = vec![0u8; 28];
+        enca_payload.extend_from_slice(&frma);
+        stsd_payload.extend_from_slice(&mp4_box(b"enca", &enca_payload));
+    } else {
+        stsd_payload.extend_from_slice(&mp4_box(b"tx3g", &[0u8; 8]));
+    }
+    payload.extend_from_slice(&mp4_box(b"stsd", &stsd_payload));
+
+    let mut stsz_payload = vec![0u8; 12];
+    stsz_payload[8..12].copy_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
+    for size in sample_sizes {
+        stsz_payload.extend_from_slice(&size.to_be_bytes());
+    }
+    payload.extend_from_slice(&mp4_box(b"stsz", &stsz_payload));
+
+    let mut stsc_payload = vec![0u8; 8];
+    stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+    payload.extend_from_slice(&mp4_box(b"stsc", &stsc_payload));
+
+    let mut chunk_payload = vec![0u8; 8];
+    chunk_payload[4..8].copy_from_slice(&(chunk_offsets.len() as u32).to_be_bytes());
+    if use_co64 {
+        for offset in chunk_offsets {
+            chunk_payload.extend_from_slice(&offset.to_be_bytes());
+        }
+        payload.extend_from_slice(&mp4_box(b"co64", &chunk_payload));
+    } else {
+        for offset in chunk_offsets {
+            chunk_payload.extend_from_slice(&(*offset as u32).to_be_bytes());
+        }
+        payload.extend_from_slice(&mp4_box(b"stco", &chunk_payload));
+    }
+
+    if let Some(senc_payload) = senc_payload {
+        payload.extend_from_slice(&mp4_box(b"senc", senc_payload));
+        let mut tenc_payload = vec![0u8; 8];
+        tenc_payload[7] = 8;
+        let tenc = mp4_box(b"tenc", &tenc_payload);
+        let schi = mp4_box(b"schi", &tenc);
+        let sinf = mp4_box(b"sinf", &schi);
+        payload.extend_from_slice(&sinf);
+    }
+
+    payload
+}
+
+/// 组装一个 `ftyp + moov(两条 trak) + mdat` 的文件。
+///
+/// `stco`/`co64` 里是绝对文件偏移，所以先拿占位偏移量出 `moov` 大小，再用真实偏移重建一遍。
+fn build_multitrack_mp4(
+    audio_sizes: &[u32],
+    audio_senc: &[u8],
+    text_sizes: &[u32],
+    layout: &[FixtureTrack],
+    mdat_payload: &[u8],
+    use_co64: bool,
+) -> Vec<u8> {
+    // 先算每个样本在 mdat 载荷里的相对偏移。
+    let mut audio_offsets = Vec::new();
+    let mut text_offsets = Vec::new();
+    let mut relative = 0usize;
+    let mut audio_index = 0usize;
+    let mut text_index = 0usize;
+    for track in layout {
+        match track {
+            FixtureTrack::Audio => {
+                audio_offsets.push(relative as u64);
+                relative += audio_sizes[audio_index] as usize;
+                audio_index += 1;
+            }
+            FixtureTrack::Text => {
+                text_offsets.push(relative as u64);
+                relative += text_sizes[text_index] as usize;
+                text_index += 1;
+            }
+        }
+    }
+    assert_eq!(audio_index, audio_sizes.len(), "布局要用完音频样本");
+    assert_eq!(text_index, text_sizes.len(), "布局要用完文字样本");
+    assert_eq!(relative, mdat_payload.len(), "布局要刚好铺满 mdat");
+
+    let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+    let build_moov = |audio_chunks: &[u64], text_chunks: &[u64]| -> Vec<u8> {
+        let audio_stbl = track_stbl(audio_sizes, Some(audio_senc), audio_chunks, use_co64, true);
+        let text_stbl = track_stbl(text_sizes, None, text_chunks, use_co64, false);
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&mp4_box(
+            b"trak",
+            &mp4_box(b"mdia", &mp4_box(b"minf", &audio_stbl)),
+        ));
+        moov_payload.extend_from_slice(&mp4_box(
+            b"trak",
+            &mp4_box(b"mdia", &mp4_box(b"minf", &text_stbl)),
+        ));
+        mp4_box(b"moov", &moov_payload)
+    };
+
+    let placeholder = build_moov(
+        &vec![0u64; audio_offsets.len()],
+        &vec![0u64; text_offsets.len()],
+    );
+    let mdat_start = (ftyp.len() + placeholder.len() + 8) as u64;
+    let audio_chunks: Vec<u64> = audio_offsets
+        .iter()
+        .map(|offset| mdat_start + *offset)
+        .collect();
+    let text_chunks: Vec<u64> = text_offsets
+        .iter()
+        .map(|offset| mdat_start + *offset)
+        .collect();
+    let moov = build_moov(&audio_chunks, &text_chunks);
+    assert_eq!(moov.len(), placeholder.len(), "改偏移不能改变 moov 大小");
+
+    let mut file = ftyp;
+    file.extend_from_slice(&moov);
+    file.extend_from_slice(&mp4_box(b"mdat", mdat_payload));
+    file
+}
+
+/// 返回（加密后的文件，期望的 mdat 明文载荷）。
+///
+/// 音频 3 个样本、文字 2 个样本按 `A1, T1, A2, T2, A3` 交错排列：
+/// 只按第一条轨的顺序读，会把文字样本当成音频，必须靠各自的 chunk 偏移取数。
+fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
+    let ivs: [[u8; 8]; 3] = [[11; 8], [12; 8], [13; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..64u8).collect(),
+        (0..96u8).map(|value| value.wrapping_mul(3)).collect(),
+        (0..48u8).map(|value| value.wrapping_add(9)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    let mut senc_payload = vec![0u8; 8];
+    senc_payload[4..8].copy_from_slice(&(ivs.len() as u32).to_be_bytes());
+    for iv in &ivs {
+        senc_payload.extend_from_slice(iv);
+    }
+
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'x'; 14], vec![b'y'; 14]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    let layout = [
+        FixtureTrack::Audio,
+        FixtureTrack::Text,
+        FixtureTrack::Audio,
+        FixtureTrack::Text,
+        FixtureTrack::Audio,
+    ];
+    let mut mdat_payload = Vec::new();
+    let mut expected = Vec::new();
+    let mut audio_index = 0usize;
+    let mut text_index = 0usize;
+    for track in layout {
+        match track {
+            FixtureTrack::Audio => {
+                let plain = &audio_plain[audio_index];
+                mdat_payload.extend_from_slice(&ctr_apply(plain, &ivs[audio_index]));
+                expected.extend_from_slice(plain);
+                audio_index += 1;
+            }
+            FixtureTrack::Text => {
+                let sample = &text_samples[text_index];
+                mdat_payload.extend_from_slice(sample);
+                expected.extend_from_slice(sample);
+                text_index += 1;
+            }
+        }
+    }
+
+    let file = build_multitrack_mp4(
+        &audio_sizes,
+        &senc_payload,
+        &text_sizes,
+        &layout,
+        &mdat_payload,
+        use_co64,
+    );
+    (file, expected)
+}
+
+// ---------------------------------------------------------------------------
 // 样本级解密
 // ---------------------------------------------------------------------------
 
@@ -232,6 +448,68 @@ fn decrypt_audio_with_key_restores_plaintext_samples() {
     let stsd = find_box_deep(&decrypted, b"stsd", 0, decrypted.len()).expect("stsd");
     assert!(!stsd.data.windows(4).any(|window| window == b"enca"));
     assert!(stsd.data.windows(4).any(|window| window == b"mp4a"));
+}
+
+/// 回归票 #42：带文字轨的曲目不能只按第一条轨的样本表解。
+///
+/// 音频样本与文字样本交错排列，必须按各自的 chunk 偏移取数；文字轨没有 `senc`，原样透传。
+/// `stco` 与 `co64` 两种 chunk 偏移表都要走一遍。
+#[test]
+fn decrypt_handles_text_track_with_chunk_offsets() {
+    for use_co64 in [false, true] {
+        let (file, expected) = multi_track_fixture(use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("带文字轨的文件应能整块解密");
+        let mdat = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
+        assert_eq!(mdat.data, expected.as_slice(), "use_co64={use_co64}");
+
+        let stsd = find_box_deep(&decrypted, b"stsd", 0, decrypted.len()).expect("stsd");
+        assert!(
+            !stsd.data.windows(4).any(|window| window == b"enca"),
+            "音频轨的 enca 应还原"
+        );
+        assert!(
+            stsd.data.windows(4).any(|window| window == b"mp4a"),
+            "音频轨应保留原始编码格式"
+        );
+
+        for step in [1usize, 3, 7, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 表格模式下的截断仍要报错，不能把半截文件当成功。
+#[test]
+fn decrypt_rejects_truncated_mdat_with_chunk_offsets() {
+    let (file, _) = multi_track_fixture(false);
+    let truncated = &file[..file.len() - 3];
+
+    assert!(
+        decrypt_audio_with_key(truncated, &KEY).is_err(),
+        "整块解密应拒绝截断的 mdat"
+    );
+
+    let mut input = Dribble {
+        data: truncated,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    assert!(
+        decrypt_stream(&mut input, &KEY, &mut out).is_err(),
+        "流式解密应拒绝截断的 mdat"
+    );
 }
 
 // ---------------------------------------------------------------------------
