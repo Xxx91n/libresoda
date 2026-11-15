@@ -444,8 +444,10 @@ fn senc_payload_for(ivs: &[[u8; 8]]) -> Vec<u8> {
     senc_payload
 }
 
-/// 单条音频轨的素材：5 个样本，一个 chunk 装 2 个。
+/// 单条音频轨的素材：5 个样本，前两块各装 2 个，最后一块装 1 个。
 ///
+/// 最后一块单独写一条 `(3, 1)` 记录，让 `stsc` 的声明数和实际样本数一致；
+/// 解码器本身也允许最后一块少装，另有 `table_sample_locations_allows_partial_last_chunk` 单测。
 /// `padding` 是 mdat 末尾故意多出来的字节（不属于任何样本）。
 fn single_track_fixture(padding: usize, use_co64: bool) -> (Vec<u8>, Vec<u8>) {
     let ivs: [[u8; 8]; 5] = [[31; 8], [32; 8], [33; 8], [34; 8], [35; 8]];
@@ -470,7 +472,7 @@ fn single_track_fixture(padding: usize, use_co64: bool) -> (Vec<u8>, Vec<u8>) {
     }
     mdat_payload.resize(mdat_payload.len() + padding, 0xEEu8);
 
-    let stsc = [(1u32, 2u32)];
+    let stsc = [(1u32, 2u32), (3u32, 1u32)];
     let track = TrackFixture {
         sizes: &audio_sizes,
         senc: Some(&senc_payload),
@@ -530,8 +532,8 @@ fn multi_track_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
 
 /// 真实汽水文件的常见形状：音频样本先连续排、文字样本跟在后面。
 ///
-/// 音频前两个 chunk 各装 1 个样本，之后每 chunk 装 2 个（最后一块只装 1 个）；
-/// 文字一个 chunk 装 2 个。这张表有多条 `stsc` 记录，chunk 内偏移要按样本大小累加。
+/// 音频前两个 chunk 各装 1 个样本，第三块装 2 个，最后一块装 1 个；文字一个 chunk 装 2 个。
+/// 最后一块也单独写一条 `(4, 1)` 记录，让声明数与实际样本数一致。
 fn multi_stsc_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
     let ivs: [[u8; 8]; 5] = [[21; 8], [22; 8], [23; 8], [24; 8], [25; 8]];
     let audio_plain: Vec<Vec<u8>> = vec![
@@ -565,7 +567,7 @@ fn multi_stsc_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
     let (mdat_payload, expected) =
         payload_and_plaintext(&audio_plain, &ivs, &text_samples, &layout);
 
-    let audio_stsc = [(1u32, 1u32), (3u32, 2u32)];
+    let audio_stsc = [(1u32, 1u32), (3u32, 2u32), (4u32, 1u32)];
     let text_stsc = [(1u32, 2u32)];
     let audio = TrackFixture {
         sizes: &audio_sizes,
