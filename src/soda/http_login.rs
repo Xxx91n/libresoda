@@ -381,18 +381,19 @@ fn verify_request(inner: &Arc<Inner>, body: &[u8]) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("GET")
         .to_ascii_uppercase();
-    let raw_url = spec
+    let url = spec
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
         .to_string();
-    // 校验和发送必须用同一个解析结果：这里是按 WHATWG 标准解析后的规范化地址，
-    // ureq 收到的也是它，不再出现「校验时看 A 主机、发出去到 B 主机」（票 #52）。
-    let url = match checked_verify_url(&raw_url) {
-        Ok(target) => target.as_str().to_string(),
-        Err(message) => return bridge_error(message),
-    };
+    // 原样转发页面给的地址：`a_bogus` 是对这个字符串算的，规范化（去默认端口、
+    // 重编码 query）会让签名对不上。安全性不靠改字符串，靠 `check_verify_target`
+    // 用 `url::Url::parse` 校验——ureq 2.12.1 发请求前用的也是同一个解析器，
+    // 校验看到的主机就是它将要连的主机（票 #52）。
+    if let Err(message) = check_verify_target(&url) {
+        return bridge_error(message);
+    }
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     if let Some(map) = spec.get("headers").and_then(Value::as_object) {
         for (name, value) in map {
@@ -596,15 +597,22 @@ fn json_str_field(body: &[u8], field: &str) -> String {
 /// 会被切成 `api.qishui.com` 放行，真实请求却发去 `collector.example`，登录 Cookie
 /// 跟着送出去（票 #52，CWE-918）。现在交给 `url` 按标准解析，再把原始 authority
 /// 里的 `@` 也查一遍，把 `https://@api.qishui.com/` 这种空 userinfo 一并拒掉。
-fn checked_verify_url(raw: &str) -> std::result::Result<Url, &'static str> {
-    let parsed = Url::parse(raw.trim()).map_err(|_| "验证请求地址无效")?;
+fn check_verify_target(raw: &str) -> std::result::Result<(), &'static str> {
+    let raw = raw.trim();
+    let Some((_, after_scheme)) = raw.split_once("://") else {
+        return Err("验证请求地址无效");
+    };
+    let parsed = Url::parse(raw).map_err(|_| "验证请求地址无效")?;
     if parsed.scheme() != "https" {
         return Err("验证请求目标不受支持");
     }
-    let has_userinfo = !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || raw_has_at_in_authority(raw);
-    if has_userinfo {
+    // 空 userinfo（`https://@host/`）解析后用户名是空串、密码是 None，
+    // 光看解析结果认不出来，所以原始 authority 里的 `@` 也要查。
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if !parsed.username().is_empty() || parsed.password().is_some() || authority.contains('@') {
         return Err("验证请求目标不受支持");
     }
     match parsed.host_str() {
@@ -613,20 +621,10 @@ fn checked_verify_url(raw: &str) -> std::result::Result<Url, &'static str> {
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(host)) =>
         {
-            Ok(parsed)
+            Ok(())
         }
         _ => Err("验证请求目标不受支持"),
     }
-}
-
-/// 原始字符串里 `://` 之后、路径/查询/片段之前那一段就是 authority。
-/// 只用来做「有没有 `@`」的否决，切得保守一点没关系：多拒总比漏放好。
-fn raw_has_at_in_authority(raw: &str) -> bool {
-    let Some((_, rest)) = raw.trim().split_once("://") else {
-        return true;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority.contains('@')
 }
 
 #[cfg(test)]
@@ -652,36 +650,45 @@ mod tests {
         .expect("验证请求应该能序列化")
     }
 
+    fn bridge_inner() -> Arc<Inner> {
+        Arc::new(Inner {
+            port: 0,
+            entries: Mutex::new(HashMap::from([("session".to_string(), bridge_entry())])),
+            jars: Mutex::new(HashMap::new()),
+        })
+    }
+
     #[test]
-    fn checked_url_allows_the_three_whitelisted_https_hosts() {
+    fn target_allows_the_three_whitelisted_https_hosts() {
         for url in [
             "https://api.qishui.com/luna/pc/me?aid=386088",
             "https://auth.zijieapi.com/passport/web/check_qrconnect/",
             "https://bff-pc.qishui.com/aweme/v1/web/",
             "https://API.QISHUI.COM/luna/pc/me",
         ] {
-            assert!(checked_verify_url(url).is_ok(), "{url} 应该放行");
+            assert!(check_verify_target(url).is_ok(), "{url} 应该放行");
         }
     }
 
     #[test]
-    fn checked_url_rejects_userinfo_bypass() {
+    fn target_rejects_userinfo_bypass() {
         for url in [
             // 票 #52 里能复现的绕过写法：url_host 切成 api.qishui.com，真实主机是 evil.example。
             "https://api.qishui.com:443@evil.example/",
             "https://api.qishui.com@evil.example/",
             "https://user:pass@api.qishui.com/luna/pc/me",
             "https://user@api.qishui.com/luna/pc/me",
-            // 空 userinfo 解析出来用户名是空串，只能靠原始 authority 里的 `@` 拒掉。
+            // 空 userinfo 解析出来用户名、密码都是空的，只能靠原始 authority 里的 `@` 拒掉。
             "https://@api.qishui.com/luna/pc/me",
+            "https://:@api.qishui.com/luna/pc/me",
             "https://:pass@api.qishui.com/luna/pc/me",
         ] {
-            assert!(checked_verify_url(url).is_err(), "{url} 应该拒绝");
+            assert!(check_verify_target(url).is_err(), "{url} 应该拒绝");
         }
     }
 
     #[test]
-    fn checked_url_rejects_plain_http_and_foreign_hosts() {
+    fn target_rejects_plain_http_and_foreign_hosts() {
         for url in [
             "http://api.qishui.com/luna/pc/me",
             "HTTP://api.qishui.com/luna/pc/me",
@@ -690,17 +697,13 @@ mod tests {
             "https://api.qishui.com.evil.example/",
             "not a url",
         ] {
-            assert!(checked_verify_url(url).is_err(), "{url} 应该拒绝");
+            assert!(check_verify_target(url).is_err(), "{url} 应该拒绝");
         }
     }
 
     #[test]
     fn verify_request_rejects_before_sending() {
-        let inner = Arc::new(Inner {
-            port: 0,
-            entries: Mutex::new(HashMap::from([("session".to_string(), bridge_entry())])),
-            jars: Mutex::new(HashMap::new()),
-        });
+        let inner = bridge_inner();
         for url in [
             "https://api.qishui.com:443@evil.example/",
             "http://api.qishui.com/luna/pc/me",
@@ -709,5 +712,12 @@ mod tests {
             assert_eq!(out["success"], json!(false), "{url} 应该被拒");
             assert_eq!(out["error"], json!("验证请求目标不受支持"), "{url}");
         }
+    }
+
+    #[test]
+    fn verify_request_rejects_empty_url() {
+        let out = verify_request(&bridge_inner(), &verify_body(""));
+        assert_eq!(out["success"], json!(false));
+        assert_eq!(out["error"], json!("验证请求地址无效"));
     }
 }
