@@ -104,6 +104,11 @@ pub trait BrowserRequester: Send + Sync {
     fn second_verify_done(&self, _token: &str) -> bool {
         false
     }
+    /// 二次验证过程中产生的 Cookie（HTTP 登录用；CDP 由浏览器上下文自管）。
+    /// `qr_login` 会在重发确认前把它们并入登录会话。
+    fn second_verify_cookies(&self, _token: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// 消费「已完成」标志（重发确认前调用，避免同一完成回执触发多次重发）。
     fn ack_second_verify(&self, _token: &str) -> Result<()> {
         Ok(())

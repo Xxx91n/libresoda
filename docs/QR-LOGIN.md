@@ -1,61 +1,61 @@
 # 汽水扫码登录（现状与实现）
 
-> 本文按**代码现状**整理（2026-09-15 核对）。移植进度与未移植清单见
+> 本文按**代码现状**整理（2026-11 更新；下半部分保留 2026-09 的 CDP/签名页历史记录）。移植进度与未移植清单见
 > [`PORTING.md`](PORTING.md)。
 
 ## 一句话现状
 
-* ✅ **能用的部分**：创建二维码 → 手机扫码 → 确认 → 拿到会话 Cookie。签名页已由
-  libresoda **内置 Rust CDP 实现**（`soda::cdp_signer`）：需要机器上有
-  Chrome/Chromium，**不再需要 Node**。纯 HTTP 直连护照接口会被一路 `error_code=7`
-  限流，且确认后的登录态只存在于签名页浏览器会话的 cookie jar 里。
-* ✅ **二次验证（`error_code=2046`）已闭环**：官方验证组件在用户浏览器打开的
-  `security_host.html` 里运行，网络请求经本地桥接路由回签名页上下文代发，
-  完成后自动带 `biz_params` 重发确认换取登录态（见下文「二次验证闭环」）。
-  纯 HTTP 短信直发（上游 Go 的 `send_code`/`validate_code` 路径）仍未移植，
-  属于可选的另一种实现。
+* ✅ **纯 HTTP 登录已闭环**：创建二维码 → 手机扫码 → 确认 → 拿到会话 Cookie。
+  登录请求由 libresoda 直接发出，**不需要 Chromium / CDP / Node**；二次验证
+  （`error_code=2046`）才打开系统默认浏览器里的本机验证页，见下文。
+* ✅ **二次验证（`error_code=2046`）已闭环**：官方验证组件在系统浏览器打开的
+  `security_host.html` 里运行，网络请求经本机桥接回 libresoda 代发，完成后自动
+  带 `biz_params` 重发确认换取登录态。
+* ⚠️ **设备身份必须持久化**：护照服务按 `device_id` 做风控，同一个身份持续使用
+  后才会补发 `odin_tt`；每次二维码换随机设备会被当成新设备，扫码后容易
+  `error_code=7`。sodam 把 `device_id/install_id` 存在自己的 `config.json`，
+  通过 `Soda::set_qr_device()` 注入；libresoda 独立使用时才回退到
+  `dirs::data_local_dir()/libresoda/passport-device.json`。
 
 ## 涉及的文件
 
 | 部分 | 文件 | 职责 |
 | --- | --- | --- |
-| 登录流程 | `src/soda/qr_login.rs` | 会话状态、公共参数、请求头、扫码 URL、状态机、Cookie 收集、二次验证决策登记与重发 |
-| 内置签名页（默认） | `src/soda/cdp_signer.rs` | Rust 直控 Chromium（CDP）：按二维码建独立上下文、本地资产+验证桥接服务、`a_bogus` 校验、按域名收割 cookie、空闲回收 |
-| 请求器抽象 | `src/soda/browser.rs` | `BrowserRequester` / `CommandRequester`（Node CLI 兼容路径） |
-| 签名提供者（可选） | `src/soda/signature.rs` | 补应用级 `X-Helios` / `X-Medusa`（`HttpSignature` / `CommandSignature` / `CapturedSignature`） |
-| 本地签名页（可选） | `tools/qishui-signer/` | Chromium + 官方 `bdms.js`，对外只暴露 `GET /health`、`POST /request` |
-| 纯 HTTP 工具 | `tools/qishui-qr.py` | 不依赖 Node / Chromium 的 Python 驱动（`create` / `check`） |
+| 登录流程 | `src/soda/qr_login.rs` | 会话状态、公共参数、请求头、扫码 URL、状态机、Cookie 收集、二次验证决策登记与重发、设备身份类型 |
+| 纯 HTTP 登录器 | `src/soda/http_login.rs` | 直接发 passport 请求、持有 Cookie jar、本机验证页资产服务与 `/verify/*` 桥接、系统浏览器拉起 |
+| 请求器抽象 | `src/soda/browser.rs` | `BrowserRequester`；HTTP 登录实现不再依赖浏览器上下文 |
+| 二次验证资产 | `tools/qishui-signer/security/security_host.html` | 官方验证组件页面 + 本机桥接客户端 |
+| 签名提供者（可选） | `src/soda/signature.rs` | 补应用级 `X-Helios` / `X-Medusa`（与登录设备身份无关） |
 
-## 请求是怎么发出去的（三级回退）
+## 请求是怎么发出去的
 
-逻辑在 `qr_login::request_passport`，按顺序判断：
+`qr_login::request_passport` 只做一件事：如果有 `browser_requester`（sodam 启用
+`enable_http_login()` 后是 `HttpLogin`），就把请求交给它；否则直接走 HTTP。
 
-1. 设了 `browser_requester` → 默认是内置 `CdpSigner`（`soda.enable_cdp_signer()`），
-   Rust 直接说 CDP 驱动 Chromium，页面里官方 `bdms.js` 补 `a_bogus`；
-   也兼容 `CommandRequester` 起 `tools/qishui-signer/sign-cli.mjs`（旧 Node 路径）；
-2. 否则**直连 HTTP，不带任何签名**。
+`HttpLogin` 的行为：
+
+1. 用 `ureq` 直接请求 `api.qishui.com`，Cookie 由本进程的 `QrSession` / jar 维护；
+2. 二维码会话里的 `device_id/install_id` 来自宿主注入的持久身份；
+3. 遇到 `2046` 时把决策登记到本机验证页，用户在系统浏览器完成验证，页面请求经
+   `POST http://127.0.0.1:<port>/verify/request` 代发；
+4. 完成回执后，`check_qrconnect` 带原始 `is_frontier` 与验证产生的 Cookie 重发。
 
 **不再注入 `signature_provider` 的 `X-Helios`/`X-Medusa`**：那两个头由 libmssdk 按
 另一套设备指纹生成，套到护照请求上反而与二维码会话的 `device_id` 冲突（实测）。
 
-`CdpSigner` 是**进程级单例**：浏览器、资产服务、二次验证登记表全进程共享，
-调用方每次轮询重建 `Soda` 也不会反复拉起 Chromium；无会话且空闲 5 分钟时自动
-关闭浏览器（下次请求重新拉起）。
-
-所以：**扫码登录目前依赖签名页**（Chromium）。第 2 条路径只在服务端当前不
-强制校验 `a_bogus` 且没触发限流时可用，属于碰运气，不要依赖。
+> 下文 2026-09 的 CDP / 签名页记录保留作历史对照；当前默认路径已改为上面的纯 HTTP。
 
 ## 会话与状态机
 
 | 项 | 现状 |
 | --- | --- |
-| 会话字段 | `token`、随机 `device_id`(16 位)、`install_id`(15 位)、`msToken`(88B base64url)、`verify_portrait_id`(`uuid.login`)、累积 `cookie`、时间戳 |
+| 会话字段 | `token`、宿主注入的持久 `device_id`(16 位)/`install_id`(15 位)、`msToken`(88B base64url)、`verify_portrait_id`(`uuid.login`)、累积 `cookie`、`is_frontier`、时间戳 |
 | 存储 | 进程内 `Mutex<HashMap>` + 可选的 `SODA_QR_STATE` 文件（支持「先 create、后 check」两段式跨进程） |
 | TTL / 频率 | 会话 3 分钟；同一 token 最小轮询间隔 2.5 秒；限流冷却 5 秒 |
 | 创建 | `POST /passport/web/get_qrcode/`，带 JS-SDK 公共参数 + `x-tt-passport-verify-portrait` / `x-tt-passport-trace-id`，POST 带 `x-ss-stub = MD5(body)` 大写 |
 | 二维码内容 | **服务端下发的 `qrcode_index_url` 原样**（`official_scan_url()`），形如 `https://bff-pc.qishui.com/ucenter_web/app/sdk-next?...&token=..&uc_sdk=scan-auth` |
 | 轮询 | `POST /passport/web/check_qrconnect/`：`new` / `scanned` / `confirmed`；`error_code=7` 当**临时限流**（冷却后继续，不判失败）；`2`/`expired` 才是过期 |
-| 成功 | 确认后跟一跳 `redirect_url`，把**签名页会话**里的 Cookie 引到本地会话，要求至少含 `sessionid` / `sessionid_ss` / `sid_guard` / `sid_tt`，然后写回 `Soda`（`set_cookie`）并返回 `QRLoginResult` |
+| 成功 | 确认后跟一跳 `redirect_url`，把登录会话 Cookie 并入本地 jar，要求至少含 `sessionid` / `sessionid_ss` / `sid_guard` / `sid_tt`，然后写回 `Soda`（`set_cookie`）并返回 `QRLoginResult` |
 | 确认判定 | 只认服务端状态（`status=3/confirmed/success`、`logged_in`、响应体 `session_cookie`）。**不能**用「本地已有 sessionid」判：老版签名页的 jar 是共享的，会把上一次登录误判成本次成功 |
 
 ## 实测结论（2026-09-15，手机真机扫码）

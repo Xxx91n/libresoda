@@ -20,8 +20,8 @@ pub mod account;
 pub mod album;
 pub mod artist;
 pub mod browser;
-#[cfg(feature = "cdp-signer")]
-pub mod cdp_signer;
+// 纯 HTTP 登录 + 本机二次验证宿主（不依赖 Chromium/CDP）。
+pub(crate) mod http_login;
 // 外部子进程执行器：签名器与请求器共用，只给这两个模块用（docs/PORTING.md）。
 pub(crate) mod child;
 pub mod collection;
@@ -77,6 +77,9 @@ pub struct Soda {
     signature: Mutex<Option<Arc<dyn signature::SignatureProvider>>>,
     browser: Mutex<Option<Arc<dyn browser::BrowserRequester>>>,
     app_credentials: Mutex<Option<signature::AppCredentials>>,
+    /// 扫码登录用的设备身份（device_id / install_id）。由宿主应用持有并持久化，
+    /// 未设置时 `qr_login` 才回退到库自己的文件存储。
+    qr_device: Mutex<Option<qr_login::QrDevice>>,
 }
 
 impl std::fmt::Debug for Soda {
@@ -123,6 +126,7 @@ impl Soda {
             signature: Mutex::new(None),
             browser: Mutex::new(None),
             app_credentials: Mutex::new(None),
+            qr_device: Mutex::new(None),
         }
     }
 
@@ -182,13 +186,12 @@ impl Soda {
         self.browser.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// 启用内置 CDP 签名页（Rust 直控 Chromium，不需要 Node）。
+    /// 启用纯 HTTP 登录：登录请求由本进程直接发出，Cookie 由本进程持有；
+    /// 遇到二次验证（2046）时用系统默认浏览器打开本机验证页，网络请求经本进程桥接。
     ///
-    /// 浏览器在第一次登录请求时才懒启动；每个二维码一个独立 `BrowserContext`。
-    /// 没装 Chrome/Chromium 时会返回错误，可用 `QISHUI_CHROMIUM_PATH` 指定路径。
-    #[cfg(feature = "cdp-signer")]
-    pub fn enable_cdp_signer(&self) {
-        self.set_browser_requester(Arc::new(cdp_signer::CdpSigner::new()));
+    /// 不依赖 Chromium/CDP，也不需要用户安装任何浏览器。
+    pub fn enable_http_login(&self) {
+        self.set_browser_requester(Arc::new(http_login::HttpLogin::new()));
     }
 
     /// 设置签名提供者（`msToken` / `a_bogus` / `bd-ticket-guard-*`）。
@@ -236,6 +239,27 @@ impl Soda {
         if let Ok(mut cache) = self.is_vip_cache.lock() {
             *cache = Some(value);
         }
+    }
+
+    /// 设置扫码登录用的持久设备身份。
+    ///
+    /// 由宿主应用（sodam）从自己的配置里传入；libresoda 不再替应用决定这份身份
+    /// 存在哪里。身份无效（长度/字符不对）时返回错误，调用方应重新生成。
+    pub fn set_qr_device(&self, device: qr_login::QrDevice) -> crate::Result<()> {
+        if !device.is_valid() {
+            return Err(crate::error::SodaError::invalid_input(
+                "扫码登录设备身份格式无效（device_id 16 位、install_id 15 位数字）",
+            ));
+        }
+        if let Ok(mut slot) = self.qr_device.lock() {
+            *slot = Some(device);
+        }
+        Ok(())
+    }
+
+    /// 当前宿主注入的扫码登录设备身份；未注入时为 `None`。
+    pub fn qr_device(&self) -> Option<qr_login::QrDevice> {
+        self.qr_device.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// 设置音质档位偏好（客户端 gear key）：`best`/`auto`/空 = 永远选最优，

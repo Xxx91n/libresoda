@@ -333,44 +333,15 @@ pub fn now_millis() -> i64 {
 
 /// 用系统默认浏览器打开一个地址（扫码二次验证窗口用）。
 ///
-/// * macOS：`open`
-/// * Windows：`cmd /C start "" <url>`（`start` 会把第一个带引号的参数当窗口标题，
-///   所以先传一个空标题，防止 URL 被吞）
-/// * 其他（Linux/BSD）：`xdg-open`
-///
-/// 只负责「拉起」，不等待页面加载；返回错误时调用方可提示用户手动复制地址。
+/// 交给跨平台 crate `open`：Windows 走系统默认处理程序，macOS 用 `open`，
+/// Linux/BSD 用 `xdg-open`。只负责「拉起」，不等待页面加载；返回错误时调用方
+/// 可提示用户手动复制地址。
 pub fn open_system_browser(url: &str) -> std::io::Result<()> {
-    use std::process::Command;
-
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    let status = command.status()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "打开浏览器失败（exit={}）",
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_default()
-        )));
-    }
-    Ok(())
+    // 跨平台交给 `open`：Windows 用系统默认处理程序（内部走 PowerShell +
+    // OPEN_RS_TARGET 环境变量，URL 里的 `&` 不会被 shell 拆开），macOS 用 `open`，
+    // Linux 用 xdg-open。之前自己拼 `cmd /C start` 在带 `&bridgeRoot=/verify`
+    // 的验证页地址上出过两次事故，不再维护平台分支。
+    open::that(url)
 }
 
 /// 生成一个 v4 UUID 字符串（客户端在 `sug_search_id` 等场景用）。

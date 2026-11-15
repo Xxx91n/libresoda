@@ -3,9 +3,10 @@
 //!
 //! 复刻要点（全部来自参考实现，规格见 `~/Work/soda-sourcemap/docs/METING-QR-LOGIN-SPEC.md`）：
 //!
-//! 1. 每个二维码一份会话：随机 `device_id`(16 位数字)、`install_id`(15 位)、
+//! 1. 每个二维码一份会话：**持久化**的 `device_id`(16 位数字) / `install_id`(15 位)
+//!    由宿主应用注入（libresoda 只提供 [`QrDevice`] 和独立使用时的文件回退），
 //!    `msToken`(88 字节 base64url + `==`)、`verify_portrait_id`(`<uuid>.login`)、
-//!    每请求随机的 `biz_trace_id`(8 hex)；
+//!    每请求随机的 `biz_trace_id`(8 hex) 仍然按会话生成；
 //! 2. 请求带完整 JS-SDK 公共参数 + `x-tt-passport-verify-portrait` /
 //!    `x-tt-passport-trace-id`；POST 另带 `x-ss-stub = MD5(body).toUpperCase()`；
 //! 3. **二维码内容必须是服务端下发的 `qrcode_index_url` 原样**（`ucenter_web/app/
@@ -38,7 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 const API_BASE: &str = "https://api.qishui.com";
 const AID: &str = "386088";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) SodaMusic/3.2.1 Chrome/136.0.7103.59 Electron/36.4.0 Safari/537.36";
+const USER_AGENT: &str = "LunaPC/3.0.0(290101097)";
 const SESSION_TTL_MS: i64 = 3 * 60 * 1000;
 const MIN_CHECK_INTERVAL_MS: i64 = 2_500;
 /// 服务端限流（`error_code=7`）后的冷却时间。
@@ -82,6 +83,10 @@ pub struct QrSession {
     /// 渲染官方组件，完成后重发确认时也要回带其中的 `biz_params`。
     #[serde(default)]
     pub second_verify: Option<Value>,
+    /// `get_qrcode` 返回的 `is_frontier`；`check_qrconnect` 必须原样回传。
+    /// lane128 的实现用 `String(qr.is_frontier === true)`，硬编码 `true` 会让服务端判成异常会话。
+    #[serde(default)]
+    pub is_frontier: bool,
 }
 
 /// 会话持久化路径：设置 `SODA_QR_STATE` 后，创建与轮询可以分两次进程完成。
@@ -281,6 +286,81 @@ fn base64_url_no_pad(data: &[u8]) -> String {
     out
 }
 
+/// 持久化的登录设备身份。
+///
+/// 汽水 passport 会按 `device_id` 做风控：同一个设备身份持续使用后，服务端才会补发
+/// `odin_tt`；每次二维码都换随机设备会被当成新设备，`check_qrconnect` 容易被限流成
+/// `error_code=7`。参考实现（lane128/MyGO）也是把 deviceID/installID 存在配置里复用，
+/// 宿主应用未注入时，回退落到 `dirs::data_local_dir()/libresoda/passport-device.json`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QrDevice {
+    pub device_id: String,
+    pub install_id: String,
+}
+
+impl QrDevice {
+    /// 生成一份新的登录设备身份（16 位 / 15 位数字，首位非 0）。
+    pub fn generate() -> Self {
+        let mut rng = Rng::new();
+        Self {
+            device_id: rng.digits(16),
+            install_id: rng.digits(15),
+        }
+    }
+
+    /// 服务端接受的基本形态：纯数字且长度正确。
+    pub fn is_valid(&self) -> bool {
+        self.device_id.len() == 16
+            && self.device_id.bytes().all(|byte| byte.is_ascii_digit())
+            && self.install_id.len() == 15
+            && self.install_id.bytes().all(|byte| byte.is_ascii_digit())
+    }
+}
+
+fn device_profile_path() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("libresoda").join("passport-device.json"))
+}
+
+/// 读取宿主未注入时使用的持久身份（库自己的文件）。
+///
+/// sodam 在升级时会用它做一次性迁移：把旧文件里的设备身份搬进 `config.json`，
+/// 之后所有二维码都由 sodam 显式注入，不再读这个文件。
+pub fn load_persisted_device() -> Option<QrDevice> {
+    let path = device_profile_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let device = serde_json::from_str::<QrDevice>(&text).ok()?;
+    device.is_valid().then_some(device)
+}
+
+fn save_persisted_device(device: &QrDevice) {
+    let Some(path) = device_profile_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(device) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+fn load_or_create_device_profile() -> QrDevice {
+    static PROFILE: OnceLock<QrDevice> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            if let Some(device) = load_persisted_device() {
+                return device;
+            }
+            let device = QrDevice::generate();
+            save_persisted_device(&device);
+            device
+        })
+        .clone()
+}
+
 /// 参考实现用 8 位随机 hex 作为 `biz_trace_id`。
 fn random_biz_trace_id() -> String {
     let mut rng = Rng::new();
@@ -414,7 +494,7 @@ fn merge_cookies(current: &str, values: &[String]) -> String {
         }
     };
     for raw in std::iter::once(current.to_string()).chain(values.iter().cloned()) {
-        for part in raw.split([';', ',']) {
+        for part in raw.split(';') {
             let Some((name, rest)) = part.split_once('=') else {
                 continue;
             };
@@ -464,7 +544,6 @@ fn request_passport(
         params.set(*key, *value);
     }
     let url = build_url(path, &params);
-
     let body = body_values.map(|values| values.encode());
     let mut options = crate::http::RequestOption::new()
         .header("Accept", "application/json, text/javascript")
@@ -621,12 +700,15 @@ pub struct QrCreateResult {
 pub fn create_qr(soda: &Soda) -> Result<QrCreateResult> {
     cleanup_sessions();
     let mut rng = Rng::new();
+    let device_profile = soda
+        .qr_device()
+        .unwrap_or_else(load_or_create_device_profile);
     let mut session = QrSession {
         token: String::new(),
         // 每个二维码一个独立浏览器上下文（对齐 Meting-API 的 sessionKey）
         session_key: format!("qr-{}", rng.hex(16)),
-        device_id: rng.digits(16),
-        install_id: rng.digits(15),
+        device_id: device_profile.device_id.clone(),
+        install_id: device_profile.install_id.clone(),
         ms_token: random_ms_token(),
         verify_portrait_id: format!("{}.login", rng.uuid()),
         cookie: String::new(),
@@ -635,6 +717,7 @@ pub fn create_qr(soda: &Soda) -> Result<QrCreateResult> {
         cooldown_until_ms: 0,
         last_result: None,
         second_verify: None,
+        is_frontier: false,
     };
 
     let payload = request_passport(
@@ -698,6 +781,10 @@ pub fn create_qr(soda: &Soda) -> Result<QrCreateResult> {
         .unwrap_or_default()
         .to_string();
     let scan_url = official_scan_url(&index_url)?;
+    session.is_frontier = data
+        .get("is_frontier")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     session_save(&session);
     save_state(&session);
 
@@ -774,7 +861,10 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
     let mut body = Params::new();
     body.set("need_logo", "false");
     body.set("need_short_url", "false");
-    body.set("is_frontier", "true");
+    body.set(
+        "is_frontier",
+        if session.is_frontier { "true" } else { "false" },
+    );
     body.set("token", token);
     body.set("is_new_login", "1");
     body.set("next", API_BASE);
@@ -1133,13 +1223,21 @@ fn complete_second_verify(
     // 先消费「完成」回执：无论重发结果如何，都要等窗口下一次回执才重发，
     // 避免同一完成事件触发多次重发把会话拖进限流。
     if let Some(requester) = soda.browser_requester() {
+        // 验证页里的请求可能刷新了 Cookie（HTTP 登录时由本进程代发）；重发确认前并入会话。
+        let pairs = requester.second_verify_cookies(token);
+        if !pairs.is_empty() {
+            session.cookie = merge_cookies(&session.cookie, &pairs);
+        }
         let _ = requester.ack_second_verify(token);
     }
     let decision = session.second_verify.clone().unwrap_or(Value::Null);
     let mut body = Params::new();
     body.set("need_logo", "false");
     body.set("need_short_url", "false");
-    body.set("is_frontier", "true");
+    body.set(
+        "is_frontier",
+        if session.is_frontier { "true" } else { "false" },
+    );
     body.set("token", token);
     body.set("is_new_login", "1");
     body.set("next", API_BASE);
@@ -1236,9 +1334,9 @@ impl Soda {
     /// 仅在 `check_qr` 返回 `need_second_verify` 后有效；地址里的 token 是
     /// 能力凭证，随二维码会话过期自动失效。
     pub fn second_verify_url(&self, token: &str) -> Result<String> {
-        let requester = self
-            .browser_requester()
-            .ok_or_else(|| SodaError::http("未启用签名页，无法进行二次验证（需要 CDP 签名页）"))?;
+        let requester = self.browser_requester().ok_or_else(|| {
+            SodaError::http("未启用登录验证页，无法进行二次验证（请重新发起登录）")
+        })?;
         requester.second_verify_url(token)
     }
 
@@ -1247,9 +1345,9 @@ impl Soda {
     /// 首选在签名页浏览器里开**可见窗口**（同一上下文：cookie/本地 bdms/
     /// 禁用同源策略全部对齐）；签名服务不支持时退回「地址 + 系统浏览器」。
     pub fn open_second_verify(&self, token: &str) -> Result<String> {
-        let requester = self
-            .browser_requester()
-            .ok_or_else(|| SodaError::http("未启用签名页，无法进行二次验证（需要 CDP 签名页）"))?;
+        let requester = self.browser_requester().ok_or_else(|| {
+            SodaError::http("未启用登录验证页，无法进行二次验证（请重新发起登录）")
+        })?;
         match requester.open_second_verify_window(token) {
             Ok(url) => Ok(url),
             Err(window_error) => {
@@ -1262,6 +1360,27 @@ impl Soda {
                 Ok(url)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod qr_device_tests {
+    use super::QrDevice;
+
+    #[test]
+    fn generated_device_is_valid_and_stable_shape() {
+        let device = QrDevice::generate();
+        assert!(device.is_valid());
+        assert_eq!(device.device_id.len(), 16);
+        assert_eq!(device.install_id.len(), 15);
+        assert!(!device.device_id.starts_with('0'));
+    }
+
+    #[test]
+    fn invalid_device_is_rejected() {
+        let mut device = QrDevice::generate();
+        device.install_id.pop();
+        assert!(!device.is_valid());
     }
 }
 
@@ -1313,6 +1432,7 @@ mod rng_tests {
             ms_token: random_ms_token(),
             verify_portrait_id: "uuid.login".to_string(),
             cookie: "sessionid_ss=x".to_string(),
+            is_frontier: false,
             created_ms: 1,
             last_check_ms: 2,
             cooldown_until_ms: 3,
