@@ -333,6 +333,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "url",
  "windows-sys 0.61.2",
 ]
 
