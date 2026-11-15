@@ -141,6 +141,89 @@ fn decrypt_rejects_impossible_fixed_sample_count_quickly() {
     );
 }
 
+/// 定长 `stsz` box：`sample_size` 非 0 时，`sample_count` 条都按这个尺寸算。
+///
+/// 调用方拿 `sample_count` 锚定 `crypto.rs` 里的上限：4M 是旧上限、1M 是计划上限，
+/// 更小的值用于放行用例。
+fn stsz_fixed_box(sample_size: u32, sample_count: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; 12];
+    payload[4..8].copy_from_slice(&sample_size.to_be_bytes());
+    payload[8..12].copy_from_slice(&sample_count.to_be_bytes());
+    mp4_box(b"stsz", &payload)
+}
+
+/// 把一段 `stbl` 载荷包成完整 `trak`（`stbl` → `minf` → `mdia` → `trak`）。
+fn trak_with_stbl_payload(stbl_payload: &[u8]) -> Vec<u8> {
+    let stbl = mp4_box(b"stbl", stbl_payload);
+    let minf = mp4_box(b"minf", &stbl);
+    let mdia = mp4_box(b"mdia", &minf);
+    mp4_box(b"trak", &mdia)
+}
+
+/// 把 `moov` 载荷包成 `moov`，后面接一段全零 `mdat`。
+fn moov_plus_zero_mdat(moov_payload: &[u8], mdat_len: usize) -> Vec<u8> {
+    let mut file = mp4_box(b"moov", moov_payload);
+    let mdat_payload = vec![0u8; mdat_len];
+    file.extend_from_slice(&mp4_box(b"mdat", &mdat_payload));
+    file
+}
+
+/// 票 #44：定长 `stsz` 声明 4M 样本（等于旧上限，旧口径会放行），即使 mdat
+/// 字节数够，也必须在计划阶段的更低硬上限处拒绝，而不是先展开几百 MB 元数据。
+#[test]
+fn decrypt_rejects_4m_samples_at_plan_cap() {
+    let trak = trak_with_stbl_payload(&stsz_fixed_box(1, 4 * 1024 * 1024));
+    // mdat 给够 4MB：没有新上限时字节数校验会放行，接着展开位置表/计划表。
+    let file = moov_plus_zero_mdat(&trak, 4 * 1024 * 1024);
+
+    let started = std::time::Instant::now();
+    let err = decrypt_audio_with_key(&file, &KEY).unwrap_err();
+    // 这句话只有 `parse_stsz_limited` 在分配尺寸表之前会报，锁死拒绝点。
+    assert_eq!(err.to_string(), "sample table is unreasonably large");
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "不能先按 4M 声明展开元数据再拒绝"
+    );
+}
+
+/// 票 #44：两条轨各声明 60 万样本（单轨都不超 1M），合计 120 万超过计划上限时，
+/// 第二条轨必须在剩余预算处拒绝。
+#[test]
+fn decrypt_rejects_cumulative_samples_over_plan_cap() {
+    let mut moov_payload = trak_with_stbl_payload(&stsz_fixed_box(1, 600_000));
+    moov_payload.extend_from_slice(&trak_with_stbl_payload(&stsz_fixed_box(1, 600_000)));
+    let file = moov_plus_zero_mdat(&moov_payload, 1_200_000);
+
+    let err = decrypt_audio_with_key(&file, &KEY).unwrap_err();
+    assert_eq!(err.to_string(), "sample table is unreasonably large");
+}
+
+/// 票 #44：十万级样本要能正常过计划和解密，防止上限收紧后误伤正常文件。
+///
+/// 定长 1 字节 × 10 万样本刚好铺满 `mdat`；没有 `stsc`/`stco` 时走首尾相接兜底，
+/// `senc` 与样本一一对应（每条 8 字节 IV）。
+#[test]
+fn decrypt_accepts_100k_samples_under_plan_cap() {
+    let mut stbl_payload = stsz_fixed_box(1, 100_000);
+    let mut senc_payload = vec![0u8; 8];
+    senc_payload[4..8].copy_from_slice(&100_000u32.to_be_bytes());
+    senc_payload.resize(8 + 100_000 * 8, 0);
+    stbl_payload.extend_from_slice(&mp4_box(b"senc", &senc_payload));
+    let trak = trak_with_stbl_payload(&stbl_payload);
+    let file = moov_plus_zero_mdat(&trak, 100_000);
+
+    let out = decrypt_audio_with_key(&file, &KEY).unwrap();
+    assert_eq!(out.len(), file.len(), "解密输出应与输入等长");
+    // 每条样本 1 字节、IV 全零，解出来每个字节都等于同一段 keystream 的首字节。
+    // 逐字节比对，任何一条样本被跳过（保持密文 0）都会露馅。
+    let keystream = ctr_apply(&[0u8; 1], &[0u8; 8]);
+    let payload = &out[out.len() - 100_000..];
+    assert!(
+        payload.iter().all(|byte| *byte == keystream[0]),
+        "十万样本都应逐条解密"
+    );
+}
+
 #[test]
 fn parse_senc_reads_ivs_and_subsamples() {
     let mut senc = vec![0u8; 8 + 8 + 2 + 6];
