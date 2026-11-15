@@ -19,6 +19,9 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+# 验证桥接的白名单校验要按 URL 标准解析地址再比主机（票 #52，防 userinfo 绕过）。
+# url 2.5.8 本来就是 ureq 的传递依赖、已锁在 Cargo.lock 里，升为直接依赖不改已锁版本。
+url = "2"
 aes = "0.8"
 ctr = "0.9"
 base64 = "0.22"

@@ -104,7 +104,9 @@ Meting-API `signer.js` 的做法，每个二维码一个独立 `BrowserContext`�
 约束与注意：
 
 * token 就是能力凭证：`get_qrcode` 随机下发、随会话过期失效，桥接服务只监听
-  127.0.0.1，代发目标另有域名白名单；
+  127.0.0.1，代发目标另有域名白名单；地址按 URL 标准解析，只认 https，
+  带 userinfo（`user@host`、`@host`）的一律拒绝，不然 Cookie 会被寄去别家
+  （票 #52 的 `https://api.qishui.com:443@evil.example/` 绕过）；
 * 验证窗口优先开在**签名页浏览器**（headed）：同上下文意味着 cookie、本地
   `bdms.js`、`--disable-web-security` 全部就位。系统浏览器方案存在两道缝：
   页面只接管了 XHR（组件用 `fetch` 的请求会直撞 CORS），bdms 也只能从 CDN 拉。
