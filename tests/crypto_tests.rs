@@ -828,6 +828,25 @@ fn decrypt_rejects_invalid_sample_table() {
     assert!(err.to_string().contains("invalid sample table"), "{err}");
 }
 
+/// `stco` 声明 4 个偏移、实际只有 3 个：不能截成 3 个当完整表。
+#[test]
+fn decrypt_rejects_truncated_sample_table_count() {
+    let (mut file, _) = single_track_fixture(0, false);
+    let stco_offset = find_box_deep(&file, b"stco", 0, file.len())
+        .expect("stco")
+        .offset;
+    let count_offset = stco_offset + 12; // 8 字节 box 头 + 4 字节 version/flags
+    let count = u32::from_be_bytes(
+        file[count_offset..count_offset + 4]
+            .try_into()
+            .expect("count bytes"),
+    );
+    file[count_offset..count_offset + 4].copy_from_slice(&(count + 1).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("stco 声明数大于实际条目应报错");
+    assert!(err.to_string().contains("invalid sample table"), "{err}");
+}
+
 /// moov 里一条 trak 都没有：明确报出来，不 panic。
 #[test]
 fn decrypt_rejects_moov_without_trak() {

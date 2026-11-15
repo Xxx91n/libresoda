@@ -317,6 +317,10 @@ fn plan_decryption(
 
     let mut track_data = Vec::with_capacity(tracks.len());
     let mut any_senc = false;
+    // 所有轨合计的样本数与字节数。单轨已受 MAX_SAMPLE_ENTRIES 限制，合计再用同一个值
+    // 兜住，防止很多条轨各自声明几百万样本，把位置表放大到几 GiB。
+    let mut total_samples = 0usize;
+    let mut total_sample_bytes = 0usize;
     // 老代码先在整个 moov 里找直接的 `senc` 子 box；标准布局不在那里，但保留这条兜底，
     // 只给第一条轨用，免得把别的轨也当成加密轨。
     let moov_level_senc = find_box(data, b"senc", moov.offset + 8, moov_end);
@@ -331,12 +335,19 @@ fn plan_decryption(
 
         let stsz = child_box(data, b"stsz", &stbl)
             .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
-        let sizes = parse_stsz(stsz.data);
-        // 样本数不可能超过 mdat 的字节数（每个样本至少占 1 字节）。固定长 `stsz`
-        // 的声明值只受 MAX_SAMPLE_ENTRIES 约束，这里先用载荷长度兜住，
-        // 免得一个很小的文件先把位置表按几百万条分配出来。
-        let max_samples = mdat_payload_len.clamp(1, MAX_SAMPLE_ENTRIES);
-        if sizes.len() > max_samples {
+        // 先按剩余预算夹紧再分配：声明值超过合计上限时直接拒绝，不先建一个几百万条的 Vec。
+        let remaining_samples = MAX_SAMPLE_ENTRIES.saturating_sub(total_samples);
+        let sizes = parse_stsz_limited(stsz.data, remaining_samples)
+            .ok_or_else(|| SodaError::crypto("sample table is unreasonably large"))?;
+        total_samples += sizes.len();
+        let track_bytes = sizes
+            .iter()
+            .try_fold(0usize, |sum, size| sum.checked_add(*size as usize))
+            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        total_sample_bytes = total_sample_bytes
+            .checked_add(track_bytes)
+            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        if total_sample_bytes > mdat_payload_len {
             return Err(SodaError::crypto("decrypted size mismatch"));
         }
 
@@ -351,7 +362,8 @@ fn plan_decryption(
             Some(senc) => {
                 let iv_size =
                     default_per_sample_iv_size(data, stbl.offset, stbl.offset + stbl.size);
-                (parse_senc(senc.data, iv_size), true)
+                // 只需要本轨样本数那么多条解密记录；多出来的条目不解。
+                (parse_senc_limited(senc.data, iv_size, sizes.len()), true)
             }
             None => (Vec::new(), false),
         };
@@ -373,10 +385,25 @@ fn plan_decryption(
             let co64 = child_box(data, b"co64", &stbl);
             let stco = child_box(data, b"stco", &stbl);
             let stsc = child_box(data, b"stsc", &stbl);
-            let chunks = co64
-                .map(|co64| parse_co64(co64.data))
-                .or_else(|| stco.map(|stco| parse_stco(stco.data)));
-            let stsc = stsc.map(|stsc| parse_stsc(stsc.data));
+            // 声明条目数大于实际可读条目数时，解析函数返回 `None`；不能把它截短后当完整表。
+            let chunks = match (co64, stco) {
+                (Some(co64), _) => Some(
+                    parse_co64(co64.data)
+                        .ok_or_else(|| SodaError::crypto("invalid sample table"))?,
+                ),
+                (None, Some(stco)) => Some(
+                    parse_stco(stco.data)
+                        .ok_or_else(|| SodaError::crypto("invalid sample table"))?,
+                ),
+                (None, None) => None,
+            };
+            let stsc = match stsc {
+                Some(stsc) => Some(
+                    parse_stsc(stsc.data)
+                        .ok_or_else(|| SodaError::crypto("invalid sample table"))?,
+                ),
+                None => None,
+            };
             match (chunks, stsc) {
                 (None, None) => None,
                 (Some(chunks), Some(stsc)) => Some(
@@ -497,74 +524,87 @@ fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<
     find_box(data, kind, parent.offset + 8, parent.offset + parent.size)
 }
 
-/// 表类 box 的公共头：版本/标志后跟条目数，按实际可读条目与硬上限夹紧。
+/// 表类 box 的公共头：版本/标志后跟条目数。
 ///
-/// 上游没有这个夹紧辅助；票 #42 新增。
-fn table_entry_count(data: &[u8], entry_size: usize) -> usize {
+/// 声明条目数超过实际可读条目数或硬上限时返回 `None`；调用方按损坏文件报错，
+/// 不能把截短后的表当成完整表。
+///
+/// 上游没有这个辅助；票 #42 新增。
+fn table_entry_count(data: &[u8], entry_size: usize) -> Option<usize> {
     if data.len() < 8 {
-        return 0;
+        return Some(0);
     }
     let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let available = data.len().saturating_sub(8) / entry_size;
-    declared.min(available).min(MAX_SAMPLE_ENTRIES)
+    if declared > available || declared > MAX_SAMPLE_ENTRIES {
+        return None;
+    }
+    Some(declared)
 }
 
 /// 读 `stsc`（sample-to-chunk）表，只取解密需要的两个字段。
 ///
 /// 上游没有对应的独立函数；票 #42 多轨修复新增。
-fn parse_stsc(data: &[u8]) -> Vec<StscEntry> {
-    let count = table_entry_count(data, 12);
+fn parse_stsc(data: &[u8]) -> Option<Vec<StscEntry>> {
+    let count = table_entry_count(data, 12)?;
     if count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    data[8..]
-        .chunks(12)
-        .take(count)
-        .map(|entry| StscEntry {
-            first_chunk: u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]),
-            samples_per_chunk: u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]),
-        })
-        .collect()
+    Some(
+        data[8..]
+            .chunks(12)
+            .take(count)
+            .map(|entry| StscEntry {
+                first_chunk: u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]),
+                samples_per_chunk: u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]),
+            })
+            .collect(),
+    )
 }
 
 /// `stco`：32 位 chunk 偏移表。
 ///
 /// 上游没有对应的独立函数；票 #42 新增。
-fn parse_stco(data: &[u8]) -> Vec<u64> {
-    let count = table_entry_count(data, 4);
+fn parse_stco(data: &[u8]) -> Option<Vec<u64>> {
+    let count = table_entry_count(data, 4)?;
     if count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    data[8..]
-        .chunks(4)
-        .take(count)
-        .map(|entry| u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as u64)
-        .collect()
+    Some(
+        data[8..]
+            .chunks(4)
+            .take(count)
+            .map(|entry| u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as u64)
+            .collect(),
+    )
 }
 
 /// `co64`：64 位 chunk 偏移表。
 ///
 /// 上游没有对应的独立函数；票 #42 新增。
-fn parse_co64(data: &[u8]) -> Vec<u64> {
-    let count = table_entry_count(data, 8);
+fn parse_co64(data: &[u8]) -> Option<Vec<u64>> {
+    let count = table_entry_count(data, 8)?;
     if count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    data[8..]
-        .chunks(8)
-        .take(count)
-        .map(|entry| {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(entry);
-            u64::from_be_bytes(bytes)
-        })
-        .collect()
+    Some(
+        data[8..]
+            .chunks(8)
+            .take(count)
+            .map(|entry| {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(entry);
+                u64::from_be_bytes(bytes)
+            })
+            .collect(),
+    )
 }
 
 /// 按 `stsc` 把每个 chunk 展开成样本，再用 `stco`/`co64` 的 chunk 偏移算出每个样本的绝对位置。
 ///
-/// 表本身不自洽（样本数对不上、chunk 号越界、偏移溢出）时返回 `None`，
-/// 由调用方按损坏文件报错，不再猜测样本位置。
+/// 表本身不自洽（样本数对不上、chunk 号越界、偏移溢出、样本已经铺满但后面还有
+/// chunk）时返回 `None`，由调用方按损坏文件报错，不再猜测样本位置。
+/// 最后一个 chunk 可以只装一部分样本，这是合法形状。
 ///
 /// 上游没有对应的展开逻辑；票 #42 新增。
 fn table_sample_locations(
@@ -602,6 +642,10 @@ fn table_sample_locations(
             sample_index += 1;
         }
         if sample_index >= sizes.len() {
+            // 最后一个 chunk 可以只装一部分样本；后面要是还有 chunk，样本数就对不上。
+            if chunk_index + 1 < chunks.len() {
+                return None;
+            }
             break;
         }
     }
@@ -820,22 +864,36 @@ pub fn box_child_start(box_type: &[u8], offset: usize, header_size: usize) -> Op
     }
 }
 
-/// 等价 `parseStsz`。
-pub fn parse_stsz(data: &[u8]) -> Vec<u32> {
+/// 读 `stsz` 头部：定长样本大小与声明条目数。
+///
+/// `parse_stsz` 的内部拆分；上游没有独立函数。
+fn stsz_header(data: &[u8]) -> Option<(usize, usize)> {
     if data.len() < 12 {
-        return Vec::new();
+        return None;
     }
-    let sample_size_fixed = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let declared_count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    // 防御：不信任头部声明的条目数。
-    // * 变长样本：按"实际可读条目数"（12 + n*4 <= data.len()）取上限；
-    // * 定长样本：没有额外数据可校验，用硬上限兜底（此时不会读取尺寸表）。
-    let sample_count = if sample_size_fixed != 0 {
-        declared_count.min(MAX_SAMPLE_ENTRIES)
+    Some((
+        u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize,
+        u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize,
+    ))
+}
+
+/// `stsz` 实际能读到的条目数。
+///
+/// 变长样本按"实际可读条目数"（12 + n*4 <= data.len()）夹紧；定长样本没有额外
+/// 数据可校验，只能让调用方套硬上限。`parse_stsz` 的内部拆分；上游没有独立函数。
+fn stsz_effective_count(data: &[u8], sample_size_fixed: usize, declared_count: usize) -> usize {
+    if sample_size_fixed != 0 {
+        declared_count
     } else {
         let available = data.len().saturating_sub(12) / 4;
-        declared_count.min(available).min(MAX_SAMPLE_ENTRIES)
-    };
+        declared_count.min(available)
+    }
+}
+
+/// 按已经夹紧的条目数读出样本大小。
+///
+/// `parse_stsz` 的内部拆分；上游没有独立函数。
+fn parse_stsz_entries(data: &[u8], sample_size_fixed: usize, sample_count: usize) -> Vec<u32> {
     let mut sizes = vec![0u32; sample_count];
     if sample_size_fixed != 0 {
         for slot in sizes.iter_mut() {
@@ -857,8 +915,37 @@ pub fn parse_stsz(data: &[u8]) -> Vec<u32> {
     sizes
 }
 
+/// 等价 `parseStsz`。
+pub fn parse_stsz(data: &[u8]) -> Vec<u32> {
+    let Some((sample_size_fixed, declared_count)) = stsz_header(data) else {
+        return Vec::new();
+    };
+    let effective = stsz_effective_count(data, sample_size_fixed, declared_count);
+    let sample_count = effective.min(MAX_SAMPLE_ENTRIES);
+    parse_stsz_entries(data, sample_size_fixed, sample_count)
+}
+
+/// `parse_stsz` 的限额版本：实际条目数超过 `max_samples` 时返回 `None`，
+/// 让调用方在分配位置表之前拒绝。上游没有限额版本；票 #42 新增。
+fn parse_stsz_limited(data: &[u8], max_samples: usize) -> Option<Vec<u32>> {
+    let Some((sample_size_fixed, declared_count)) = stsz_header(data) else {
+        return Some(Vec::new());
+    };
+    let effective = stsz_effective_count(data, sample_size_fixed, declared_count);
+    if effective > max_samples.min(MAX_SAMPLE_ENTRIES) {
+        return None;
+    }
+    Some(parse_stsz_entries(data, sample_size_fixed, effective))
+}
+
 /// 等价 `parseSenc`。
 pub fn parse_senc(data: &[u8], iv_size: usize) -> Vec<SencSample> {
+    parse_senc_limited(data, iv_size, MAX_SAMPLE_ENTRIES)
+}
+
+/// `parse_senc` 的限额版本：最多只读 `max_samples` 条记录。
+/// 上游没有限额版本；票 #42 新增。
+fn parse_senc_limited(data: &[u8], iv_size: usize, max_samples: usize) -> Vec<SencSample> {
     if data.len() < 8 {
         return Vec::new();
     }
@@ -874,7 +961,10 @@ pub fn parse_senc(data: &[u8], iv_size: usize) -> Vec<SencSample> {
     // 据此把声明值夹到实际数据能容纳的范围内，再套硬上限。
     let per_sample = if has_subsamples { iv_size + 2 } else { iv_size };
     let max_by_data = data.len().saturating_sub(8) / per_sample.max(1);
-    let sample_count = declared_count.min(max_by_data).min(MAX_SAMPLE_ENTRIES);
+    let sample_count = declared_count
+        .min(max_by_data)
+        .min(max_samples)
+        .min(MAX_SAMPLE_ENTRIES);
 
     let mut samples = Vec::with_capacity(sample_count);
     let mut ptr = 8usize;
@@ -996,4 +1086,49 @@ pub fn hex_decode(value: &str) -> Option<Vec<u8>> {
         out.push((high * 16 + low) as u8);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最后一个 chunk 比 `samples_per_chunk` 少是合法形状，不能因此报错。
+    #[test]
+    fn table_sample_locations_allows_partial_last_chunk() {
+        let sizes = [16u32];
+        let stsc = [StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 2,
+        }];
+        let chunks = [100u64];
+        assert_eq!(
+            table_sample_locations(&sizes, &stsc, &chunks),
+            Some(vec![(100, 16)])
+        );
+    }
+
+    /// 样本已经铺满，后面还挂着 chunk 偏移：表不自洽，应拒绝。
+    #[test]
+    fn table_sample_locations_rejects_extra_chunks() {
+        let sizes = [16u32];
+        let stsc = [StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 1,
+        }];
+        let chunks = [100u64, 200];
+        assert_eq!(table_sample_locations(&sizes, &stsc, &chunks), None);
+    }
+
+    /// 定长 `stsz` 的声明条目数超过剩余预算时，必须在分配尺寸表之前拒绝。
+    #[test]
+    fn parse_stsz_limited_rejects_over_budget() {
+        let mut data = vec![0u8; 12];
+        data[4..8].copy_from_slice(&1u32.to_be_bytes());
+        data[8..12].copy_from_slice(&100u32.to_be_bytes());
+        assert!(parse_stsz_limited(&data, 16).is_none());
+        assert_eq!(
+            parse_stsz_limited(&data, 100).map(|sizes| sizes.len()),
+            Some(100)
+        );
+    }
 }
