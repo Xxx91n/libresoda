@@ -598,20 +598,13 @@ fn json_str_field(body: &[u8], field: &str) -> String {
 /// 通过后返回解析结果，调用方拿它的规范化字符串去发请求，校验和发送是同一个地址。
 fn check_verify_target(raw: &str) -> std::result::Result<Url, &'static str> {
     let raw = raw.trim();
-    let Some((_, after_scheme)) = raw.split_once("://") else {
-        return Err("验证请求地址无效");
-    };
     let parsed = Url::parse(raw).map_err(|_| "验证请求地址无效")?;
     if parsed.scheme() != "https" {
         return Err("验证请求目标不受支持");
     }
     // 空 userinfo（`https://@host/`）解析后用户名是空串、密码是 None，
     // 光看解析结果认不出来，所以原始 authority 里的 `@` 也要查。
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    if !parsed.username().is_empty() || parsed.password().is_some() || authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() || raw_url_has_userinfo(raw) {
         return Err("验证请求目标不受支持");
     }
     match parsed.host_str() {
@@ -624,6 +617,27 @@ fn check_verify_target(raw: &str) -> std::result::Result<Url, &'static str> {
         }
         _ => Err("验证请求目标不受支持"),
     }
+}
+
+/// 原始串里有没有「authority 段带 `@`」（含空 userinfo）。
+///
+/// 按 URL 标准定位 authority：`scheme:` 之后先跳过任意个 `/` 和 `\`，
+/// 再取到下一个 `/`、`\`、`?`、`#` 为止；tab/换行按标准先删掉。
+/// 这样 `https:////@host/`、`https:\@host/` 这类多斜杠写法不会让空 userinfo
+/// 从扫描里溜过去（CodeRabbit 对 PR #7 的审计）。定位不出来就当可疑，返回 true。
+fn raw_url_has_userinfo(raw: &str) -> bool {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let Some((_, rest)) = cleaned.split_once(':') else {
+        return true;
+    };
+    rest.trim_start_matches(['/', '\\'])
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .contains('@')
 }
 
 #[cfg(test)]
@@ -681,6 +695,12 @@ mod tests {
             "https://@api.qishui.com/luna/pc/me",
             "https://:@api.qishui.com/luna/pc/me",
             "https://:pass@api.qishui.com/luna/pc/me",
+            // 多写斜杠/反斜杠、夹 tab：解析器会跳过它们并丢掉空 userinfo，
+            // authority 扫描也要按同样的规则跳（CodeRabbit 对 PR #7 的审计）。
+            "https:////@api.qishui.com/",
+            "https:/@api.qishui.com/",
+            "https:\\@api.qishui.com/",
+            "https:\t//@api.qishui.com/",
         ] {
             assert!(check_verify_target(url).is_err(), "{url} 应该拒绝");
         }
@@ -706,6 +726,7 @@ mod tests {
         for url in [
             "https://api.qishui.com:443@evil.example/",
             "http://api.qishui.com/luna/pc/me",
+            "https:////@api.qishui.com/",
         ] {
             let out = verify_request(&inner, &verify_body(url));
             assert_eq!(out["success"], json!(false), "{url} 应该被拒");
