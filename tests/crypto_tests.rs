@@ -584,6 +584,914 @@ fn multi_stsc_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>) {
 }
 
 // ---------------------------------------------------------------------------
+// 多 mdat 文件（票 #45）：样本按绝对偏移分散在多个顶层 mdat 里
+// ---------------------------------------------------------------------------
+
+/// 多 mdat 夹具的选项。
+struct MdatFixtureOptions<'a> {
+    /// 相邻 mdat 之间原样插入的字节（比如 free box）。
+    between: &'a [u8],
+    /// 把 moov 挪到所有 mdat 之后。
+    moov_last: bool,
+    /// mdat 用 64 位加长头（size 字段为 1，后跟 u64 实际长度）。
+    large_size: bool,
+    use_co64: bool,
+}
+
+/// 64 位加长头的 mdat：size 字段写 1，后跟 u64 实际长度。
+fn mp4_box_largesize(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + payload.len());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 组装 `ftyp + moov(两条 trak) + mdat + mdat + …` 的文件。
+///
+/// `layout` 里每个样本标明属于哪条轨、落在第几个 mdat。
+/// 偏移同样是先占位、再按真实位置重建。
+fn build_multi_mdat_mp4(
+    audio: &TrackFixture<'_>,
+    text: &TrackFixture<'_>,
+    layout: &[(FixtureTrack, usize)],
+    mdat_payloads: &[&[u8]],
+    opts: &MdatFixtureOptions<'_>,
+) -> Vec<u8> {
+    let mut audio_pos: Vec<(usize, u64)> = Vec::new();
+    let mut text_pos: Vec<(usize, u64)> = Vec::new();
+    let mut relatives = vec![0usize; mdat_payloads.len()];
+    let mut audio_index = 0usize;
+    let mut text_index = 0usize;
+    for &(track, mdat) in layout {
+        let relative = relatives[mdat] as u64;
+        match track {
+            FixtureTrack::Audio => {
+                audio_pos.push((mdat, relative));
+                relatives[mdat] += audio.sizes[audio_index] as usize;
+                audio_index += 1;
+            }
+            FixtureTrack::Text => {
+                text_pos.push((mdat, relative));
+                relatives[mdat] += text.sizes[text_index] as usize;
+                text_index += 1;
+            }
+        }
+    }
+    assert_eq!(audio_index, audio.sizes.len(), "布局要用完音频样本");
+    assert_eq!(text_index, text.sizes.len(), "布局要用完文字样本");
+    for (mdat, payload) in mdat_payloads.iter().enumerate() {
+        assert_eq!(
+            relatives[mdat],
+            payload.len(),
+            "布局要刚好铺满第 {mdat} 个 mdat"
+        );
+    }
+
+    // chunk 分组只跟样本顺序有关：拿样本序号当占位偏移，取出每块第一个样本的序号。
+    let audio_indices: Vec<u64> = (0..audio_pos.len() as u64).collect();
+    let text_indices: Vec<u64> = (0..text_pos.len() as u64).collect();
+    let audio_starts = track_chunk_offsets(&audio_indices, audio.stsc);
+    let text_starts = track_chunk_offsets(&text_indices, text.stsc);
+
+    let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+    let build_moov = |audio_chunks: &[u64], text_chunks: &[u64]| -> Vec<u8> {
+        let audio_stbl = track_stbl(audio, audio_chunks, opts.use_co64);
+        let text_stbl = track_stbl(text, text_chunks, opts.use_co64);
+        let mut moov_payload = Vec::new();
+        moov_payload.extend_from_slice(&mp4_box(
+            b"trak",
+            &mp4_box(b"mdia", &mp4_box(b"minf", &audio_stbl)),
+        ));
+        moov_payload.extend_from_slice(&mp4_box(
+            b"trak",
+            &mp4_box(b"mdia", &mp4_box(b"minf", &text_stbl)),
+        ));
+        mp4_box(b"moov", &moov_payload)
+    };
+
+    let placeholder = build_moov(
+        &vec![0u64; audio_starts.len()],
+        &vec![0u64; text_starts.len()],
+    );
+    let header_len = if opts.large_size { 16u64 } else { 8u64 };
+    let mut starts = Vec::with_capacity(mdat_payloads.len());
+    let mut next = if opts.moov_last {
+        ftyp.len() as u64 + header_len
+    } else {
+        (ftyp.len() + placeholder.len()) as u64 + header_len
+    };
+    for payload in mdat_payloads {
+        starts.push(next);
+        next += payload.len() as u64 + header_len + opts.between.len() as u64;
+    }
+    let audio_chunks: Vec<u64> = audio_starts
+        .iter()
+        .map(|&index| {
+            let (mdat, relative) = audio_pos[index as usize];
+            starts[mdat] + relative
+        })
+        .collect();
+    let text_chunks: Vec<u64> = text_starts
+        .iter()
+        .map(|&index| {
+            let (mdat, relative) = text_pos[index as usize];
+            starts[mdat] + relative
+        })
+        .collect();
+    let moov = build_moov(&audio_chunks, &text_chunks);
+    assert_eq!(moov.len(), placeholder.len(), "改偏移不能改变 moov 大小");
+
+    let mut file = ftyp;
+    if !opts.moov_last {
+        file.extend_from_slice(&moov);
+    }
+    for (index, payload) in mdat_payloads.iter().enumerate() {
+        if index > 0 {
+            file.extend_from_slice(opts.between);
+        }
+        if opts.large_size {
+            file.extend_from_slice(&mp4_box_largesize(b"mdat", payload));
+        } else {
+            file.extend_from_slice(&mp4_box(b"mdat", payload));
+        }
+    }
+    if opts.moov_last {
+        file.extend_from_slice(&moov);
+    }
+    file
+}
+
+/// 票 #45 验收素材：音频 3 个样本全在第一个 mdat（前两块各装 2 个、最后一块装 1 个），
+/// 文字 2 个样本在第二个 mdat（同一个 chunk）。
+/// 返回（文件, 第一个 mdat 的明文, 第二个 mdat 的明文）。
+fn two_mdat_fixture(
+    use_co64: bool,
+    between: &[u8],
+    moov_last: bool,
+    large_size: bool,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let ivs: [[u8; 8]; 3] = [[51; 8], [52; 8], [53; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..64u8).collect(),
+        (0..96u8).map(|value| value.wrapping_mul(3)).collect(),
+        (0..48u8).map(|value| value.wrapping_add(9)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'x'; 14], vec![b'y'; 14]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    let mut first = Vec::new();
+    let mut expected_first = Vec::new();
+    for (index, plain) in audio_plain.iter().enumerate() {
+        first.extend_from_slice(&ctr_apply(plain, &ivs[index]));
+        expected_first.extend_from_slice(plain);
+    }
+    let second: Vec<u8> = text_samples.concat();
+
+    let layout = [
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Text, 1),
+        (FixtureTrack::Text, 1),
+    ];
+    // 音频前两个样本一个 chunk、最后一个单独一块；文字两个样本同一个 chunk
+    let audio_stsc = [(1u32, 2u32), (3u32, 1u32)];
+    let text_stsc = [(1u32, 2u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+    };
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+    };
+    let opts = MdatFixtureOptions {
+        between,
+        moov_last,
+        large_size,
+        use_co64,
+    };
+    let file = build_multi_mdat_mp4(
+        &audio,
+        &text,
+        &layout,
+        &[first.as_slice(), second.as_slice()],
+        &opts,
+    );
+    (file, expected_first, second)
+}
+
+/// 同一条音频轨的样本拆在两个 mdat 里，文字轨插进第二个 mdat：
+/// 布局 A1→mdat0, T1→mdat1, A2→mdat1, A3→mdat0, T2→mdat1。
+fn split_track_two_mdat_fixture(use_co64: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let ivs: [[u8; 8]; 3] = [[61; 8], [62; 8], [63; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..32u8).collect(),
+        (0..48u8).map(|value| value.wrapping_mul(5)).collect(),
+        (0..64u8).map(|value| value.wrapping_add(3)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'm'; 10], vec![b'n'; 10]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    // 第一个 mdat = A1 + A3；第二个 mdat = T1 + A2 + T2
+    let mut first = ctr_apply(&audio_plain[0], &ivs[0]);
+    first.extend_from_slice(&ctr_apply(&audio_plain[2], &ivs[2]));
+    let mut expected_first = audio_plain[0].clone();
+    expected_first.extend_from_slice(&audio_plain[2]);
+
+    let mut second = text_samples[0].clone();
+    second.extend_from_slice(&ctr_apply(&audio_plain[1], &ivs[1]));
+    second.extend_from_slice(&text_samples[1]);
+    let mut expected_second = text_samples[0].clone();
+    expected_second.extend_from_slice(&audio_plain[1]);
+    expected_second.extend_from_slice(&text_samples[1]);
+
+    let layout = [
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Text, 1),
+        (FixtureTrack::Audio, 1),
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Text, 1),
+    ];
+    let audio_stsc = [(1u32, 1u32)];
+    let text_stsc = [(1u32, 1u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+    };
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+    };
+    let opts = MdatFixtureOptions {
+        between: &[],
+        moov_last: false,
+        large_size: false,
+        use_co64,
+    };
+    let file = build_multi_mdat_mp4(
+        &audio,
+        &text,
+        &layout,
+        &[first.as_slice(), second.as_slice()],
+        &opts,
+    );
+    (file, expected_first, expected_second)
+}
+
+/// 三个 mdat：音频跨第一、第三个，文字全在第二个。
+/// 布局 A1→mdat0, T1→mdat1, A2→mdat2, A3→mdat0, T2→mdat1。
+/// 返回（文件, 每个 mdat 的明文）。
+fn three_mdat_fixture(use_co64: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let ivs: [[u8; 8]; 3] = [[71; 8], [72; 8], [73; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![
+        (0..40u8).collect(),
+        (0..56u8).map(|value| value.wrapping_mul(7)).collect(),
+        (0..24u8).map(|value| value.wrapping_add(5)).collect(),
+    ];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+    let text_samples: Vec<Vec<u8>> = vec![vec![b'p'; 12], vec![b'q'; 12]];
+    let text_sizes: Vec<u32> = text_samples
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+
+    // 第一个 mdat = A1 + A3；第二个 = T1 + T2；第三个 = A2
+    let mut first = ctr_apply(&audio_plain[0], &ivs[0]);
+    first.extend_from_slice(&ctr_apply(&audio_plain[2], &ivs[2]));
+    let mut expected_first = audio_plain[0].clone();
+    expected_first.extend_from_slice(&audio_plain[2]);
+    let second: Vec<u8> = text_samples.concat();
+    let third = ctr_apply(&audio_plain[1], &ivs[1]);
+    let expected_third = audio_plain[1].clone();
+
+    let layout = [
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Text, 1),
+        (FixtureTrack::Audio, 2),
+        (FixtureTrack::Audio, 0),
+        (FixtureTrack::Text, 1),
+    ];
+    let audio_stsc = [(1u32, 1u32)];
+    let text_stsc = [(1u32, 1u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+    };
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+    };
+    let opts = MdatFixtureOptions {
+        between: &[],
+        moov_last: false,
+        large_size: false,
+        use_co64,
+    };
+    let file = build_multi_mdat_mp4(
+        &audio,
+        &text,
+        &layout,
+        &[first.as_slice(), second.as_slice(), third.as_slice()],
+        &opts,
+    );
+    (file, vec![expected_first, second, expected_third])
+}
+
+/// 票 #45 验收：音频在第一个 mdat、文字在第二个 mdat，两条路径都要解出正确明文。
+#[test]
+fn decrypt_handles_two_mdats() {
+    for use_co64 in [false, true] {
+        let (file, expected_first, expected_second) = two_mdat_fixture(use_co64, &[], false, false);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("双 mdat 文件应能整块解密");
+        let first = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("第一个 mdat");
+        assert_eq!(first.data, expected_first.as_slice(), "use_co64={use_co64}");
+        let second = find_box(
+            &decrypted,
+            b"mdat",
+            first.offset + first.size,
+            decrypted.len(),
+        )
+        .expect("第二个 mdat");
+        assert_eq!(
+            second.data,
+            expected_second.as_slice(),
+            "use_co64={use_co64}"
+        );
+
+        let stsd = find_box_deep(&decrypted, b"stsd", 0, decrypted.len()).expect("stsd");
+        assert!(
+            !stsd.data.windows(4).any(|window| window == b"enca"),
+            "音频轨的 enca 应还原"
+        );
+
+        for step in [1usize, 3, 7, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 同一条轨的样本拆在两个 mdat 里，也要按各自的绝对偏移定位。
+#[test]
+fn decrypt_handles_track_split_across_mdats() {
+    for use_co64 in [false, true] {
+        let (file, expected_first, expected_second) = split_track_two_mdat_fixture(use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("同轨跨 mdat 应能整块解密");
+        let first = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("第一个 mdat");
+        assert_eq!(first.data, expected_first.as_slice(), "use_co64={use_co64}");
+        let second = find_box(
+            &decrypted,
+            b"mdat",
+            first.offset + first.size,
+            decrypted.len(),
+        )
+        .expect("第二个 mdat");
+        assert_eq!(
+            second.data,
+            expected_second.as_slice(),
+            "use_co64={use_co64}"
+        );
+
+        for step in [1usize, 5, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 两个 mdat 中间夹一个 free box：原样透传，不影响样本定位。
+#[test]
+fn decrypt_two_mdats_with_free_between() {
+    for use_co64 in [false, true] {
+        let free = mp4_box(b"free", &[0u8; 4]);
+        let (file, _, expected_second) = two_mdat_fixture(use_co64, &free, false, false);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("夹 free box 应能整块解密");
+        assert!(
+            find_box(&decrypted, b"free", 0, decrypted.len()).is_some(),
+            "free box 应原样保留"
+        );
+        let first = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("第一个 mdat");
+        let second = find_box(
+            &decrypted,
+            b"mdat",
+            first.offset + first.size,
+            decrypted.len(),
+        )
+        .expect("第二个 mdat");
+        assert_eq!(
+            second.data,
+            expected_second.as_slice(),
+            "use_co64={use_co64}"
+        );
+
+        let mut input = Dribble {
+            data: &file,
+            pos: 0,
+            step: 7,
+        };
+        let mut out = Vec::new();
+        decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+        assert_eq!(
+            out, decrypted,
+            "use_co64={use_co64} 时流式输出应与整块解密一致"
+        );
+    }
+}
+
+/// 第二个 mdat 末尾有没被样本覆盖的字节：两条路径都要拒绝。
+#[test]
+fn decrypt_rejects_unaccounted_bytes_in_second_mdat() {
+    let (mut file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let first = find_box(&file, b"mdat", 0, file.len()).expect("第一个 mdat");
+    let second =
+        find_box(&file, b"mdat", first.offset + first.size, file.len()).expect("第二个 mdat");
+    let new_size = (second.size + 7) as u32;
+    let second_offset = second.offset;
+    file[second_offset..second_offset + 4].copy_from_slice(&new_size.to_be_bytes());
+    file.extend_from_slice(&[0xEEu8; 7]);
+
+    let err = decrypt_audio_with_key(&file, &KEY)
+        .expect_err("整块解密应拒绝第二个 mdat 里没认出来的字节");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out)
+        .expect_err("流式解密应拒绝第二个 mdat 里没认出来的字节");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 样本偏移指到第二个 mdat 的 box 头（而不是载荷）：两条路径都要拒绝。
+#[test]
+fn decrypt_rejects_sample_pointing_into_mdat_header() {
+    let (mut file, _, _) = two_mdat_fixture(false, &[], false, false);
+    // 第二个 stco 属于文字轨；把它的第一个 chunk 偏移减 8，正好指进 mdat 头。
+    let audio_stco = find_box_deep(&file, b"stco", 0, file.len()).expect("音频 stco");
+    let text_stco = find_box_deep(
+        &file,
+        b"stco",
+        audio_stco.offset + audio_stco.size,
+        file.len(),
+    )
+    .expect("文字 stco");
+    let entry = text_stco.offset + 16; // 8 字节 box 头 + 4 version/flags + 4 条目数
+    let value = u32::from_be_bytes(file[entry..entry + 4].try_into().expect("偏移字节"));
+    file[entry..entry + 4].copy_from_slice(&(value - 8).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块解密应拒绝指进 mdat 头的样本");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err =
+        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝指进 mdat 头的样本");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 多个 mdat 又没有样本表：老口径的首尾相接推不出布局，按损坏拒绝。
+#[test]
+fn decrypt_rejects_multi_mdat_without_tables() {
+    let (mut file, _, _) = two_mdat_fixture(false, &[], false, false);
+    for kind in [b"stsc", b"stco"] {
+        while let Some(found) = find_box_deep(&file, kind, 0, file.len()) {
+            let type_start = found.offset + 4;
+            file[type_start..type_start + 4].copy_from_slice(b"junk");
+        }
+    }
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块解密应拒绝缺表的多 mdat 文件");
+    assert!(err.to_string().contains("incomplete sample table"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    // 流式看不到后续 mdat：无表样本越过第一个 mdat 末尾时，覆盖核对先报
+    // `decrypted size mismatch`，与整块的 `incomplete sample table` 文案不同；
+    // 两条路径都拒绝，文案差异是已知口径（PORTING.md 已记）。
+    assert!(
+        decrypt_stream(&mut input, &KEY, &mut out).is_err(),
+        "流式解密应拒绝缺表的多 mdat 文件"
+    );
+}
+
+/// 第二个 mdat 被截断：两条路径都要拒绝。
+#[test]
+fn decrypt_rejects_truncated_second_mdat() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let truncated = &file[..file.len() - 3];
+
+    let err = decrypt_audio_with_key(truncated, &KEY).expect_err("整块解密应拒绝截断的第二个 mdat");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: truncated,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    // 流式的覆盖核对是纯算术，截断要到读样本时才暴露，文案与整块不同
+    let err =
+        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝截断的第二个 mdat");
+    assert!(err.to_string().contains("read mdat failed"), "{err}");
+}
+
+/// moov 排在两个 mdat 之后：流式退回整块，整块也要认得多 mdat。
+#[test]
+fn decrypt_stream_falls_back_with_two_mdats() {
+    let (file, _, _) = two_mdat_fixture(false, &[], true, false);
+
+    let expected = decrypt_audio_with_key(&file, &KEY).expect("整块解密");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密");
+    assert_eq!(out, expected);
+}
+
+/// 票 #45：三个 mdat，音频跨第一、第三个，两条路径都要解出正确明文。
+#[test]
+fn decrypt_handles_three_mdats() {
+    for use_co64 in [false, true] {
+        let (file, expected) = three_mdat_fixture(use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("三个 mdat 应能整块解密");
+        let mut search_from = 0usize;
+        for (index, plain) in expected.iter().enumerate() {
+            let mdat = find_box(&decrypted, b"mdat", search_from, decrypted.len())
+                .unwrap_or_else(|| panic!("第 {index} 个 mdat 应在"));
+            assert_eq!(
+                mdat.data,
+                plain.as_slice(),
+                "use_co64={use_co64}, mdat #{index}"
+            );
+            search_from = mdat.offset + mdat.size;
+        }
+
+        for step in [1usize, 7, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 64 位加长头的 mdat：两条路径都要认得，头部原样保留。
+#[test]
+fn decrypt_handles_two_mdats_with_64bit_size() {
+    for use_co64 in [false, true] {
+        let (file, expected_first, expected_second) = two_mdat_fixture(use_co64, &[], false, true);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("64 位头 mdat 应能整块解密");
+        // find_box 只认 32 位头，这里用认加长头的 find_box_deep 定位输出里的 mdat
+        let first = find_box_deep(&decrypted, b"mdat", 0, decrypted.len()).expect("第一个 mdat");
+        assert_eq!(first.data, expected_first.as_slice(), "use_co64={use_co64}");
+        assert_eq!(
+            &decrypted[first.offset..first.offset + 4],
+            &1u32.to_be_bytes(),
+            "加长头应原样保留"
+        );
+        let second = find_box_deep(
+            &decrypted,
+            b"mdat",
+            first.offset + first.size,
+            decrypted.len(),
+        )
+        .expect("第二个 mdat");
+        assert_eq!(
+            second.data,
+            expected_second.as_slice(),
+            "use_co64={use_co64}"
+        );
+
+        for step in [1usize, 7, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 样本偏移指进两个 mdat 之间的 free box：两条路径都要拒绝。
+#[test]
+fn decrypt_rejects_sample_pointing_into_free_box() {
+    let free = mp4_box(b"free", &[0u8; 4]);
+    let (mut file, _, _) = two_mdat_fixture(false, &free, false, false);
+    let first = find_box(&file, b"mdat", 0, file.len()).expect("第一个 mdat");
+    let free_start = (first.offset + first.size) as u32;
+    let audio_stco = find_box_deep(&file, b"stco", 0, file.len()).expect("音频 stco");
+    let text_stco = find_box_deep(
+        &file,
+        b"stco",
+        audio_stco.offset + audio_stco.size,
+        file.len(),
+    )
+    .expect("文字 stco");
+    let entry = text_stco.offset + 16;
+    // 指进 free box 的载荷（box 头后 4 字节）
+    file[entry..entry + 4].copy_from_slice(&(free_start + 4).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块解密应拒绝指进 free box 的样本");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err =
+        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝指进 free box 的样本");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 64 位头 mdat 且 moov 后置：moov 定位只认 32 位头，两条路径同口径拒绝。
+/// 这是单 mdat 时代就有的限制，钉住两条路径的奇偶性。
+#[test]
+fn decrypt_rejects_64bit_mdat_when_moov_follows() {
+    let (file, _, _) = two_mdat_fixture(false, &[], true, true);
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+}
+
+/// 尾部 size==0（延伸到文件尾）的 mdat 不被识别：没有样本指向它时原样透传，
+/// 与旧版对尾部 box 的处理一致，两条路径必须一致。
+#[test]
+fn decrypt_passes_through_trailing_size_zero_mdat() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let mut with_tail = file.clone();
+    with_tail.extend_from_slice(&0u32.to_be_bytes());
+    with_tail.extend_from_slice(b"mdat");
+    with_tail.extend_from_slice(&[0xEEu8; 8]);
+
+    let decrypted = decrypt_audio_with_key(&with_tail, &KEY).expect("整块解密应成功");
+    assert!(
+        decrypted.ends_with(&[0xEEu8; 8]),
+        "没认出来的尾部字节应原样透传"
+    );
+    let mut input = Dribble {
+        data: &with_tail,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+    assert_eq!(out, decrypted);
+}
+
+/// 尾部 size-0 mdat 不被识别，但有样本指向它时按损坏拒绝。
+#[test]
+fn decrypt_rejects_samples_pointing_into_size_zero_mdat() {
+    let (mut file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let tail_start = file.len() as u32;
+    file.extend_from_slice(&0u32.to_be_bytes());
+    file.extend_from_slice(b"mdat");
+    file.extend_from_slice(&[0xEEu8; 8]);
+    // 把文字轨第一个 chunk 偏移指进 size-0 mdat 的载荷
+    let audio_stco = find_box_deep(&file, b"stco", 0, file.len()).expect("音频 stco");
+    let text_stco = find_box_deep(
+        &file,
+        b"stco",
+        audio_stco.offset + audio_stco.size,
+        file.len(),
+    )
+    .expect("文字 stco");
+    let entry = text_stco.offset + 16;
+    file[entry..entry + 4].copy_from_slice(&(tail_start + 8).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 尾部不够一个 box 头（或 64 位加长头只有一半 ext）：两条路径都原样透传。
+#[test]
+fn decrypt_passes_through_partial_trailing_headers() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+
+    // 不足 8 字节：不够一个 box 头
+    let mut short_tail = file.clone();
+    short_tail.extend_from_slice(&[0xAAu8; 3]);
+    let expected = decrypt_audio_with_key(&short_tail, &KEY).expect("整块应成功");
+    assert!(expected.ends_with(&[0xAAu8; 3]));
+    let mut input = Dribble {
+        data: &short_tail,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式应成功");
+    assert_eq!(out, expected);
+
+    // 64 位加长头只读到一半 ext
+    let mut half_ext = file.clone();
+    half_ext.extend_from_slice(&1u32.to_be_bytes());
+    half_ext.extend_from_slice(b"free");
+    half_ext.extend_from_slice(&[0xBBu8; 4]);
+    let expected = decrypt_audio_with_key(&half_ext, &KEY).expect("整块应成功");
+    assert!(expected.ends_with(&[0xBBu8; 4]));
+    let mut input = Dribble {
+        data: &half_ext,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式应成功");
+    assert_eq!(out, expected);
+}
+
+/// 64 位加长头 box 排在 moov 之前：moov 定位只认 32 位头，两条路径同口径拒绝。
+/// 单 mdat 时代就有的限制，钉住奇偶性。
+#[test]
+fn decrypt_rejects_64bit_box_before_moov() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let ftyp = find_box(&file, b"ftyp", 0, file.len()).expect("ftyp");
+    let front_end = ftyp.offset + ftyp.size;
+    let free = mp4_box_largesize(b"free", &[0u8; 8]);
+    let delta = free.len() as u32;
+
+    // 在 ftyp 后插一个 64 位头 free，所有 stco 条目加上它的长度，保持文件其余部分合法
+    let mut shifted = file[front_end..].to_vec();
+    let mut search_from = 0usize;
+    while let Some(stco) = find_box_deep(&shifted, b"stco", search_from, shifted.len()) {
+        let stco_offset = stco.offset;
+        let stco_size = stco.size;
+        let count = u32::from_be_bytes(
+            shifted[stco_offset + 12..stco_offset + 16]
+                .try_into()
+                .expect("条目数"),
+        ) as usize;
+        for index in 0..count {
+            let entry = stco_offset + 16 + index * 4;
+            let value = u32::from_be_bytes(shifted[entry..entry + 4].try_into().expect("偏移"));
+            shifted[entry..entry + 4].copy_from_slice(&(value + delta).to_be_bytes());
+        }
+        search_from = stco_offset + stco_size;
+    }
+    let mut rebuilt = file[..front_end].to_vec();
+    rebuilt.extend_from_slice(&free);
+    rebuilt.extend_from_slice(&shifted);
+
+    let err = decrypt_audio_with_key(&rebuilt, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+    let mut input = Dribble {
+        data: &rebuilt,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+}
+
+/// 缺表的多 mdat 即使第二个 mdat 是空载荷也要拒绝：老口径推不出布局。
+#[test]
+fn decrypt_rejects_legacy_layout_with_empty_second_mdat() {
+    let ivs: [[u8; 8]; 2] = [[81; 8], [82; 8]];
+    let audio_plain: Vec<Vec<u8>> = vec![(0..32u8).collect(), (0..48u8).collect()];
+    let audio_sizes: Vec<u32> = audio_plain
+        .iter()
+        .map(|sample| sample.len() as u32)
+        .collect();
+    let senc_payload = senc_payload_for(&ivs);
+    let mut payload = Vec::new();
+    for (index, plain) in audio_plain.iter().enumerate() {
+        payload.extend_from_slice(&ctr_apply(plain, &ivs[index]));
+    }
+
+    let layout = [(FixtureTrack::Audio, 0), (FixtureTrack::Audio, 0)];
+    let audio_stsc = [(1u32, 1u32)];
+    let audio = TrackFixture {
+        sizes: &audio_sizes,
+        senc: Some(&senc_payload),
+        stsc: &audio_stsc,
+    };
+    let text_sizes: Vec<u32> = Vec::new();
+    let text_stsc: [(u32, u32); 0] = [];
+    let text = TrackFixture {
+        sizes: &text_sizes,
+        senc: None,
+        stsc: &text_stsc,
+    };
+    let opts = MdatFixtureOptions {
+        between: &[],
+        moov_last: false,
+        large_size: false,
+        use_co64: false,
+    };
+    let mut file = build_multi_mdat_mp4(&audio, &text, &layout, &[payload.as_slice(), &[]], &opts);
+    // 拆掉样本表，逼文件走老口径
+    for kind in [b"stsc", b"stco"] {
+        while let Some(found) = find_box_deep(&file, kind, 0, file.len()) {
+            let type_start = found.offset + 4;
+            file[type_start..type_start + 4].copy_from_slice(b"junk");
+        }
+    }
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块解密应拒绝缺表的多 mdat 文件");
+    assert!(err.to_string().contains("incomplete sample table"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err =
+        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝缺表的多 mdat 文件");
+    assert!(err.to_string().contains("incomplete sample table"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
 // 样本级解密
 // ---------------------------------------------------------------------------
 
@@ -738,6 +1646,44 @@ fn decrypt_handles_single_audio_track_with_chunk_offsets() {
         let decrypted = decrypt_audio_with_key(&file, &KEY).expect("单音轨应能整块解密");
         let mdat = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
         assert_eq!(mdat.data, expected.as_slice(), "use_co64={use_co64}");
+
+        for step in [1usize, 5, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
+/// 尾部 0 字节样本（stsz 允许 0 尺寸）：偏移正好等于载荷末尾，应归当前 mdat 所有，
+/// 不能当成损坏拒绝（票 #45 回归，改动前基线接受这种文件）。
+#[test]
+fn decrypt_handles_trailing_zero_size_sample() {
+    for use_co64 in [false, true] {
+        let ivs: [[u8; 8]; 2] = [[91; 8], [92; 8]];
+        let plain: Vec<u8> = (0..24u8).collect();
+        let sizes: Vec<u32> = vec![24, 0];
+        let senc_payload = senc_payload_for(&ivs);
+        let payload = ctr_apply(&plain, &ivs[0]);
+        let stsc = [(1u32, 1u32)];
+        let track = TrackFixture {
+            sizes: &sizes,
+            senc: Some(&senc_payload),
+            stsc: &stsc,
+        };
+        let file = build_single_track_mp4(&track, &payload, 0, use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("尾部 0 字节样本应能整块解密");
+        let mdat = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
+        assert_eq!(mdat.data, plain.as_slice(), "use_co64={use_co64}");
 
         for step in [1usize, 5, 4096] {
             let mut input = Dribble {

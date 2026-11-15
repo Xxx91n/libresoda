@@ -80,7 +80,7 @@
 | `soda_user_playlist_test.go`（需 Cookie） | `tests/network_tests.rs::user_playlists_online` |
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
-| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返；票 #42 另补多轨 MP4（`stco` 与 `co64` 各走一遍，覆盖单音轨、交错样本、多条 `stsc`/多样本 chunk、文字轨透传、截断报错、mdat 有未覆盖字节时报错，以及 `senc` 少条目、`stsc`/`stco` 只缺一半或对不上、声明条目数大于实际条目、样本铺满后还有多余 chunk 时的拒绝；`table_sample_locations` 与 `parse_stsz_limited` 的边界另有库内单测） |
+| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返；票 #42 另补多轨 MP4（`stco` 与 `co64` 各走一遍，覆盖单音轨、交错样本、多条 `stsc`/多样本 chunk、文字轨透传、截断报错、mdat 有未覆盖字节时报错，以及 `senc` 少条目、`stsc`/`stco` 只缺一半或对不上、声明条目数大于实际条目、样本铺满后还有多余 chunk 时的拒绝；`table_sample_locations` 与 `parse_stsz_limited` 的边界另有库内单测）；票 #45 再补多 mdat（音频在第一个、文字在第二个，同轨样本拆两个 mdat，多条 `stsc`/多样本 chunk，三个 mdat，64 位加长头 mdat，中间夹 `free` box，moov 排在 mdat 之后走兜底，`stco`/`co64` 各走一遍；第二个 mdat 留未覆盖字节、样本指进 mdat 头或 free box、多 mdat 缺表（含第二个 mdat 空载荷）、第二个 mdat 截断、64 位头且 moov 后置或 moov 前有 64 位头 box 时的拒绝、尾部 size-0 mdat 的透传与样本指进它的拒绝、尾部 0 字节样本的接受、尾部不完整 box 头的透传，断到错误文案） |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
 | （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**#8 那一批不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口当时还是 `pub(crate)` —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以那批用例放在 `soda` 这一层的兄弟模块里，只能看见 `pub(crate)`。对外入口落地后（#9），`tests/` 那份由下一行补上 |
@@ -107,7 +107,24 @@
   声明条目数大于实际可读条目数、样本已铺满但后面还有 chunk、`senc` 条目少于样本数、
   或所有轨合计的样本数/字节数超过上限，也都按损坏报错。没有 `stsc`/`stco`/`co64` 的旧
   合成文件退回「按 `trak` 顺序首尾相接」的老口径，同样要求刚好铺满。两条路径（整块 / 流式）
-  共用同一份计划，输出逐字节一致；只处理第一个 `mdat`，多 `mdat` 的碎片化文件不在本票范围。
+  共用同一份计划，成功输出逐字节一致；失败文案不保证相同（截断时整块报
+  `decrypted size mismatch`、流式在读样本时才暴露、报 `read mdat failed`；缺表多 mdat 时
+  整块报 `incomplete sample table`、流式看到越过第一个 mdat 的样本先报
+  `decrypted size mismatch`，均有用例钉住）。
+  票 #45 起支持多个顶层 `mdat`：样本按绝对文件偏移定位，
+  所有 `mdat` 的载荷都要被样本刚好铺满，哪一段留空都报错；流式路径按 box 顺序逐个处理
+  `mdat`，之间的其它 box（`free`/`udta` 等）原样透传，整块路径也认 64 位加长头的 `mdat`。
+  老口径只对单个 `mdat` 有效，多 `mdat` 又缺表时推不出布局，按损坏报错。moof/traf 的真碎片化
+  （偏移靠 `tfhd`/`trun` 推算，没有 `stco`/`stsc`）仍不在范围。已知边界：`moov` 的定位仍走
+  只认 32 位头的 `find_box`，64 位头 box 排在 `moov` 之前（含 64 位头 `mdat` 且 `moov` 后置）
+  的文件两条路径都按 `moov box not found` 拒绝（与单 `mdat` 时一致，有用例钉住）；
+  `size==0`（延伸到文件尾）的尾部 `mdat` 不被识别，没有样本指向它时原样透传（与旧版对尾部
+  box 的处理一致，有用例钉住），有样本指向它时按损坏拒绝；整块路径顺带认了 64 位头的非
+  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径的字节预算传
+  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），位置表只受 `MAX_SAMPLE_ENTRIES` 兜底：
+  构造小文件声明 4M 个单字节样本时最坏约 208 MiB 瞬态分配，整块路径仍在展开位置表前按载荷
+  拒绝；结构修复（chunk 级惰性展开）见
+  [`sodahub-org/libresoda#49`](https://github.com/sodahub-org/libresoda/issues/49)。
 
 * **断点续传的判据（`soda::resume`，上游无对应）**：判断函数与 `Content-Range` 解析都只做
   纯计算，不碰网络与磁盘；`pub(crate)` 不对外，因为公开它等于对判断规则做出承诺

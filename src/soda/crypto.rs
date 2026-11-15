@@ -1,7 +1,8 @@
 //! 汽水音频解密：`play_auth`（spade）密钥还原 + MP4/CENC 样本解密。
 //!
 //! 多轨文件按每条 `trak` 的 `stsc` + `stco`/`co64` 定位样本；没有 `senc` 的轨
-//! （文字轨）原样透传。所有轨的样本必须刚好铺满 `mdat`，中间留空就报错（票 #42）。
+//! （文字轨）原样透传。样本按绝对文件偏移定位，支持多个顶层 `mdat`（票 #45）；
+//! 所有轨的样本必须刚好铺满每一个 `mdat` 的载荷，中间留空就报错（票 #42）。
 //!
 //! 逐函数对应上游 `soda/crypto.go`。
 
@@ -56,6 +57,8 @@ struct TrackPlan {
 struct DecryptPlan {
     tracks: Vec<TrackPlan>,
     samples: Vec<PlannedSample>,
+    /// 走了「无表首尾相接」的老口径。多 mdat 时这种布局推不出来，要显式拒绝。
+    legacy_layout: bool,
 }
 
 /// `stsc` 的一条记录：从 `first_chunk` 起，每个 chunk 装 `samples_per_chunk` 个样本。
@@ -102,19 +105,19 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
     let data = file_data;
     let moov = find_box(data, b"moov", 0, data.len())
         .ok_or_else(|| SodaError::crypto("moov box not found"))?;
-    let mdat = find_box(data, b"mdat", 0, data.len())
-        .ok_or_else(|| SodaError::crypto("mdat box not found"))?;
+    let mdats = top_level_mdats(data);
     // 整块路径同样要求声明的 mdat 载荷完整到位：只缺尾部填充也要报错，
     // 不能和流式路径给出两种结果。
-    let mdat_end = mdat
-        .offset
-        .checked_add(mdat.size)
-        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-    if mdat_end > data.len() {
-        return Err(SodaError::crypto("decrypted size mismatch"));
+    for &(payload_start, payload_len) in &mdats {
+        let mdat_end = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+        if mdat_end > data.len() {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
     }
 
-    let plan = plan_decryption(data, &moov, mdat.offset + 8, mdat.size.saturating_sub(8))?;
+    let plan = plan_decryption(data, &moov, &mdats)?;
 
     let mut decrypted_data = data.to_vec();
     for sample in &plan.samples {
@@ -143,14 +146,17 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
     Ok(decrypted_data)
 }
 
-/// 流式解密：边读边解边写，峰值内存只与「单个样本」和「mdat 之前的 box」有关。
+/// 流式解密：边读边解边写，峰值内存主要由「单个样本」和「mdat 之前的 box」决定。
 ///
 /// 与 [`decrypt_audio_with_key`] 的输出**逐字节一致**，区别只是不再把整首
 /// （无损 40~80MB）连同解密副本一起放进内存：
 ///
 /// * `mdat` 之前的所有顶层 box（`ftyp` / `moov` / `free` …，通常几十 KB）读进内存，
 ///   因为样本表 `stsz`、初始化向量 `senc`、`stsd` 编码改写都在 `moov` 里；
+/// * 样本位置表受条目数上限 `MAX_SAMPLE_ENTRIES` 约束；流式路径看不到后续 mdat，
+///   总载荷未知，字节预算核对由逐段覆盖检查兜底（票 #45）；
 /// * `mdat` 载荷按样本大小逐块读出、解密、写出，缓冲只占一个样本（几 KB）；
+/// * 多个顶层 `mdat` 按文件顺序逐个处理（票 #45），之间的其它 box 原样透传；
 /// * 少数 `moov` 排在 `mdat` 之后的文件无法流式处理，退回整块解密，保证兼容性。
 pub fn decrypt_stream<R: Read, W: Write>(
     input: &mut R,
@@ -224,14 +230,25 @@ pub fn decrypt_stream<R: Read, W: Write>(
         return Ok(());
     }
 
-    // 3) 从前导 box 里解出「每个样本在哪、用哪条轨的哪个 senc 样本解」
+    // 3) 从前导 box 里解出「每个样本在哪、用哪条轨的哪个 senc 样本解」。
+    //    此刻只见过第一个 mdat，总载荷长度未知：字节预算核对交给后面逐段 mdat
+    //    的覆盖检查，条目数上限在解析时已经兜住内存。
     let moov = find_box(&prefix, b"moov", 0, prefix.len())
         .ok_or_else(|| SodaError::crypto("moov box not found"))?;
     let mdat_payload_start = prefix
         .len()
         .checked_add(mdat_header.len())
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-    let plan = plan_decryption(&prefix, &moov, mdat_payload_start, mdat_payload_len)?;
+    let plan = plan_track_samples(&prefix, &moov, mdat_payload_start, usize::MAX)?;
+
+    // 第一个 mdat 的覆盖核对放在写任何输出之前，与整块路径一样先验后写。
+    let mut next_sample = 0usize;
+    cover_mdat_payload(
+        &plan.samples,
+        &mut next_sample,
+        mdat_payload_start,
+        mdat_payload_len,
+    )?;
 
     // stsd 里的 `enca` 还原成 `frma` 指向的原始编码格式（与整块解密一致）
     for track in &plan.tracks {
@@ -245,9 +262,104 @@ pub fn decrypt_stream<R: Read, W: Write>(
     out.write_all(&mdat_header)
         .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
 
-    // 4) 逐样本解密 mdat。计划已经确认所有轨的样本按文件偏移刚好铺满载荷，
+    // 4) 逐样本解密第一个 mdat。覆盖核对已经确认样本按文件偏移刚好铺满载荷，
     //    没有需要原样透传的间隙。
-    for sample in &plan.samples {
+    write_samples(input, out, key_bytes, &plan, &plan.samples[..next_sample])?;
+
+    // 5) 后面的顶层 box 逐个走：mdat 继续按样本解密，其它 box（udta / free …）
+    //    原样透传，保证输出与整块解密一致。
+    let mut offset = mdat_payload_start
+        .checked_add(mdat_payload_len)
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    loop {
+        let mut head = [0u8; 8];
+        let filled = read_up_to(input, &mut head)
+            .map_err(|err| SodaError::crypto(format!("read box header failed: {err}")))?;
+        if filled == 0 {
+            break;
+        }
+        if filled < 8 {
+            // 尾巴不够一个 box 头：整块路径扫到这里就停，流式把残留字节原样写出
+            out.write_all(&head[..filled])
+                .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+            break;
+        }
+        let size32 = u32::from_be_bytes(head[0..4].try_into().unwrap_or_default());
+        let kind = &head[4..8];
+        let (size, header_len, ext) = if size32 == 1 {
+            let mut ext = [0u8; 8];
+            let filled_ext = read_up_to(input, &mut ext)
+                .map_err(|err| SodaError::crypto(format!("read box header failed: {err}")))?;
+            if filled_ext < 8 {
+                out.write_all(&head)
+                    .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+                out.write_all(&ext[..filled_ext])
+                    .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+                break;
+            }
+            (u64::from_be_bytes(ext) as usize, 16usize, Some(ext))
+        } else {
+            (size32 as usize, 8usize, None)
+        };
+
+        let box_end = offset.checked_add(size).filter(|_| size >= header_len);
+        let Some(box_end) = box_end else {
+            // 尺寸不合法：整块路径不再往后扫，流式把头部和剩余字节原样写出
+            write_box_header(out, &head, ext)?;
+            std::io::copy(input, out)
+                .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+            break;
+        };
+
+        if kind == b"mdat" {
+            // 老口径只认第一个 mdat：后面再出现 mdat 就推不出布局了
+            if plan.legacy_layout {
+                return Err(SodaError::crypto("incomplete sample table"));
+            }
+            let payload_start = offset + header_len;
+            let payload_len = size - header_len;
+            let before = next_sample;
+            cover_mdat_payload(&plan.samples, &mut next_sample, payload_start, payload_len)?;
+            write_box_header(out, &head, ext)?;
+            write_samples(
+                input,
+                out,
+                key_bytes,
+                &plan,
+                &plan.samples[before..next_sample],
+            )?;
+        } else {
+            // 非 mdat 的 box 里不能藏着样本：有样本指进来就说明表对不上
+            if let Some(sample) = plan.samples.get(next_sample) {
+                if sample.offset < box_end {
+                    return Err(SodaError::crypto("decrypted size mismatch"));
+                }
+            }
+            write_box_header(out, &head, ext)?;
+            std::io::copy(&mut input.take((size - header_len) as u64), out)
+                .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+        }
+        offset = box_end;
+    }
+
+    // 还有样本没落到任何 mdat 里：表指向了文件外或别的 box，按损坏报错
+    if next_sample != plan.samples.len() {
+        return Err(SodaError::crypto("decrypted size mismatch"));
+    }
+    Ok(())
+}
+
+/// 按计划把一段样本从输入读出、解密（没有 `senc` 的原样透传）、写出。
+///
+/// 上游没有这个辅助；票 #45 新增。
+fn write_samples<R: Read, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    key_bytes: &[u8],
+    plan: &DecryptPlan,
+    samples: &[PlannedSample],
+) -> Result<()> {
+    for sample in samples {
         let mut chunk = vec![0u8; sample.size];
         input
             .read_exact(&mut chunk)
@@ -263,10 +375,36 @@ pub fn decrypt_stream<R: Read, W: Write>(
                 .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?,
         }
     }
-
-    // mdat 之后可能还有其它 box（如 udta / free），原样透传，保证输出与整块解密一致
-    std::io::copy(input, out).map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
     Ok(())
+}
+
+/// 写出 box 头（64 位加长头时多写 8 字节 ext）。
+///
+/// 上游没有这个辅助；票 #45 新增。
+fn write_box_header<W: Write>(out: &mut W, head: &[u8; 8], ext: Option<[u8; 8]>) -> Result<()> {
+    out.write_all(head)
+        .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+    if let Some(ext) = ext {
+        out.write_all(&ext)
+            .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
+    }
+    Ok(())
+}
+
+/// 尽量读满 `buf`；碰到 EOF 返回已读字节数，不报错。
+///
+/// 上游没有这个辅助；票 #45 新增。
+fn read_up_to<R: Read>(input: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
 /// [`decrypt_stream`] 的便捷版本：直接从 `play_auth` 还原密钥。
@@ -279,19 +417,59 @@ pub fn decrypt_stream_with_auth<R: Read, W: Write>(
     decrypt_stream(input, &key_bytes, out)
 }
 
-/// 按每条 `trak` 的样本表算出「`mdat` 里哪些字节是哪个样本」。
+/// 按每条 `trak` 的样本表算出「文件里哪些字节是哪个样本」。
 ///
-/// 有 `stsc` + `stco`/`co64` 时按真实偏移走（多轨文件的样本可以按轨交错排列）；
-/// 没有时退回老口径：按 `trak` 出现顺序把样本首尾相接铺进 `mdat`，并要求刚好铺满。
+/// 有 `stsc` + `stco`/`co64` 时按真实偏移走（多轨文件的样本可以按轨交错排列，
+/// 也可以分散在多个顶层 `mdat` 里，票 #45）；没有时退回老口径：按 `trak` 出现顺序
+/// 把样本首尾相接铺进第一个 `mdat`，并要求刚好铺满。
 /// 没有 `senc` 的轨（例如文字轨）不参与解密，它的样本仍然要在计划里占位，流式路径才能
 /// 按文件顺序把这段字节原样写出去。
 ///
-/// 上游没有这条多轨计划；票 #42 新增。
+/// 上游没有这条多轨计划；票 #42 新增，票 #45 扩展到多个 `mdat`。
 fn plan_decryption(
     data: &[u8],
     moov: &Mp4Box<'_>,
-    mdat_payload_start: usize,
-    mdat_payload_len: usize,
+    mdats: &[(usize, usize)],
+) -> Result<DecryptPlan> {
+    let Some(&(first_payload_start, _)) = mdats.first() else {
+        return Err(SodaError::crypto("mdat box not found"));
+    };
+    let total_payload_len = mdats
+        .iter()
+        .try_fold(0usize, |sum, &(_, len)| sum.checked_add(len))
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    let plan = plan_track_samples(data, moov, first_payload_start, total_payload_len)?;
+    // 老口径只会把样本铺进第一个 mdat；多个 mdat 时布局推不出来，直接拒绝。
+    if plan.legacy_layout && mdats.len() > 1 {
+        return Err(SodaError::crypto("incomplete sample table"));
+    }
+
+    // 所有轨的样本合起来必须刚好铺满每一个 mdat 的载荷：中间留空就说明还有
+    // 我们没认出来的数据（可能是密文），原样透传会写出不完整的文件，所以宁可报错。
+    let mut next_sample = 0usize;
+    for &(payload_start, payload_len) in mdats {
+        cover_mdat_payload(&plan.samples, &mut next_sample, payload_start, payload_len)?;
+    }
+    if next_sample != plan.samples.len() {
+        return Err(SodaError::crypto("decrypted size mismatch"));
+    }
+
+    Ok(plan)
+}
+
+/// 解析所有轨的样本表，产出按文件偏移排好序的样本位置（不做覆盖核对）。
+///
+/// `payload_budget` 是所有 mdat 载荷的合计字节数，用来在分配位置表之前拒绝
+/// 明显装不下的声明；流式路径传 `usize::MAX`（总载荷要等所有 mdat 都见过才知道，
+/// 覆盖核对会在后面逐段兜住）。条目数上限不受影响，内存仍然有界；放大上限与
+/// chunk 级惰性展开的改进见 sodahub-org/libresoda#49。
+///
+/// 上游没有这条多轨计划；票 #42 新增，票 #45 从 `plan_decryption` 拆出。
+fn plan_track_samples(
+    data: &[u8],
+    moov: &Mp4Box<'_>,
+    first_payload_start: usize,
+    payload_budget: usize,
 ) -> Result<DecryptPlan> {
     let moov_end = (moov.offset + moov.size).min(data.len());
     let mut tracks = Vec::new();
@@ -347,7 +525,7 @@ fn plan_decryption(
         total_sample_bytes = total_sample_bytes
             .checked_add(track_bytes)
             .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
-        if total_sample_bytes > mdat_payload_len {
+        if total_sample_bytes > payload_budget {
             return Err(SodaError::crypto("decrypted size mismatch"));
         }
 
@@ -436,9 +614,6 @@ fn plan_decryption(
         return Err(SodaError::crypto("incomplete sample table"));
     }
 
-    let mdat_end = mdat_payload_start
-        .checked_add(mdat_payload_len)
-        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut planned = Vec::new();
     if !any_without_tables {
         for (track_index, track) in track_data.iter().enumerate() {
@@ -458,8 +633,8 @@ fn plan_decryption(
             }
         }
     } else {
-        // 老口径：所有轨按 trak 顺序首尾相接，样本必须刚好铺满 mdat。
-        let mut cursor = mdat_payload_start;
+        // 老口径：所有轨按 trak 顺序首尾相接，铺不铺得满交给覆盖核对。
+        let mut cursor = first_payload_start;
         for (track_index, track) in track_data.iter().enumerate() {
             for (sample_index, size) in track.sizes.iter().enumerate() {
                 let size = *size as usize;
@@ -474,34 +649,9 @@ fn plan_decryption(
                     .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
             }
         }
-        if cursor != mdat_end {
-            return Err(SodaError::crypto("decrypted size mismatch"));
-        }
     }
 
     planned.sort_unstable_by_key(|sample| sample.offset);
-    // 所有轨的样本合起来必须刚好铺满 mdat：中间留空就说明还有我们没认出来的数据
-    // （可能是密文），原样透传会写出不完整的文件，所以宁可报错。
-    let mut expected_offset = mdat_payload_start;
-    for sample in &planned {
-        if sample.size > MAX_SAMPLE_BYTES {
-            return Err(SodaError::crypto("sample size is unreasonably large"));
-        }
-        if sample.offset != expected_offset {
-            return Err(SodaError::crypto("decrypted size mismatch"));
-        }
-        expected_offset = sample
-            .offset
-            .checked_add(sample.size)
-            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
-        if expected_offset > mdat_end {
-            return Err(SodaError::crypto("decrypted size mismatch"));
-        }
-    }
-    if expected_offset != mdat_end {
-        return Err(SodaError::crypto("decrypted size mismatch"));
-    }
-
     let tracks = track_data
         .into_iter()
         .map(|track| TrackPlan {
@@ -509,11 +659,101 @@ fn plan_decryption(
             stsd: track.stsd,
         })
         .collect();
-
     Ok(DecryptPlan {
         tracks,
         samples: planned,
+        legacy_layout: any_without_tables,
     })
+}
+
+/// 核对排好序的样本是否刚好铺满一段 `mdat` 载荷，把 `next` 推到第一个不属于这段的样本。
+///
+/// 铺不满、越过边界、指向这段之前，都按损坏报错：没认出来的字节可能是密文，
+/// 不能原样透传（票 #42 的口径，票 #45 推广到每一段 mdat）。
+///
+/// 上游没有这个辅助；票 #45 新增。
+fn cover_mdat_payload(
+    samples: &[PlannedSample],
+    next: &mut usize,
+    payload_start: usize,
+    payload_len: usize,
+) -> Result<()> {
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
+    let mut cursor = payload_start;
+    while let Some(sample) = samples.get(*next) {
+        // 正好落在载荷末尾的 0 字节样本归当前段所有（stsz 允许 0 尺寸）；
+        // 真正越过末尾才交给下一段。
+        if sample.offset > payload_end {
+            break;
+        }
+        if sample.size > MAX_SAMPLE_BYTES {
+            return Err(SodaError::crypto("sample size is unreasonably large"));
+        }
+        if sample.offset != cursor {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+        cursor = sample
+            .offset
+            .checked_add(sample.size)
+            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        if cursor > payload_end {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        }
+        *next += 1;
+    }
+    if cursor != payload_end {
+        return Err(SodaError::crypto("decrypted size mismatch"));
+    }
+    Ok(())
+}
+
+/// 按文件顺序收集所有顶层 `mdat` 的载荷区间（起点, 长度）。
+///
+/// 认 64 位加长头：流式路径本来就认，整块路径不认的话，
+/// 两条路径会对同一个文件给出两种结果。
+///
+/// 上游没有这个辅助；票 #45 新增。
+fn top_level_mdats(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut mdats = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size32 =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let (size, header_len) = if size32 == 1 {
+            if pos + 16 > data.len() {
+                break;
+            }
+            let size64 = u64::from_be_bytes([
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]);
+            (size64 as usize, 16usize)
+        } else {
+            (size32, 8usize)
+        };
+        if size < header_len {
+            break;
+        }
+        let Some(box_end) = pos.checked_add(size) else {
+            break;
+        };
+        if &data[pos + 4..pos + 8] == b"mdat" {
+            mdats.push((pos + header_len, size - header_len));
+        }
+        if box_end > data.len() {
+            break;
+        }
+        pos = box_end;
+    }
+    mdats
 }
 
 /// 取 `parent` 的直接子 box。起点是 `parent.offset + 8`，不能从 `parent.offset` 开始 ——
