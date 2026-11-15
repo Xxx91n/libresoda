@@ -80,7 +80,7 @@
 | `soda_user_playlist_test.go`（需 Cookie） | `tests/network_tests.rs::user_playlists_online` |
 | `soda/login_test.go`（13 例） | ⚠️ 仅 `tests/qr_login_tests.rs`（4 例：MD5 向量、base64url、扫码 URL 形状）；限流退避、MFA 字段提取、表单形状用例未移植 |
 | `soda/login_debug_test.go`（调试入口 `TestSodaQRLoginDebug`） | `tests/network_tests.rs::qr_login_debug`（`SODA_QR_DEBUG=1` 触发） |
-| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返；票 #42 另补多轨 MP4（`stco` 与 `co64` 各走一遍，覆盖单音轨、交错样本、多条 `stsc`/多样本 chunk、文字轨透传、截断报错、mdat 有未覆盖字节时报错，以及 `senc` 少条目、`stsc`/`stco` 只缺一半或对不上、声明条目数大于实际条目、样本铺满后还有多余 chunk 时的拒绝；`table_sample_locations` 与 `parse_stsz_limited` 的边界另有库内单测）；票 #44 再补计划上限拒绝（4M 定长声明、跨轨累计超 1M）与十万样本放行、`MAX_PLAN_SAMPLES`/`table_entry_count` 边界单测；票 #45 再补多 mdat（音频在第一个、文字在第二个，同轨样本拆两个 mdat，多条 `stsc`/多样本 chunk，三个 mdat，64 位加长头 mdat，中间夹 `free` box，moov 排在 mdat 之后走兜底，`stco`/`co64` 各走一遍；第二个 mdat 留未覆盖字节、样本指进 mdat 头或 free box、多 mdat 缺表（含第二个 mdat 空载荷）、第二个 mdat 截断、64 位头且 moov 后置或 moov 前有 64 位头 box 时的拒绝、尾部 size-0 mdat 的透传与样本指进它的拒绝、尾部 0 字节样本的接受、尾部不完整 box 头的透传，断到错误文案） |
+| 上游没有的离线路径 | `tests/crypto_tests.rs`：合成 MP4 的加密→解密往返、spade 密钥往返；票 #42 另补多轨 MP4（`stco` 与 `co64` 各走一遍，覆盖单音轨、交错样本、多条 `stsc`/多样本 chunk、文字轨透传、截断报错、mdat 有未覆盖字节时报错，以及 `senc` 少条目、`stsc`/`stco` 只缺一半或对不上、声明条目数大于实际条目、样本铺满后还有多余 chunk 时的拒绝；`table_sample_locations` 与 `parse_stsz_layout` 的边界另有库内单测）；票 #44 再补计划上限拒绝（4M 定长声明、跨轨累计超 1M）与十万样本放行、`MAX_PLAN_SAMPLES`/`table_entry_count` 边界单测；票 #45 再补多 mdat（音频在第一个、文字在第二个，同轨样本拆两个 mdat，多条 `stsc`/多样本 chunk，三个 mdat，64 位加长头 mdat，中间夹 `free` box，moov 排在 mdat 之后走兜底，`stco`/`co64` 各走一遍；第二个 mdat 留未覆盖字节、样本指进 mdat 头或 free box、多 mdat 缺表（含第二个 mdat 空载荷）、第二个 mdat 截断、64 位头且 moov 后置或 moov 前有 64 位头 box 时的拒绝、尾部 size-0 mdat 的透传与样本指进它的拒绝、尾部 0 字节样本的接受、尾部不完整 box 头的透传，断到错误文案）；票 #49 再补单测与用例：库内单测覆盖惰性游标与全量展开逐条对照、`senc` 计数与逐条解析一致、惰性尺寸表与 `parse_stsz` 一致；文件级用例覆盖 chunk 乱序（`decrypt_handles_out_of_order_chunk_offsets`）。峰值分配用例单独放 `tests/crypto_plan_memory_tests.rs` |
 | 上游没有的客户端能力 | 库内单测（`src/soda/{feed,collection,playlist_edit,playback,artist,media_ref,quality,resume,part_record}.rs` 的 `#[cfg(test)]`）+ `tests/signature_tests.rs`（签名器/token）+ `tests/app_credentials_tests.rs`（抓包凭证） |
 | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
 | （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**#8 那一批不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口当时还是 `pub(crate)` —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以那批用例放在 `soda` 这一层的兄弟模块里，只能看见 `pub(crate)`。对外入口落地后（#9），`tests/` 那份由下一行补上 |
@@ -120,23 +120,38 @@
   的文件两条路径都按 `moov box not found` 拒绝（与单 `mdat` 时一致，有用例钉住）；
   `size==0`（延伸到文件尾）的尾部 `mdat` 不被识别，没有样本指向它时原样透传（与旧版对尾部
   box 的处理一致，有用例钉住），有样本指向它时按损坏拒绝；整块路径顺带认了 64 位头的非
-  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径的字节预算传
-  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），样本数仍受计划阶段的合计上限
+  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径按 box 顺序逐段处理
+  `mdat`，每段解密前先核对样本刚好铺满该段载荷；样本位置和 `senc` 记录都不预先展开
+  （票 #49，见下一条），计划阶段的内存只跟 `moov` 里的表大小和轨数有关。总样本数仍受
   `MAX_PLAN_SAMPLES`（1M）兜底（票 #44）：声明超过 1M 条样本的畸形文件直接报
-  `sample table is unreasonably large`，最坏元数据约 120MB；结构修复（chunk 级惰性展开）
-  见 [`sodahub-org/libresoda#49`](https://github.com/sodahub-org/libresoda/issues/49)。
+  `sample table is unreasonably large`。
 
-* **解密计划的样本上限（`crypto::plan_decryption`，票 #44）**：计划阶段把每个样本的尺寸、
-  位置、`senc` 记录都落内存，64 位下约 100 字节/样本。沿用解析上限 `MAX_SAMPLE_ENTRIES`（4M）
-  时，一个声明 4M 样本、`mdat` 够大的畸形文件最坏峰值约 400–500MB（`senc` 每条 48 字节外加
-  一次 IV 堆分配，占近一半）。计划阶段单独设更紧的 `MAX_PLAN_SAMPLES`（1M，所有轨合计），
-  把最坏元数据压到约 120MB；`stsc`/`stco`/`co64` 的单张表条目数也夹到这个上限（chunk 数不会
-  超过样本数；表本身还受实际数据长度约束）。取舍：1M 约够 6 小时音频（48kHz AAC），正常曲目
-  只有几千到几万条，不受影响；样本数超上限的畸形文件报 `sample table is unreasonably large`，
-  chunk 表条目超限或表本身对不上时报 `invalid sample table`。
-  公开的独立解析函数（`parse_stsz`/`parse_senc`）仍用 4M，公开口径不变；计划阶段的表解析统一
-  用 1M。`planned` 改用 `with_capacity` 一次性分配，去掉翻倍扩容时旧新两份并存的瞬态。按 chunk
-  流式展开（彻底去掉 O(样本数) 元数据）是更大的重构，另见规划票 #46，不在本票范围。
+* **解密计划改成惰性展开（`crypto::{plan_decryption, plan_track_samples}`，票 #49）**：
+  旧实现把每条轨的 `sizes`（4 字节/样本）、`(偏移, 尺寸)` 位置表（16 字节/样本）和
+  `PlannedSample`（32 字节/样本）全量落内存，再排序、再核对覆盖——一个几百字节、
+  声明 1M 样本的畸形文件能把计划阶段撑到几十 MB。现在计划只记表本身：
+   - 尺寸表 `SampleSizes` 只保存定长值或 `stsz` 载荷，按索引现读；
+   - 样本位置由 `TrackSamples` 按 `stsc`/`stco`/`co64` 现算，跨轨按（偏移, 尺寸, 轨序号）
+     归并（`SampleWalk`）：同偏移时 0 字节样本先出，不会因为先写同起点的非零样本，
+     把别的轨的 0 字节样本挤到游标后面；
+   - `senc` 只数条目数（`count_senc_records`，不按记录分配），解密时按样本顺序现读；
+     变长 `stsz` 表和 `senc` 载荷各复制一份：`senc` 只复制真正读到的那几条记录，
+     声明的 box 大小越过父容器时不会整段复制；
+     定长 `stsz` 只存两个数值，不复制。
+  峰值内存只跟 `moov` 里的表大小和轨数有关，不跟声明的样本数走；两条路径仍然共用同一份
+  计划、输出逐字节一致。`MAX_PLAN_SAMPLES`（1M，票 #44）保留，作用变成限制游标走一遍的
+  工作量和 chunk 表条目数，不再是按样本展开的内存上限（1M 约够 6 小时音频，正常曲目只有
+  几千到几万条，不受影响；公开的独立解析函数 `parse_stsz`/`parse_senc` 仍用 4M，公开口径
+  不变）。跨轨归并用小顶堆，每条轨只放一个当前样本，取下一个是 O(log 轨数)，
+  不会按「样本数 × 轨数」扫。计划建好后会先空跑一遍游标，表不自洽（chunk 号越界、
+  `samples_per_chunk` 为 0、样本数对不上、chunk 表多出来、偏移溢出）照旧报
+  `invalid sample table`；`stsz` 条目数超限报 `sample table is unreasonably large`。
+  表校验统一在计划建好后做：同一个文件同时有多处损坏时，报错种类可能与旧版不同
+  （旧版逐轨边解析边报），单处损坏的文案不变。同一条轨的 chunk 在文件里可以乱序
+  （样本跨 mdat 分布时就会出现）：chunk 表按偏移排好序再走，采样顺序与旧实现
+  「全量收集后排序」一致；同偏移时零长度的 chunk 排前面。subsample 的 `senc` 记录变长，
+  chunk 表里记下每个 chunk 的第一条记录偏移，乱序取记录也是 O(1)，不会反复重扫前缀。
+  全量展开的 `table_sample_locations` 只留在测试里当对照。
 
 * **断点续传的判据（`soda::resume`，上游无对应）**：判断函数与 `Content-Range` 解析都只做
   纯计算，不碰网络与磁盘；`pub(crate)` 不对外，因为公开它等于对判断规则做出承诺
