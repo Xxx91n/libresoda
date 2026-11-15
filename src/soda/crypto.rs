@@ -932,6 +932,10 @@ fn parse_stsz_limited(data: &[u8], max_samples: usize) -> Option<Vec<u32>> {
         return Some(Vec::new());
     };
     let effective = stsz_effective_count(data, sample_size_fixed, declared_count);
+    // 变长样本的尺寸表必须够 declared_count 条；截断的表不能当完整表。
+    if sample_size_fixed == 0 && declared_count > effective {
+        return None;
+    }
     if effective > max_samples.min(MAX_SAMPLE_ENTRIES) {
         return None;
     }
@@ -1130,5 +1134,14 @@ mod tests {
             parse_stsz_limited(&data, 100).map(|sizes| sizes.len()),
             Some(100)
         );
+    }
+
+    /// 变长 `stsz` 声明两条、实际只有一条尺寸：截断的表不能当完整表。
+    #[test]
+    fn parse_stsz_limited_rejects_truncated_variable_table() {
+        let mut data = vec![0u8; 12 + 4];
+        data[8..12].copy_from_slice(&2u32.to_be_bytes());
+        data[12..16].copy_from_slice(&16u32.to_be_bytes());
+        assert!(parse_stsz_limited(&data, 10).is_none());
     }
 }
