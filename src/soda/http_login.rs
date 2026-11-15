@@ -381,19 +381,17 @@ fn verify_request(inner: &Arc<Inner>, body: &[u8]) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("GET")
         .to_ascii_uppercase();
-    let url = spec
+    let raw_url = spec
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .trim()
         .to_string();
-    // 原样转发页面给的地址：`a_bogus` 是对这个字符串算的，规范化（去默认端口、
-    // 重编码 query）会让签名对不上。安全性不靠改字符串，靠 `check_verify_target`
-    // 用 `url::Url::parse` 校验——ureq 2.12.1 发请求前用的也是同一个解析器，
-    // 校验看到的主机就是它将要连的主机（票 #52）。
-    if let Err(message) = check_verify_target(&url) {
-        return bridge_error(message);
-    }
+    // 校验通过后直接用解析结果的规范化字符串发请求：ureq 收到的就是这里
+    // 校验过的同一个地址，不再出现「校验时看 A 主机、发出去到 B 主机」（票 #52）。
+    let url = match check_verify_target(&raw_url) {
+        Ok(target) => target.as_str().to_string(),
+        Err(message) => return bridge_error(message),
+    };
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     if let Some(map) = spec.get("headers").and_then(Value::as_object) {
         for (name, value) in map {
@@ -597,7 +595,8 @@ fn json_str_field(body: &[u8], field: &str) -> String {
 /// 会被切成 `api.qishui.com` 放行，真实请求却发去 `collector.example`，登录 Cookie
 /// 跟着送出去（票 #52，CWE-918）。现在交给 `url` 按标准解析，再把原始 authority
 /// 里的 `@` 也查一遍，把 `https://@api.qishui.com/` 这种空 userinfo 一并拒掉。
-fn check_verify_target(raw: &str) -> std::result::Result<(), &'static str> {
+/// 通过后返回解析结果，调用方拿它的规范化字符串去发请求，校验和发送是同一个地址。
+fn check_verify_target(raw: &str) -> std::result::Result<Url, &'static str> {
     let raw = raw.trim();
     let Some((_, after_scheme)) = raw.split_once("://") else {
         return Err("验证请求地址无效");
@@ -621,7 +620,7 @@ fn check_verify_target(raw: &str) -> std::result::Result<(), &'static str> {
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(host)) =>
         {
-            Ok(())
+            Ok(parsed)
         }
         _ => Err("验证请求目标不受支持"),
     }
@@ -702,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_rejects_before_sending() {
+    fn verify_request_rejects_userinfo_and_http_targets() {
         let inner = bridge_inner();
         for url in [
             "https://api.qishui.com:443@evil.example/",
