@@ -1,6 +1,6 @@
 //! 专辑：搜索 / 分享页解析（对应上游 `soda/album.go` + `fetchAlbumDetail`）。
 
-use super::search::{fetch_android_search, parse_album_search};
+use super::search::{fetch_search_body, parse_album_search};
 use super::types::{
     album_link, build_image_url, join_track_artists, max_bitrate_size, track_extra, track_link,
     ShareAlbumPage, SODA_ANDROID_SEARCH_PAGE_SIZE, USER_AGENT,
@@ -27,7 +27,7 @@ pub fn fetch_pc_album_detail(soda: &Soda, album_id: &str) -> Result<serde_json::
 
 /// 等价 `SearchAlbum`。
 pub fn search_album(soda: &Soda, keyword: &str) -> Result<Vec<Playlist>> {
-    let body = fetch_android_search(soda, "album", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
+    let body = fetch_search_body(soda, "album", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
     let albums = parse_album_search(&body)?;
 
     Ok(albums

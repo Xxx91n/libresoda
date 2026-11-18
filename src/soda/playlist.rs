@@ -1,6 +1,6 @@
 //! 歌单：搜索 / 分页详情 / web 兜底（对应上游 `soda/playlist.go` + `fetchPlaylistDetail*`）。
 
-use super::search::{fetch_android_search, parse_playlist_search};
+use super::search::{fetch_search_body, parse_playlist_search};
 use super::types::{
     build_image_url, playlist_link, PlaylistDetailResponse, UserPlaylistItem,
     SODA_ANDROID_SEARCH_PAGE_SIZE, USER_AGENT,
@@ -15,7 +15,7 @@ use crate::util::{first_non_empty, query_escape};
 
 /// 等价 `SearchPlaylist`。
 pub fn search_playlist(soda: &Soda, keyword: &str) -> Result<Vec<Playlist>> {
-    let body = fetch_android_search(soda, "playlist", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
+    let body = fetch_search_body(soda, "playlist", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
     let items = parse_playlist_search(&body)?;
 
     Ok(items

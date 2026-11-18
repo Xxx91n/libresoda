@@ -1,6 +1,6 @@
 //! 搜索与链接解析入口（对应上游 `soda/song.go`）。
 
-use super::search::{fetch_android_search, parse_track_search};
+use super::search::{fetch_search_body, parse_track_search};
 use super::track::{build_song_from_track, fetch_song_detail};
 use super::types::{SODA_ANDROID_SEARCH_PAGE_SIZE, USER_AGENT};
 use super::Soda;
@@ -11,7 +11,7 @@ use crate::soda::link::extract_track_id;
 
 /// 等价 `(*Soda).Search`。
 pub fn search(soda: &Soda, keyword: &str) -> Result<Vec<Song>> {
-    let body = fetch_android_search(soda, "track", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
+    let body = fetch_search_body(soda, "track", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
     let tracks = parse_track_search(&body)?;
     Ok(tracks.iter().map(build_song_from_track).collect())
 }

@@ -953,6 +953,17 @@
 由 `signature` 模块的签名提供者（libmssdk / 抓包回填 / 本地桥）负责。细节见
 [`QR-LOGIN.md`](QR-LOGIN.md)。
 
+## 签名器 URL 与搜索凭据（2026-11）
+
+搜索现在会带着 Soda Cookie、设备身份和关键词去请求签名器，签名契约要求完整请求头，
+因此**签名器本身必须受信**。`SignatureProvider::exposes_credentials_over_plain_http()`
+默认 `false`；`HttpSignature` 对非本机 `http://` 返回 `true`，搜索在任何序列化/发送前
+拒绝该配置，只放行本机回环 HTTP 与 HTTPS。`HttpSignature::sign` 也会先解析并校验
+signer URL，非法 URL 或远端明文 HTTP 直接报 `signer error:`。
+
+这是“库不静默降级”的延伸：签名器已配置但签名失败/缺 `x-helios`/`x-medusa` 时，
+搜索返回签名错误，不会改发未签名请求假装“没有结果”。
+
 ## 如何同步上游
 
 ```bash

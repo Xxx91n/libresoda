@@ -6,7 +6,8 @@ use super::types::{
 use super::Soda;
 use crate::error::{Result, SodaError};
 use crate::http::{self, RequestOption};
-use crate::util::Params;
+use crate::util::{now_millis, random_uuid_v4, Params};
+use std::collections::BTreeMap;
 
 /// 等价 `sodaAndroidSearchParams`。
 pub fn android_search_params() -> Params {
@@ -105,7 +106,179 @@ pub fn fetch_search_all_body(
     page: i64,
     page_size: i64,
 ) -> Result<Vec<u8>> {
-    fetch_android_search(soda, "all", keyword, page, page_size)
+    // 2026-11 起 Android `/luna/search/all` 对未签名请求返回
+    // `{"extra":{"empty_search":1}}`（或空 body），PC 端 `/luna/pc/search/all`
+    // 带应用签名才返回完整 result_groups。没有配置签名器时保留旧的 Android
+    // 路径作为降级；配置了签名器则签名失败必须报错，不能静默变成"搜不到"。
+    if soda.signature_provider().is_none() {
+        return fetch_android_search(soda, "all", keyword, page, page_size);
+    }
+    fetch_pc_search_all(soda, keyword, page, page_size, "all")
+}
+
+/// 按搜索范围取原始回包。
+///
+/// 有签名器时统一走 PC 综合搜索（服务端当前只对带签名的 PC 请求返回结果）；
+/// 没有签名器时保留原来的 Android 分类接口，避免把未签名的综合请求当成
+/// “没有结果”。综合搜索本身仍由 [`fetch_search_all_body`] 处理。
+pub(crate) fn fetch_search_body(
+    soda: &Soda,
+    search_type: &str,
+    keyword: &str,
+    page: i64,
+    page_size: i64,
+) -> Result<Vec<u8>> {
+    if soda.signature_provider().is_some() {
+        fetch_pc_search_all(soda, keyword, page, page_size, search_type)
+    } else {
+        fetch_android_search(soda, search_type, keyword, page, page_size)
+    }
+}
+
+/// PC 综合搜索（`GET /luna/pc/search/all`），使用应用级签名。
+///
+/// 上游 `music-lib` 没有 PC 综合搜索的等价实现（它只有 Android 搜索）；
+/// 这是按官方 PC 客户端接口新增的实现，不假装存在同名 port。
+fn fetch_pc_search_all(
+    soda: &Soda,
+    keyword: &str,
+    page: i64,
+    page_size: i64,
+    fallback_type: &str,
+) -> Result<Vec<u8>> {
+    let Some(provider) = soda.signature_provider() else {
+        return Err(SodaError::http("搜索需要配置签名器"));
+    };
+    if provider.exposes_credentials_over_plain_http() {
+        return Err(SodaError::http(
+            "signer error: 签名器使用非本机明文 HTTP，拒绝发送搜索凭据",
+        ));
+    }
+    let android_page = page;
+    let android_page_size = page_size;
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+    let credentials = soda.app_credentials().unwrap_or_default();
+    let qr_device = soda.qr_device();
+    let device_id = if credentials.device_id.trim().is_empty() {
+        qr_device
+            .as_ref()
+            .map(|device| device.device_id.clone())
+            .unwrap_or_default()
+    } else {
+        credentials.device_id.trim().to_string()
+    };
+    let install_id = if credentials.iid.trim().is_empty() {
+        qr_device
+            .as_ref()
+            .map(|device| device.install_id.clone())
+            .unwrap_or_default()
+    } else {
+        credentials.iid.trim().to_string()
+    };
+    let fp = if credentials.fp.trim().is_empty() {
+        device_id.clone()
+    } else {
+        credentials.fp_or_device_id()
+    };
+    let cursor = ((page - 1) * page_size).to_string();
+    let mut params = Params::new();
+    for (key, value) in [
+        ("aid", "386088"),
+        ("app_name", "luna_pc"),
+        ("region", "cn"),
+        ("geo_region", "cn"),
+        ("os_region", "cn"),
+        ("sim_region", ""),
+        ("device_id", device_id.as_str()),
+        ("cdid", ""),
+        ("iid", install_id.as_str()),
+        ("version_name", "3.7.0"),
+        ("version_code", "30070000"),
+        ("channel", "official"),
+        ("build_mode", "master"),
+        ("network_carrier", ""),
+        ("ac", "wifi"),
+        ("tz_name", "Asia/Shanghai"),
+        ("resolution", ""),
+        ("device_platform", "windows"),
+        ("device_type", "Windows"),
+        ("os_version", "Windows 11"),
+        ("fp", fp.as_str()),
+        ("q", keyword),
+        ("cursor", cursor.as_str()),
+        ("search_id", &random_uuid_v4()),
+        ("search_method", "input"),
+        ("debug_params", ""),
+        ("from_search_id", ""),
+        ("search_scene", ""),
+    ] {
+        params.set(key, value);
+    }
+    params.set("_rticket", now_millis().to_string());
+
+    let url = format!("{SODA_ANDROID_API_BASE}/pc/search/all?{}", params.encode());
+    let mut headers = BTreeMap::new();
+    for (key, value) in [
+        ("User-Agent", "LunaPC/3.7.0(452316191)"),
+        ("Accept", "application/json"),
+        ("Accept-Encoding", "identity"),
+        ("X-Luna-Background-Type", "foreground"),
+        ("X-Luna-Is-Background-Req", "0"),
+        ("X-Luna-Is-Local-User", "0"),
+        ("Cookie", soda.cookie().as_str()),
+    ] {
+        headers.insert(key.to_string(), value.to_string());
+    }
+    let signed = provider
+        .sign(&super::signature::SignRequest {
+            url: url.clone(),
+            method: "GET".to_string(),
+            body: String::new(),
+            ts_ms: now_millis(),
+            headers: headers.clone(),
+        })
+        .map_err(super::signature::with_signer_context)?;
+    if signed.is_empty() {
+        if provider.allows_empty_signature() {
+            return fetch_android_search(
+                soda,
+                fallback_type,
+                keyword,
+                android_page,
+                android_page_size,
+            );
+        }
+        return Err(super::signature::empty_signature_error());
+    }
+    let signed_url = super::signature::apply_signature_to_url(&url, &signed);
+    let mut options = RequestOption::new();
+    for (name, value) in &headers {
+        options = options.header(name.clone(), value.clone());
+    }
+    for (name, value) in &signed.headers {
+        options = options.header(name.clone(), value.clone());
+    }
+    // 校验的是“最终会发出去的合并头”，而不是签名器原始 map：后者可能同时
+    // 出现 X-Helios / x-helios 两个大小写不同的键。
+    let merged = crate::http::merge_options(std::slice::from_ref(&options));
+    let missing: Vec<&str> = ["x-helios", "x-medusa"]
+        .into_iter()
+        .filter(|name| {
+            !merged
+                .headers()
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(SodaError::http(format!(
+            "signer error: 搜索签名缺少请求头 {}",
+            missing.join(", ")
+        )));
+    }
+    http::get(&signed_url, &[options])
+        .map_err(|err| SodaError::http(super::signature::redact_urls_in_text(&err.to_string())))
 }
 
 /// 等价 `androidSearchOptions`。
@@ -237,7 +410,7 @@ pub(crate) fn parse_playlist_search(body: &[u8]) -> Result<Vec<super::types::Use
 
 /// 等价 `SearchArtist`。
 pub fn search_artist(soda: &Soda, keyword: &str) -> Result<Vec<super::types::Artist>> {
-    let body = fetch_android_search(soda, "artist", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
+    let body = fetch_search_body(soda, "artist", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
     parse_artist_search(&body)
 }
 
