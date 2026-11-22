@@ -5,8 +5,9 @@
 //! 复用同一套假服务器与合成素材。
 //!
 //! #2 的「测试决定」要求这一层放在**新的集成测试文件**里：用例只看得见公开 API，所以断言只能落在
-//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误类别与
-//! 线上真发了几次什么请求。假服务器按 #2 的约定用本地 `TcpListener` 手写，不引 mock 库。
+//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个传输事实与
+//! `stream_info`（#55：交回的流信息就是这次实际取流的那份，假服务器记下的请求可以证明）、错误
+//! 类别与线上真发了几次什么请求。假服务器按 #2 的约定用本地 `TcpListener` 手写，不引 mock 库。
 //!
 //! 合成素材（密钥、MP4 box、`play_auth`）来自 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用；
 //! 这里只需要「一把已知密钥能解开的加密样本」，用来证明交付的是解密后的成品而不是密文，并让
@@ -257,6 +258,13 @@ fn a_resumed_download_matches_the_one_shot_download_byte_for_byte() {
     assert_eq!(report.on_disk, total as u64, "磁盘累计");
     assert_eq!(report.total_len, total as u64, "文件总长");
     assert_eq!(report.status, 206, "把字节交给调用方的那一次");
+    // #55：交回的流信息就是这次实际取流的那份 —— 剩下的字节就是发往 `rest_url` 的那次
+    // 响应交付的。
+    assert_eq!(
+        report.stream_info.url, rest_url,
+        "stream_info 的 URL 与这次取流的是同一条"
+    );
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert!(
         report.transferred < report.total_len,
         "补的是缺口，不是整份"
@@ -315,6 +323,9 @@ fn a_full_response_reports_no_resume_and_the_whole_size() {
     assert_eq!(report.on_disk, total as u64);
     assert_eq!(report.total_len, total as u64);
     assert_eq!(report.status, 200);
+    // #55：协议退回整份时，交回的也是这次实际取到的那条整份流。
+    assert_eq!(report.stream_info.url, full_url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
@@ -429,6 +440,10 @@ fn a_failed_delivery_is_retried_without_transferring_bytes() {
     assert_eq!(report.resumed_from, None);
     assert_eq!(report.on_disk, total as u64);
     assert_eq!(report.total_len, total as u64);
+    // #55：`416` 判已完成时，交回的流信息与这次解密用的密钥同源 —— 这次解析出的 `play_auth`
+    // 与当初落盘字节加密时的密钥指纹一致（`resume.rs` 的守卫），才走得进「只重做解密」。
+    assert_eq!(report.stream_info.url, retry_url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt"),
@@ -491,6 +506,9 @@ fn a_plaintext_stream_is_delivered_like_an_encrypted_one() {
     assert_eq!(report.transferred, body.len() as u64);
     assert_eq!(report.on_disk, body.len() as u64);
     assert_eq!(report.total_len, body.len() as u64);
+    // #55：明文流同样交回本次实际取流的那份；`play_auth` 为空。
+    assert_eq!(report.stream_info.url, url);
+    assert_eq!(report.stream_info.play_auth, "");
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         body,

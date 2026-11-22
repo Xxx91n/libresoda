@@ -213,7 +213,9 @@ soda.media_stats(&[("media_id", "<track_id>".into()), ("media_type", "track".int
 
 * 实测：整曲无损 46.3MB/236.6s 下载并解密（ffmpeg 可解码）；最近播放 写→读→删均通过
 * 断点续传：`soda.download_resumable(&song, path)?` 交回 `DownloadReport`（`resumed_from` /
-  `transferred` / `on_disk` / `total_len` / `status`）；`download` / `download_with_info` 保留旧
+  `transferred` / `on_disk` / `total_len` / `status`，另有 `stream_info`：**本次实际使用的**流信息，
+  含音质 / 格式 / 是否试听 —— 与落盘字节同一次取流，写档位 / 试听记录用它，**不要再调
+  `get_download_info` 补**，重新解析拿到的是另一条流）；`download` / `download_with_info` 保留旧
   行为（不续传、取流成功后失败即删），但底下共用同一套实现。临时名由目标路径推导（`.part` /
   `.part.meta` / `.part.meta.tmp` / `.part.lock` / `.dec.tmp`）；网络文件系统上的锁不可靠，
   续传可能退回重下；锁可用时不会产出坏文件，完全失效时的限制见 `docs/PORTING.md`
