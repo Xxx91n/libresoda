@@ -336,11 +336,9 @@ fn download_with_strategy(
 /// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」，流信息来自
 /// [`#55`](https://github.com/sodahub-org/libresoda/issues/55)）。
 ///
-/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**，只解析一次、与
-/// 落盘字节同一条；`416` 判已完成时字节是上次下的，能对上多少见字段注释。写档位 / 试听记录
-/// 直接用它，不要再调 [`get_download_info`] 补 —— 重新解析可能拿到另一条流（换 CDN / 换
-/// 档位 / 新 `play_auth`），跟盘上文件对不上。为什么这样设计、`Eq` 为什么被去掉，见
-/// `docs/PORTING.md`。
+/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：续传与退回整份时
+/// 与落盘字节同一条；`416` 判已完成时字节是上次下的，能对上多少见字段注释。写档位 / 试听
+/// 记录直接用它，不要再调 [`get_download_info`] 补。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadReport {
@@ -375,9 +373,8 @@ pub struct DownloadReport {
 /// 失败时的两条：解密失败**不删**加密数据，再调一次时服务端若回 `416` 证明已经下完，就只重做
 /// 解密、不再传字节（#2 用户故事 12）；目标文件只在最后那次改名时才被碰，失败不留半截产物。
 ///
-/// 返回的 [`DownloadReport`] 除了传输事实，还带 `stream_info` —— 本次实际交付的那条流；写
-/// 档位 / 试听记录直接用它，不要再调 [`get_download_info`] 补（边界细节见 [`DownloadReport`]
-/// 与 `docs/PORTING.md`）。
+/// 返回的 [`DownloadReport`] 除了传输事实，还带 `stream_info` —— 本次实际交付的那条流，用法
+/// 与边界见 [`DownloadReport`]。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
     let (info, staged) =
         download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
