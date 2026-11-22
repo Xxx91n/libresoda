@@ -217,7 +217,7 @@ soda.media_stats(&[("media_id", "<track_id>".into()), ("media_type", "track".int
   含音质 / 格式 / 是否试听 —— 与落盘字节同一次取流；`416` 只重做解密那条路：加密流只能证明
   密钥没换、总长对得上，据此认为是同一条流，明文流没有字节身份证据，URL 级来源不承诺
   （见 `docs/PORTING.md`），写档位 / 试听记录用它，**不要再调 `get_download_info` 补**，
-  重新解析拿到的是另一条流）；
+  重新解析可能拿到另一条流）；
   `download` / `download_with_info` 保留旧
   行为（不续传、取流成功后失败即删），但底下共用同一套实现。临时名由目标路径推导（`.part` /
   `.part.meta` / `.part.meta.tmp` / `.part.lock` / `.dec.tmp`）；网络文件系统上的锁不可靠，

@@ -336,13 +336,11 @@ fn download_with_strategy(
 /// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」，流信息来自
 /// [`#55`](https://github.com/sodahub-org/libresoda/issues/55)）。
 ///
-/// 各字段的含义见下面的字段注释；成功交付时 `on_disk` 必然等于 `total_len`，但别拿
-/// `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数。完整口径、失败处置与
-/// `Eq` 移除的记录见 `docs/PORTING.md`。
-///
 /// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**，只解析一次、与
 /// 落盘字节同一条；`416` 判已完成时字节是上次下的，能对上多少见字段注释。写档位 / 试听记录
-/// 直接用它，不要再调 [`get_download_info`] 补 —— 重新解析拿到的是另一条流。
+/// 直接用它，不要再调 [`get_download_info`] 补 —— 重新解析可能拿到另一条流（换 CDN / 换
+/// 档位 / 新 `play_auth`），跟盘上文件对不上。为什么这样设计、`Eq` 为什么被去掉，见
+/// `docs/PORTING.md`。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadReport {
@@ -355,7 +353,8 @@ pub struct DownloadReport {
     /// 独立是为了让调用方别用 `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，
     /// 不是这次写下的数（#2 验收）。
     pub on_disk: u64,
-    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
+    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数；
+    /// `416` 判已完成时是本地已下的长度（与记录总长、服务端报的总长相等）。
     pub total_len: u64,
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
