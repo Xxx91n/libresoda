@@ -333,6 +333,69 @@ fn a_full_response_reports_no_resume_and_the_whole_size() {
     cleanup(&dir);
 }
 
+/// 服务器先答一个起点对不上的 `206`：旧数据接不上，作废后重发一次从 0 的请求（协议退回整份的
+/// 「重发」形态）。交回的 `stream_info` 仍是同一次解析的那条流 —— 与第 2 次实际交付字节的
+/// 响应同一条 URL（#55）。
+#[test]
+fn a_refetch_after_a_mismatched_206_still_reports_the_same_stream_info() {
+    let dir = sandbox("refetch-stream-info");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 先留下 100 字节的暂存。
+    let range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (dropped_url, _) = stream_server(vec![response(
+        "206 Partial Content",
+        &[range.as_str(), "ETag: \"v1\""],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+    soda.download_resumable(&song_for(&dropped_url, &play_auth), &target)
+        .expect_err("断流不是成功");
+    assert_eq!(part_bytes(&target).expect("半截密文"), ciphertext[..CUT]);
+
+    // 第 1 次响应：本地在 100，它从 50 起 —— 起点对不上，判「重发」；第 2 次响应：从 0 起的
+    // `206` 整份，把整曲交付。
+    let wrong_start = format!("Content-Range: bytes 50-{}/{}", total - 1, total);
+    let full_range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (url, server) = stream_server(vec![
+        answered(
+            "206 Partial Content",
+            &[wrong_start.as_str()],
+            &ciphertext[50..],
+        ),
+        answered("206 Partial Content", &[full_range.as_str()], &ciphertext),
+    ]);
+    let report = soda
+        .download_resumable(&song_for(&url, &play_auth), &target)
+        .expect("重发之后整份交付");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 2, "协议退回整份时最多发两次请求");
+    assert!(
+        requests[0].contains(&format!("Range: bytes={CUT}-")),
+        "{}",
+        requests[0]
+    );
+    assert!(requests[1].contains("Range: bytes=0-"), "{}", requests[1]);
+    assert_eq!(report.status, 206, "交付字节的是第 2 次响应");
+    assert_eq!(report.resumed_from, None, "作废重下不算接上");
+    assert_eq!(report.transferred, total as u64);
+    assert_eq!(report.on_disk, total as u64);
+    assert_eq!(report.total_len, total as u64);
+    // #55：重发交回的流信息与第 2 次实际交付的那条流同源。
+    assert_eq!(report.stream_info.url, url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    cleanup(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // 交付阶段的失败：解密失败保留加密数据；改名失败不留半截目标
 // ---------------------------------------------------------------------------

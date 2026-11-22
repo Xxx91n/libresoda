@@ -341,9 +341,11 @@ fn download_with_strategy(
 /// 与 `status` 是这次响应的两个事实。
 ///
 /// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：与落盘字节来自
-/// 同一次取流（同一次解析、同一条 URL），不是重新解析出来的 —— 续传、协议退回整份、`416`
-/// 判已完成三条路径上都成立。写档位 / 试听记录直接用它，**不要再调 [`get_download_info`] 补**：
-/// 那是一次重新解析，拿到的是另一条流，可能换 CDN / 换档位 / 换密钥，跟盘上这份对不上（#55）。
+/// 同一次取流（同一次解析），不是重新解析出来的 —— 续传与协议退回整份取的就是这次解析的
+/// URL；`416` 判已完成时字节来自上一次调用，靠「这次密钥指纹与记录一致」（不符就作废重下）
+/// 保证这份流信息仍与盘上字节同源。写档位 / 试听记录直接用它，**不要再调
+/// [`get_download_info`] 补**：那是一次重新解析，拿到的是另一条流，可能换 CDN / 换档位 /
+/// 换密钥，跟盘上这份对不上（#55）。
 ///
 /// 标为不可穷尽匹配：以后加字段不破坏调用方（#2 用户故事 17）。加 `stream_info` 时移除了
 /// `Eq`（`DownloadInfo` 含 `f64`，无法 `Eq`；`PartialEq` 保留），已记在 `docs/PORTING.md`。
@@ -380,9 +382,8 @@ pub struct DownloadReport {
 /// 解密、不再传字节（#2 用户故事 12）；目标文件只在最后那次改名时才被碰，失败不留半截产物。
 ///
 /// 返回的 [`DownloadReport`] 除了这次传输的五个事实，还带 `stream_info` —— **本次实际交付的
-/// 那条流**（音质/格式/是否试听），与落盘字节同一次取流、同一条 URL。写档位 / 试听记录直接用
-/// 它，不要再调 [`get_download_info`] 补：重新解析拿到的是另一条流，可能换 CDN / 换档位 /
-/// 换密钥，跟盘上那份对不上（#55）。
+/// 那条流**（音质/格式/是否试听），与落盘字节同一次取流（口径详见 [`DownloadReport`]）。写
+/// 档位 / 试听记录直接用它，不要再调 [`get_download_info`] 补（#55）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
     let (info, staged) =
         download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
