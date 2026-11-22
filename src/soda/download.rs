@@ -336,16 +336,13 @@ fn download_with_strategy(
 /// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」，流信息来自
 /// [`#55`](https://github.com/sodahub-org/libresoda/issues/55)）。
 ///
-/// 传输事实只描述这次调用在**网络与磁盘上发生了什么**：`resumed_from` / `transferred` /
-/// `on_disk` 三个数证明「重试补的是缺口，不是整份」（#2 用户故事 2~4），`total_len` 与
-/// `status` 是这次响应的两个事实。成功交付时 `on_disk` 必然等于 `total_len`；别拿
-/// `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数（#2 验收）。
+/// 各字段的含义见下面的字段注释；成功交付时 `on_disk` 必然等于 `total_len`，但别拿
+/// `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数。完整口径、失败处置与
+/// `Eq` 移除的记录见 `docs/PORTING.md`。
 ///
-/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：与落盘字节同一次
-/// 取流，写档位 / 试听记录直接用它，**不要再调 [`get_download_info`] 补** —— 重新解析拿到
-/// 的是另一条流（#10 的前向约束）。`416` 判已完成时字节来自上一次调用，这份流信息能与盘上
-/// 字节对上多少，见 [`stream_info`](DownloadReport::stream_info) 的字段注释与
-/// `docs/PORTING.md`（加 `stream_info` 时移除 `Eq` 的记录也在那里）。
+/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**，只解析一次、与
+/// 落盘字节同一条；`416` 判已完成时字节是上次下的，能对上多少见字段注释。写档位 / 试听记录
+/// 直接用它，不要再调 [`get_download_info`] 补 —— 重新解析拿到的是另一条流。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadReport {
@@ -363,10 +360,9 @@ pub struct DownloadReport {
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
     /// 本次实际使用的流信息（音质 / 码率 / 格式 / 是否试听 / `play_auth`）：与落盘字节同一次
-    /// 取流的那份 [`DownloadInfo`]（续传与退回整份就是这次解析的 URL 取的）。`416` 判已完成时
-    /// 字节是上次下的：加密流靠「同一把密钥」接上（#3：同一个文件可能换发不同的 `play_auth`
-    /// 而密钥不变），音质 / 格式 / 试听标记可信；明文流共用同一个空密钥指纹，没有任何身份
-    /// 证据，字段值就是这次解析的结论。URL 来源一律不承诺。
+    /// 取流的那份 [`DownloadInfo`]。`416` 判已完成时字节是上次下的：加密流只能证明密钥没换、
+    /// 总长对得上，据此**认为**音质 / 格式 / 试听是同一条流；明文流所有流共用同一个空密钥
+    /// 指纹，没有任何身份证据，字段值就是这次解析的结论。URL 来源一律不承诺。
     pub stream_info: DownloadInfo,
 }
 
