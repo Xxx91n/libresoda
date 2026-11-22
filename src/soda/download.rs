@@ -332,16 +332,15 @@ fn download_with_strategy(
     Ok((info, staged))
 }
 
-/// 一次可续传下载交回的传输事实（[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的
-/// 「详细结果」）。
+/// 一次可续传下载交回的传输事实与本次实际使用的流信息
+/// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」，流信息来自
+/// [`#55`](https://github.com/sodahub-org/libresoda/issues/55)）。
 ///
-/// 只描述这次调用在**网络与磁盘上发生了什么**：`resumed_from` / `transferred` / `on_disk` 三个数
-/// 让调用方证明「重试补的是缺口，不是整份」（#2 用户故事 2~4），`total_len` 与 `status` 是这次
-/// 响应的两个事实。流本身的音质/格式不在这里，仍由 [`DownloadInfo`] 给出。
-///
-/// 标为不可穷尽匹配：以后加字段不破坏调用方（#2 用户故事 17）。
+/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：续传与退回整份时
+/// 与落盘字节同一条；`416` 判已完成时字节是上次下的，能对上多少见字段注释。写档位 / 试听
+/// 记录直接用它，不要再调 [`get_download_info`] 补。
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DownloadReport {
     /// 从第几个字节接上的；没接上（整份重下、本来就完整、或本来就没旧数据）为 `None`。
     pub resumed_from: Option<u64>,
@@ -352,10 +351,16 @@ pub struct DownloadReport {
     /// 独立是为了让调用方别用 `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，
     /// 不是这次写下的数（#2 验收）。
     pub on_disk: u64,
-    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数。
+    /// 文件总长：`206` 用这次 `Content-Range` 的总长；`200` 没有范围事实，用交付的字节数；
+    /// `416` 判已完成时是本地已下的长度（与记录总长、服务端报的总长相等）。
     pub total_len: u64,
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
+    /// 本次实际使用的流信息（音质 / 码率 / 格式 / 是否试听 / `play_auth`）：与落盘字节同一次
+    /// 取流的那份 [`DownloadInfo`]。`416` 判已完成时字节是上次下的：加密流只能证明密钥没换、
+    /// 总长对得上，据此**认为**音质 / 格式 / 试听是同一条流；明文流所有流共用同一个空密钥
+    /// 指纹，没有任何身份证据，字段值就是这次解析的结论。URL 来源一律不承诺。
+    pub stream_info: DownloadInfo,
 }
 
 /// 以可续传路径下载 `song` 的整曲：先把**加密**字节暂存到 `{目标}.part`，下完再单独走一遍解密，
@@ -368,17 +373,18 @@ pub struct DownloadReport {
 /// 失败时的两条：解密失败**不删**加密数据，再调一次时服务端若回 `416` 证明已经下完，就只重做
 /// 解密、不再传字节（#2 用户故事 12）；目标文件只在最后那次改名时才被碰，失败不留半截产物。
 ///
-/// 返回的 [`DownloadReport`] 只描述这次传输本身；流信息（音质/格式/是否试听）用
-/// [`get_download_info`] 另取 —— 这份报告不携带「这次是不是试听片段」的标记（与
-/// [`download_with_info`] 的分工）。
+/// 返回的 [`DownloadReport`] 除了传输事实，还带 `stream_info` —— 本次实际交付的那条流，用法
+/// 与边界见 [`DownloadReport`]。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
-    let (_, staged) = download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
+    let (info, staged) =
+        download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
     Ok(DownloadReport {
         resumed_from: staged.resumed_from,
         transferred: staged.transferred,
         on_disk: staged.on_disk,
         total_len: staged.total_len,
         status: staged.status,
+        stream_info: info,
     })
 }
 
@@ -403,7 +409,8 @@ impl Soda {
         download_with_info(self, song, output_path)
     }
 
-    /// 以可续传路径下载整曲，并交回这次传输的五个事实（见 [`DownloadReport`]）。
+    /// 以可续传路径下载整曲，并交回这次传输的事实与本次实际使用的流信息（见
+    /// [`DownloadReport`]）。
     pub fn download_resumable(&self, song: &Song, output_path: &Path) -> Result<DownloadReport> {
         download_resumable(self, song, output_path)
     }

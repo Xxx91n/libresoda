@@ -101,7 +101,11 @@ soda.download(&song, Path::new("/tmp/soda.m4a"))?;
 
 `soda.download` / `soda.download_with_info` 保留旧策略（不续传、取流后失败即删本次暂存），底下与
 `soda.download_resumable` 共用同一套实现；需要断点续传时用后者，它交回 `DownloadReport`
-（接上偏移 / 本次传输 / 磁盘累计 / 总长 / 状态码）。
+（接上偏移 / 本次传输 / 磁盘累计 / 总长 / 状态码，另有 `stream_info`：本次实际使用的流信息 ——
+音质 / 格式 / 是否试听，与落盘字节同一次取流；`416` 只重做解密那条路：加密流只能证明密钥
+没换、总长对得上，据此认为是同一条流，明文流没有字节身份证据，URL 级来源不承诺，
+见 [`docs/PORTING.md`](docs/PORTING.md) —— 写档位 / 试听记录用它，不要再调
+`get_download_info` 补）。
 
 所有临时名都由目标路径推导：`{目标}.part`（未下完的加密字节）、`{目标}.part.meta`（记录）、
 `{目标}.part.meta.tmp`（记录的原子写临时名）、`{目标}.part.lock`（并发锁，空文件、不删）、

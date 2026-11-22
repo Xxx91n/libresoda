@@ -40,7 +40,7 @@
 | （上游无对应）| `fetch::fetch_range`：断点续传的取数层 —— 对指定偏移发一次 `Range: bytes={offset}-`，交回状态码、`Content-Range` 解析结果、`ETag` 原值与未读的响应体；**不含判断逻辑**。`pub(crate)`（它交回的就是 `resume` 那个不外见的类型）；实现票 [`#6`](https://github.com/sodahub-org/libresoda/issues/6)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；可见性口径见下文「与上游的实现差异」 |
 | （上游无对应）| `part_record::{StagedPaths, staged_paths, PartRecord, StagedPart, write_record, load_record, discard_parts, purge_expired_parts, etag_matches, key_fingerprint}`：`.part` 与它的记录文件 `{目标}.part.meta` 的命名规则、原子写、读回时的一起作废、7 天清扫。`pub(crate)` 的理由是它对外承诺的是**落盘格式**（四样字段），不是 `resume` 那种判断规则；实现票 [`#7`](https://github.com/sodahub-org/libresoda/issues/7)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，字段、判龄与「什么位置不许删」的取舍见下文「断点续传的记录文件」 |
 | （上游无对应）| `staged::{download_staged_to_file, DownloadStrategy, StagedDownload}`：可续传的暂存下载主路径 —— 把加密字节写进 `{目标}.part`，接得上就追加、协议退回整份就清空重写，全部读写在 `{目标}.part.lock` 那把不等待的独占锁下；下完之后在同一把锁里解密、改名到位、作废暂存对。`DownloadStrategy::{Legacy, Resumable}` 是同一套实现上的两种行为（#10）：旧策略不续传、只发一次整份请求、取流成功后失败即删本次暂存（取流失败不动作废前已有的暂存）。`pub(crate)`：对外入口是 `download` 的三个公开函数，这里交回的 `StagedDownload` 是 `DownloadReport` 的内部件；实现票 [`#8`](https://github.com/sodahub-org/libresoda/issues/8)、[`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)，口径票 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)，锁、处置表与请求次数见下文「断点续传的暂存下载主路径」 |
-| （上游无对应）| `download::{download_resumable, DownloadReport}`：可续传下载的公开入口 —— 一次调用完成「解析流 → 暂存加密字节 → 解密 → 改名到位」，交回五个传输事实（`resumed_from` / `transferred` / `on_disk` / `total_len` / `status`），结果结构标为 `#[non_exhaustive]`。旧 `download` / `download_with_info` 在 #10 之后也走同一条实现（`Legacy` 策略），函数体只做参数转调。实现票 [`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；解密、失败处置、可见性与删除计划见下文「断点续传的解密与详细结果」「旧下载函数的转调与策略枚举」 |
+| （上游无对应）| `download::{download_resumable, DownloadReport}`：可续传下载的公开入口 —— 一次调用完成「解析流 → 暂存加密字节 → 解密 → 改名到位」，交回五个传输事实（`resumed_from` / `transferred` / `on_disk` / `total_len` / `status`）与本次实际使用的流信息（`stream_info`，#55），结果结构标为 `#[non_exhaustive]`。旧 `download` / `download_with_info` 在 #10 之后也走同一条实现（`Legacy` 策略），函数体只做参数转调。实现票 [`#9`](https://github.com/sodahub-org/libresoda/issues/9)、[`#10`](https://github.com/sodahub-org/libresoda/issues/10)、[`#55`](https://github.com/sodahub-org/libresoda/issues/55)，上级 [`#2`](https://github.com/sodahub-org/libresoda/issues/2)；解密、失败处置、可见性与删除计划见下文「断点续传的解密与详细结果」「旧下载函数的转调与策略枚举」 |
 | `findBox` / `findBoxDeep` / `parseStsz` / `parseSenc` | `crypto::{find_box, find_box_deep, parse_stsz, parse_senc}` |
 | `decryptSencSample` / `encryptedSampleOriginalFormat` | `crypto::{decrypt_senc_sample, encrypted_sample_original_format}` |
 | `sodaQualityRank` / `sodaBetterStreamCandidate` | `quality::{quality_rank, better_stream_candidate}` |
@@ -85,7 +85,7 @@
 | （上游无对应）| `src/soda/fetch.rs` 的 `#[cfg(test)]`：本地 `TcpListener` 假服务器逐个形态回（`206` 带区间 / 忽略范围回 `200` / `416` 带与不带 `bytes */N` / `503` / 读不懂的范围头 / 同名头写两行 / 非 UTF-8 头值 / 弱 `ETag` / 偏移取 `u64::MAX` / 调用方的头透传与 `Range` 覆盖），按形态断到该断的那部分事实（三项不必每条都断满：弱 `ETag` 那条只看 `ETag`，`416` 不带范围头那条不读响应体），按偏移取数那几条还断言 `Range` 真上了线。不引 mock 库；取数层是 `pub(crate)`，所以用例落在模块内 |
 | （上游无对应）| `src/soda/staged_tests.rs`：#8 的端到端用例，同样用本地 `TcpListener` 手写假流服务器（不引 mock 库）。按 #2 的三种形态各有用例（`206` 追加、忽略范围的 `200` 退回整份、`416` 判已完成 / 判作废），再补上「不能用来续传」的其余形态（`206` 没带范围头、`416` 没带总长头、`416` 带的是闭区间、密钥指纹不符、起点不吻合）。断言只落在外部可见的东西上：`.part` 的字节（四处与一次性整份下载**逐字节**对比 —— 另起一个只回 `200` 整份的服务器、走 `http::get_reader` 拿回来的那串；其余用例与同一份 fixture 比）、`.part` 与 `.part.meta` 这对暂存在每一档失败下的去留（保留：鉴权失败、`5xx`、表里没点名的 `4xx`（429/418）、连不上、被封顶的 `206`、声明了长度却只给一半的 `200`；删除：`404`/`410`、交付字节与这次区间不符 —— 多给与少给两格都试）、交回的五个事实、错误文本、线上真的发了几次什么请求（「一次调用最多两次」与「断流/连不上不自己重试」都是数出来的：后者靠一个每接受一个连接就记一次、答话前先丢掉连接的假服务器）。并发那一组三条，机制各不一样：手持锁句柄（撞锁立刻报错、一个请求都不发出去）、整份应答前先卡住的服务器（两路并发时产出仍然正确）、正文分两段发的服务器（`.part` 开在下载手里那段时间：锁文件确实被占着，而 `.part` 本身读得动也锁得上 —— #2 规定不锁数据文件；Linux 的 flock 是建议锁，只断「读得动」在这一档没有牙）。撞锁那两条把调用放进带 `recv_timeout` 的线程里：库里一旦改成等锁，用例是超时失败而不是永远卡住。**#8 那一批不在 `tests/` 里**：#2 说「端到端测试放新的集成测试文件」，而 `tests/` 只够得着公开 API，#8 的入口当时还是 `pub(crate)` —— 为测试把它做成 `pub` 是反模式（也违反铁律 2），所以那批用例放在 `soda` 这一层的兄弟模块里，只能看见 `pub(crate)`。对外入口落地后（#9），`tests/` 那份由下一行补上 |
 | （上游无对应）| `src/soda/fetch.rs::range_probe`：#9 的真机探针（`#[ignore]`，不进 CI）。放在库内是因为要 `pub(crate)` 的 `fetch_range` 交回状态码/范围头；用 `SODA_COOKIE` + `SODA_TRACK_ID` 或 `SODA_KEYWORD` 驱动，输出只有状态码与布尔事实（不印 URL / Cookie / track id / 体积）。2026-10-30 在 WSL 跑过一次，结论与单点局限记在「断点续传的取数层」一节 |
-| （上游无对应）| `tests/download_resumable_tests.rs`：#9 的端到端用例，只走公开 API。假服务器同样用本地 `TcpListener` 手写；断言落在成品字节、暂存 / 记录 / `.dec.tmp` 的去留、`DownloadReport` 的五个事实、错误类别与线上真发出的请求。与 `staged_tests.rs` 互补：那里钉下载层，这里钉「一次调用 → 解密 → 改名」这条交付链。逐字节对比的基准就是**旧下载函数自己的产出**（`download` 对另一个只回 `200` 整份的假服务器、同一份密文做一次性下载），所以比的是真函数而不是复制品；#10 之后旧函数也走同一套实现，但它的产出在同一条用例里先与 `decrypt_audio_with_key` 的批量解密结果逐字节对齐，独立基准仍然成立。失败侧两条：解密失败保留 `.part`/记录且不碰旧目标（再调一次时 416 只重做解密，仍失败也保留密文）；改名被目录挡住时不留半截目标、不删加密数据。另有一条钉「只重跑解密」的恢复路线（第一次交付被目录挡住 → 第二次 `416` 判已完成、`transferred == 0` 只解密），顺带钉住上次留下的 `.dec.tmp` 被截断重用。#10 又补了六条钉旧包装：只发一次请求且不带 `Range`、忽略可续传留下的暂存、下载段失败后暂存全删、交付段失败后暂存全删、明文流照样交付、失败时保留预存的旧目标；#20 再补两条：取流失败（404 / 503 / 连接断开 / 被拒）时保留已有的续传暂存、记录临时名被目录占位时仍整曲落盘。合成素材在 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用 |
+| （上游无对应）| `tests/download_resumable_tests.rs`：#9 的端到端用例，只走公开 API。假服务器同样用本地 `TcpListener` 手写；断言落在成品字节、暂存 / 记录 / `.dec.tmp` 的去留、`DownloadReport` 的五个传输事实与 `stream_info`（#55：报告里的 URL 就用例里那条真被服务器接到的流地址，续传 / 退回整份（含重发形态）/ 416 只重做解密 / 明文五条路径各断一次）、错误类别与线上真发出的请求。与 `staged_tests.rs` 互补：那里钉下载层，这里钉「一次调用 → 解密 → 改名」这条交付链。逐字节对比的基准就是**旧下载函数自己的产出**（`download` 对另一个只回 `200` 整份的假服务器、同一份密文做一次性下载），所以比的是真函数而不是复制品；#10 之后旧函数也走同一套实现，但它的产出在同一条用例里先与 `decrypt_audio_with_key` 的批量解密结果逐字节对齐，独立基准仍然成立。失败侧两条：解密失败保留 `.part`/记录且不碰旧目标（再调一次时 416 只重做解密，仍失败也保留密文）；改名被目录挡住时不留半截目标、不删加密数据。另有一条钉「只重跑解密」的恢复路线（第一次交付被目录挡住 → 第二次 `416` 判已完成、`transferred == 0` 只解密），顺带钉住上次留下的 `.dec.tmp` 被截断重用。#10 又补了六条钉旧包装：只发一次请求且不带 `Range`、忽略可续传留下的暂存、下载段失败后暂存全删、交付段失败后暂存全删、明文流照样交付、失败时保留预存的旧目标；#20 再补两条：取流失败（404 / 503 / 连接断开 / 被拒）时保留已有的续传暂存、记录临时名被目录占位时仍整曲落盘。合成素材在 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用 |
 
 ## 与上游的实现差异
 
@@ -423,13 +423,28 @@
     （#2：路径由库推导）。#10 之后 `download` / `download_with_info` 也走同一套实现，但走旧策略、
     不交报告（见下文「旧下载函数的转调与策略枚举」）。`staged` / `part_record` / `resume` /
     `fetch` 仍不公开。
-  - **结果是 `DownloadReport`**，五个 `pub` 字段：`resumed_from: Option<u64>`（没接上为 `None`）、
-    `transferred`（本次从网络写入的字节）、`on_disk`（交付前 `.part` 的字节数）、`total_len`、
-    `status`（把字节交给调用方的那一次请求的状态码）。**成功交付时 `on_disk` 必然等于
+  - **结果是 `DownloadReport`**，五个传输事实 `pub` 字段：`resumed_from: Option<u64>`（没接上为
+    `None`）、`transferred`（本次从网络写入的字节）、`on_disk`（交付前 `.part` 的字节数）、
+    `total_len`、`status`（把字节交给调用方的那一次请求的状态码）。**成功交付时 `on_disk` 必然等于
     `total_len`**（本层只在下完时返回 `Ok`）；两个字段仍然独立，是为了让调用方别用
     `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数，不是这次写下的数。结构标
-    `#[non_exhaustive]`，以后加字段不破坏调用方。流信息（音质/格式/试听）仍由 `get_download_info`
-    给出，不混进这份报告，**`is_preview` 也不在里面**（需要它的调用方自己另取）。
+    `#[non_exhaustive]`，以后加字段不破坏调用方。
+  - **`stream_info` 字段（#55）**：`DownloadReport` 还带 `stream_info: DownloadInfo` —— 本次实际
+    交付的那条流（音质/码率/格式/`is_preview`/`play_auth`）。它与落盘字节来自**同一次取流**：
+    `download_with_strategy` 只解析一次、把同一份 `DownloadInfo` 同时交给暂存路径与报告（#10 的
+    「不二次解析」前向约束），续传、协议退回整份、`416` 判已完成三条路径上都成立 —— 追加与 416
+    完成要求这次密钥指纹与记录一致（`resume.rs` 的守卫，指纹不符按作废重下处理），退回整份与
+    重发则直接用这次解析的 URL 取流。`416` 完成这条的口径分两种：**加密流**是推断 —— 指纹
+    一致即同一把密钥（#3：同一个文件可能换发不同的 `play_auth` 而密钥不变），不同档位会
+    换密钥、被 `resume.rs` 的守卫拒掉整份重取，据此认为音质 / 格式 / 试听是同一条流；残余风险
+    与 `resume.rs` 为字节本身记的同一条（指纹只证明同一把密钥，不证明同一个文件）。
+    **明文流没有身份证据** —— 指纹是空密钥的 MD5，所有明文流共用，`416` 复用的字节属于哪条流
+    无从验证，报告的就是这次解析的结论。记录（#7）不存流地址，签名 URL 级来源一律不承诺。
+    #55 不新增判据、也不改记录格式（#7 把记录限定成四样，加字段要先改那张票）；
+    **调用方不要再调 `get_download_info` 补流信息**：那是一次
+    重新解析，可能给出另一条流（换 CDN / 换档位 / 新 `play_auth`），拿它写档位/试听记录会把
+    A 流的信息写到 B 流的文件上。为此移除了 `DownloadReport` 的 `Eq`（`DownloadInfo` 含 `f64`
+    无法 `Eq`；`PartialEq` 保留）—— 这是 #55 对公开项的唯一修改，按铁律 2 在此记录。
   - **解密在锁内，输出先落到同目录的临时名**：`{目标}.dec.tmp`，写完 `flush` 之后 `rename` 到
     目标。与目标同目录是为了不跨设备 —— 跨设备的 `rename` 直接报错（`EXDEV` /
     `ERROR_NOT_SAME_DEVICE`），**不会**退化成拷贝。目标只被最后那次原子改名碰过，解密或改名失败

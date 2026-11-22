@@ -5,8 +5,9 @@
 //! 复用同一套假服务器与合成素材。
 //!
 //! #2 的「测试决定」要求这一层放在**新的集成测试文件**里：用例只看得见公开 API，所以断言只能落在
-//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个事实、错误类别与
-//! 线上真发了几次什么请求。假服务器按 #2 的约定用本地 `TcpListener` 手写，不引 mock 库。
+//! 外部可见的东西上 —— 成品文件的字节、暂存/记录/解密临时名的去留、结果里的五个传输事实与
+//! `stream_info`（#55：交回的流信息就是这次实际取流的那份，假服务器记下的请求可以证明）、错误
+//! 类别与线上真发了几次什么请求。假服务器按 #2 的约定用本地 `TcpListener` 手写，不引 mock 库。
 //!
 //! 合成素材（密钥、MP4 box、`play_auth`）来自 `tests/common/mod.rs`，与 `crypto_tests.rs` 共用；
 //! 这里只需要「一把已知密钥能解开的加密样本」，用来证明交付的是解密后的成品而不是密文，并让
@@ -257,6 +258,13 @@ fn a_resumed_download_matches_the_one_shot_download_byte_for_byte() {
     assert_eq!(report.on_disk, total as u64, "磁盘累计");
     assert_eq!(report.total_len, total as u64, "文件总长");
     assert_eq!(report.status, 206, "把字节交给调用方的那一次");
+    // #55：交回的流信息就是这次实际取流的那份 —— 剩下的字节就是发往 `rest_url` 的那次
+    // 响应交付的。
+    assert_eq!(
+        report.stream_info.url, rest_url,
+        "stream_info 的 URL 与这次取流的是同一条"
+    );
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert!(
         report.transferred < report.total_len,
         "补的是缺口，不是整份"
@@ -315,6 +323,72 @@ fn a_full_response_reports_no_resume_and_the_whole_size() {
     assert_eq!(report.on_disk, total as u64);
     assert_eq!(report.total_len, total as u64);
     assert_eq!(report.status, 200);
+    // #55：协议退回整份时，交回的也是这次实际取到的那条整份流。
+    assert_eq!(report.stream_info.url, full_url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
+    );
+    cleanup(&dir);
+}
+
+/// 服务器先答一个起点对不上的 `206`：旧数据接不上，作废后重发一次从 0 的请求（协议退回整份的
+/// 「重发」形态）。交回的 `stream_info` 仍是同一次解析的那条流 —— 与第 2 次实际交付字节的
+/// 响应同一条 URL（#55）。
+#[test]
+fn a_refetch_after_a_mismatched_206_still_reports_the_same_stream_info() {
+    let dir = sandbox("refetch-stream-info");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 先留下 100 字节的暂存。
+    let range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (dropped_url, _) = stream_server(vec![response(
+        "206 Partial Content",
+        &[range.as_str(), "ETag: \"v1\""],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+    soda.download_resumable(&song_for(&dropped_url, &play_auth), &target)
+        .expect_err("断流不是成功");
+    assert_eq!(part_bytes(&target).expect("半截密文"), ciphertext[..CUT]);
+
+    // 第 1 次响应：本地在 100，它从 50 起 —— 起点对不上，判「重发」；第 2 次响应：从 0 起的
+    // `206` 整份，把整曲交付。
+    let wrong_start = format!("Content-Range: bytes 50-{}/{}", total - 1, total);
+    let full_range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (url, server) = stream_server(vec![
+        answered(
+            "206 Partial Content",
+            &[wrong_start.as_str()],
+            &ciphertext[50..],
+        ),
+        answered("206 Partial Content", &[full_range.as_str()], &ciphertext),
+    ]);
+    let report = soda
+        .download_resumable(&song_for(&url, &play_auth), &target)
+        .expect("重发之后整份交付");
+    let requests = seen(&server);
+
+    assert_eq!(requests.len(), 2, "协议退回整份时最多发两次请求");
+    assert!(
+        requests[0].contains(&format!("Range: bytes={CUT}-")),
+        "{}",
+        requests[0]
+    );
+    assert!(requests[1].contains("Range: bytes=0-"), "{}", requests[1]);
+    assert_eq!(report.status, 206, "交付字节的是第 2 次响应");
+    assert_eq!(report.resumed_from, None, "作废重下不算接上");
+    assert_eq!(report.transferred, total as u64);
+    assert_eq!(report.on_disk, total as u64);
+    assert_eq!(report.total_len, total as u64);
+    // #55：重发交回的流信息与第 2 次实际交付的那条流同源。
+    assert_eq!(report.stream_info.url, url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt")
@@ -429,6 +503,10 @@ fn a_failed_delivery_is_retried_without_transferring_bytes() {
     assert_eq!(report.resumed_from, None);
     assert_eq!(report.on_disk, total as u64);
     assert_eq!(report.total_len, total as u64);
+    // #55：`416` 判已完成时，交回的流信息与这次解密用的密钥同源 —— 这次解析出的 `play_auth`
+    // 与当初落盘字节加密时的密钥指纹一致（`resume.rs` 的守卫），才走得进「只重做解密」。
+    assert_eq!(report.stream_info.url, retry_url);
+    assert_eq!(report.stream_info.play_auth, play_auth);
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt"),
@@ -491,6 +569,9 @@ fn a_plaintext_stream_is_delivered_like_an_encrypted_one() {
     assert_eq!(report.transferred, body.len() as u64);
     assert_eq!(report.on_disk, body.len() as u64);
     assert_eq!(report.total_len, body.len() as u64);
+    // #55：明文流同样交回本次实际取流的那份；`play_auth` 为空。
+    assert_eq!(report.stream_info.url, url);
+    assert_eq!(report.stream_info.play_auth, "");
     assert_eq!(
         std::fs::read(&target).expect("输出文件"),
         body,
