@@ -333,26 +333,19 @@ fn download_with_strategy(
 }
 
 /// 一次可续传下载交回的传输事实与本次实际使用的流信息
-/// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」；流信息来自
+/// （[`#2`](https://github.com/sodahub-org/libresoda/issues/2) 的「详细结果」，流信息来自
 /// [`#55`](https://github.com/sodahub-org/libresoda/issues/55)）。
 ///
 /// 传输事实只描述这次调用在**网络与磁盘上发生了什么**：`resumed_from` / `transferred` /
-/// `on_disk` 三个数让调用方证明「重试补的是缺口，不是整份」（#2 用户故事 2~4），`total_len`
-/// 与 `status` 是这次响应的两个事实。
+/// `on_disk` 三个数证明「重试补的是缺口，不是整份」（#2 用户故事 2~4），`total_len` 与
+/// `status` 是这次响应的两个事实。成功交付时 `on_disk` 必然等于 `total_len`；别拿
+/// `total_len - transferred` 反推磁盘字节 —— 续传时那个差是旧字节数（#2 验收）。
 ///
-/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：与落盘字节来自
-/// 同一次取流（同一次解析），不是重新解析出来的 —— 续传与协议退回整份取的就是这次解析的
-/// URL；`416` 判已完成时字节来自上一次调用，靠「这次密钥指纹与记录一致」（不符就作废重下）
-/// 接上。这条保证只对**加密流**成立到素材级：同指纹即同一把密钥，#3 的口径（同一个文件可能
-/// 换发不同的 `play_auth` 而密钥不变）支撑「同一档位素材」的推断，残余风险与 `resume.rs` 为
-/// 字节本身记的同一条（指纹只证明同一把密钥，不证明同一个文件）。**明文流没有这份保证**：
-/// 所有明文流共用空密钥指纹，复用的字节属于哪条流没有可验证的证据，音质 / 格式 / 试听标记
-/// 就是这次解析的结论。记录里不存流地址，签名 URL 级的来源一律不承诺。写档位 / 试听记录
-/// 直接用它，**不要再调 [`get_download_info`] 补**：那是一次重新解析，拿到的是另一条流，
-/// 可能换 CDN / 换档位 / 换密钥，跟盘上这份对不上（#55）。
-///
-/// 标为不可穷尽匹配：以后加字段不破坏调用方（#2 用户故事 17）。加 `stream_info` 时移除了
-/// `Eq`（`DownloadInfo` 含 `f64`，无法 `Eq`；`PartialEq` 保留），已记在 `docs/PORTING.md`。
+/// [`stream_info`](DownloadReport::stream_info) 是**这次实际交付的那条流**：与落盘字节同一次
+/// 取流，写档位 / 试听记录直接用它，**不要再调 [`get_download_info`] 补** —— 重新解析拿到
+/// 的是另一条流（#10 的前向约束）。`416` 判已完成时字节来自上一次调用，这份流信息能与盘上
+/// 字节对上多少，见 [`stream_info`](DownloadReport::stream_info) 的字段注释与
+/// `docs/PORTING.md`（加 `stream_info` 时移除 `Eq` 的记录也在那里）。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadReport {
@@ -370,9 +363,10 @@ pub struct DownloadReport {
     /// 把字节交给调用方的那一次请求的状态码（`200` / `206` / `416`）。
     pub status: u16,
     /// 本次实际使用的流信息（音质 / 码率 / 格式 / 是否试听 / `play_auth`）：与落盘字节同一次
-    /// 取流的那份 [`DownloadInfo`]，三条交付路径（续传 / 退回整份 / `416` 判已完成）上都一致
-    /// —— `416` 判已完成时加密流是素材级一致（同一把密钥），明文流没有字节身份证据；
-    /// 边界细节见结构文档。调用方不要再调 [`get_download_info`] 补（#55）。
+    /// 取流的那份 [`DownloadInfo`]（续传与退回整份就是这次解析的 URL 取的）。`416` 判已完成时
+    /// 字节是上次下的：加密流靠「同一把密钥」接上（#3：同一个文件可能换发不同的 `play_auth`
+    /// 而密钥不变），音质 / 格式 / 试听标记可信；明文流共用同一个空密钥指纹，没有任何身份
+    /// 证据，字段值就是这次解析的结论。URL 来源一律不承诺。
     pub stream_info: DownloadInfo,
 }
 
@@ -386,9 +380,9 @@ pub struct DownloadReport {
 /// 失败时的两条：解密失败**不删**加密数据，再调一次时服务端若回 `416` 证明已经下完，就只重做
 /// 解密、不再传字节（#2 用户故事 12）；目标文件只在最后那次改名时才被碰，失败不留半截产物。
 ///
-/// 返回的 [`DownloadReport`] 除了这次传输的五个事实，还带 `stream_info` —— **本次实际交付的
-/// 那条流**（音质/格式/是否试听），与落盘字节同一次取流（口径详见 [`DownloadReport`]）。写
-/// 档位 / 试听记录直接用它，不要再调 [`get_download_info`] 补（#55）。
+/// 返回的 [`DownloadReport`] 除了传输事实，还带 `stream_info` —— 本次实际交付的那条流；写
+/// 档位 / 试听记录直接用它，不要再调 [`get_download_info`] 补（边界细节见 [`DownloadReport`]
+/// 与 `docs/PORTING.md`）。
 pub fn download_resumable(soda: &Soda, song: &Song, output_path: &Path) -> Result<DownloadReport> {
     let (info, staged) =
         download_with_strategy(soda, song, output_path, DownloadStrategy::Resumable)?;
