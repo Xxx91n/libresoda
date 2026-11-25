@@ -936,9 +936,10 @@
     `is_signer_failure()` 不受影响。
   - 分类只读结构化事实：`non_2xx_retry_delay`（仅 429/5xx，且 body 的 `code` 不在
     `INVALID_REQUEST` / `UNAUTHORIZED` / `SIGNER_UNAVAILABLE` 里；退避先看
-    `Retry-After` 头，头没有或认不出（HTTP-date）就读 body 的 `retry_after_seconds` /
-    `retry_after`，都没有才用 200ms）、`ok_false_retry_delay`（仅 `BUSY` /
-    `RATE_LIMITED`，取 `retry_after_seconds`）。两者都封顶 2s（`cap_retry_delay`）。
+    `Retry-After` 头，头没有或认不出（HTTP-date）就用 `body_retry_seconds` 读 body
+    的 `retry_after_seconds` / `retry_after`，都没有才用 200ms）、
+    `ok_false_retry_delay`（仅 `BUSY` / `RATE_LIMITED`，等待时长与上一条共用
+    `body_retry_seconds`）。两者都封顶 2s（`cap_retry_delay`）。
     传输层失败走固定 200ms。**不**从错误文案反解析（那里已脱敏并截断）。
   - `http::post_with_status` 不再把「2xx 超 1 MiB」折成错误，改为照常交回并置
     `body_truncated`，由 `sign_once` 判成不可重试的签名故障。这样「传输层失败可重试」
@@ -951,8 +952,9 @@
     下载与续传层，本调用是另一条路径（已在那一节写明理由）。
   - `HttpSignature::retries` 由 `MAX_SIGNER_RETRIES`（8）夹紧：调用方填一个很大的数
     也不会让一次签名无限重打。次数之外还有整轮总预算 `MAX_SIGNER_RETRY_BUDGET`
-    （30s，检查点在一次重试发起之前）：上限 8 时最坏耗时不会被次数 × 超时拖到一分
-    多钟，到点就交回最后一次的错误。
+    （30s）：发起一次重试前检查「已花时间 + 这次等待」够不够，`sleep` 醒来后再复查
+    一次（线程可能睡过头），到点就交回最后一次的错误。判断抽成 `retry_allowed` /
+    `budget_spent` 两个纯函数，单测能钉住 `<` 与 `<=`、漏加 `delay` 这类错误。
   - **测试**：`tests/signature_tests.rs` 十三条（传输失败一次后成功且计数 = 2、尊重
     `Retry-After: 1` 的间隔 ≥ 950ms、永久错误码只请求一次、401 只请求一次且带 token
     提示、重试耗尽交回最后一次的文案（两次回包刻意不同，防「返回第一次」也能过）、
@@ -961,10 +963,11 @@
     2xx 超限 / 空签名 / JSON 解不开 / 非 `BUSY` 的 `ok:false` 各只请求一次）；
     脚本化服务器在脚本用完后继续记账并回合法签名，好让「不该重试却重试了」既能被
     计数看见、也会让 `expect_err` 因第二次成功而失败。既有一次性服务器用例全部显式
-    `.without_retries()`，继续钉住各自的失败形态。`src/soda/signature.rs` 五条纯函数
+    `.without_retries()`，继续钉住各自的失败形态。`src/soda/signature.rs` 六条纯函数
     用例（默认重试数与 builder 夹紧、`Retry-After` 解析与封顶、
     `BUSY`/`RATE_LIMITED` 判定、429/5xx 与永久错误码判定、头缺失时读 body 的
-    `retry_after_seconds` / `retry_after` 且同样封顶）。全部离线。
+    `retry_after_seconds` / `retry_after` 且同样封顶、整轮预算的边界与睡醒复查）。
+    全部离线。
 
 ## 未移植项
 

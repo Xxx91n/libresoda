@@ -297,12 +297,8 @@ pub struct HttpSignature {
     /// 401/400、永久错误码、空签名与解析失败都不重试。签名接口没有副作用，
     /// 复用同一个 `SignRequest` 是安全的（见 `docs/SIGNER-SERVICE.md` §2.4）。
     ///
-    /// 实际只在 `sign()` 读取时夹紧，最多 8 次：无论是 builder 还是直接写这个
-    /// 字段，一次签名都不会无限重打下去（字段本身仍保留调用方写进去的值）。
-    ///
-    /// 次数之外还有整轮总预算（30s，检查点在一次重试发起之前）。最坏耗时大致是
-    /// `(次数 + 1) × timeout_ms + 次数 × 2s`，再受这个预算夹住；默认 1 次时约
-    /// 12s + 2s。
+    /// 读取时夹到 `MAX_SIGNER_RETRIES`；另有整轮总预算 `MAX_SIGNER_RETRY_BUDGET`
+    /// 兜底（各自的注释写了范围与算法）。
     pub retries: u32,
 }
 
@@ -522,12 +518,16 @@ fn non_2xx_retry_delay(reply: &crate::http::PostResponse) -> Option<Duration> {
     if reply.status != 429 && !(500..600).contains(&reply.status) {
         return None;
     }
-    if body_json(&reply.body).is_some_and(|json| is_permanent_code(&json_code(&json))) {
+    let json = body_json(&reply.body);
+    if json
+        .as_ref()
+        .is_some_and(|json| is_permanent_code(&json_code(json)))
+    {
         return None;
     }
     Some(
         retry_after_header(&reply.headers)
-            .or_else(|| body_retry_seconds(&reply.body))
+            .or_else(|| json.as_ref().and_then(body_retry_seconds))
             .unwrap_or(DEFAULT_SIGNER_RETRY_DELAY),
     )
 }
@@ -542,13 +542,12 @@ fn retry_after_header(headers: &[(String, String)]) -> Option<Duration> {
         .map(cap_retry_delay)
 }
 
-/// 头里没写等待时长时，从回包体读：`retry_after_seconds` 是 libmssdk 的字段名，
-/// `retry_after` 是 Cloudflare 530 那类代理的写法。都没有才回落到固定退避 ——
-/// 429/5xx 立刻重打会放大限流，所以体的值同样要认。
-fn body_retry_seconds(body: &[u8]) -> Option<Duration> {
-    let json = body_json(body)?;
-    json_u64(&json, "retry_after_seconds")
-        .or_else(|| json_u64(&json, "retry_after"))
+/// 从已经解析好的回包里读等待时长：`retry_after_seconds` 是 libmssdk 的字段名，
+/// `retry_after` 是 Cloudflare 530 那类代理的写法。两条重试路径（非 2xx 与
+/// 2xx `ok:false`）共用这一处，免得只改一边、另一边开始立刻重打。
+fn body_retry_seconds(value: &serde_json::Value) -> Option<Duration> {
+    json_u64(value, "retry_after_seconds")
+        .or_else(|| json_u64(value, "retry_after"))
         .map(cap_retry_delay)
 }
 
@@ -574,7 +573,7 @@ fn is_unauthorized_code(code: &str) -> bool {
 }
 
 /// 2xx + `ok:false` 是否值得重试：只认 `BUSY` / `RATE_LIMITED`，
-/// 等待时长读 `retry_after_seconds`（缺省固定 200ms，封顶 2s）。
+/// 等待时长与另一条路径共用 `body_retry_seconds`（缺省固定 200ms，封顶 2s）。
 fn ok_false_retry_delay(body: &[u8]) -> Option<Duration> {
     let value = body_json(body)?;
     if value.get("ok").and_then(|ok| ok.as_bool()) != Some(false) {
@@ -587,11 +586,17 @@ fn ok_false_retry_delay(body: &[u8]) -> Option<Duration> {
     {
         return None;
     }
-    Some(
-        json_u64(&value, "retry_after_seconds")
-            .map(cap_retry_delay)
-            .unwrap_or(DEFAULT_SIGNER_RETRY_DELAY),
-    )
+    Some(body_retry_seconds(&value).unwrap_or(DEFAULT_SIGNER_RETRY_DELAY))
+}
+
+/// 一次失败之后要不要再打：次数没到上限，且**这轮**预算还够再等一次。
+fn retry_allowed(attempt: u32, max_retries: u32, elapsed: Duration, delay: Duration) -> bool {
+    attempt < max_retries && !budget_spent(elapsed + delay)
+}
+
+/// 整轮预算是否已经用完（含 sleep 醒来的复查）。
+fn budget_spent(elapsed: Duration) -> bool {
+    elapsed >= MAX_SIGNER_RETRY_BUDGET
 }
 
 fn is_loopback_signer_host(host: Option<&str>) -> bool {
@@ -646,11 +651,14 @@ impl SignatureProvider for HttpSignature {
                     // 次数用完、这类失败不该重试、或已经花掉整轮预算：交回**最后一次**
                     // 的结果，文案形状与直接调用一次时完全一致。
                     Some(delay)
-                        if attempt < max_retries
-                            && started.elapsed() + delay < MAX_SIGNER_RETRY_BUDGET =>
+                        if retry_allowed(attempt, max_retries, started.elapsed(), delay) =>
                     {
                         attempt += 1;
                         thread::sleep(delay);
+                        // sleep 可能比要求的长；醒来后预算可能已经用完，别再发起。
+                        if budget_spent(started.elapsed()) {
+                            return Err(failure.error);
+                        }
                     }
                     _ => return Err(failure.error),
                 },
@@ -1536,6 +1544,12 @@ mod tests {
             Some(DEFAULT_SIGNER_RETRY_DELAY)
         );
 
+        // 代理写法（`retry_after`）与另一条路径共用同一处解析，同样认。
+        assert_eq!(
+            ok_false_retry_delay(br#"{"ok":false,"code":"BUSY","retry_after":3}"#),
+            Some(MAX_SIGNER_RETRY_DELAY)
+        );
+
         // 其余原因码、以及根本不是 `ok:false` 的回包都不重试。
         assert_eq!(
             ok_false_retry_delay(br#"{"ok":false,"code":"INVALID_REQUEST"}"#),
@@ -1543,6 +1557,40 @@ mod tests {
         );
         assert_eq!(ok_false_retry_delay(br#"{"ok":true,"code":"BUSY"}"#), None);
         assert_eq!(ok_false_retry_delay(b"not json"), None);
+    }
+
+    /// 整轮预算：次数没到时也得看已经花掉多少，睡醒后还要复查一次。
+    #[test]
+    fn retry_budget_bounds_total_time() {
+        let delay = Duration::from_millis(200);
+
+        // 次数与预算都够。
+        assert!(retry_allowed(0, 1, Duration::ZERO, delay));
+        // 次数用完。
+        assert!(!retry_allowed(1, 1, Duration::ZERO, delay));
+        // 预算差一点就满：这一次加上数据里的等待时长就超了。
+        assert!(!retry_allowed(
+            0,
+            8,
+            MAX_SIGNER_RETRY_BUDGET - Duration::from_millis(100),
+            delay
+        ));
+        // 还剩一秒以上，可以再试。
+        assert!(retry_allowed(
+            0,
+            8,
+            MAX_SIGNER_RETRY_BUDGET - Duration::from_secs(1),
+            delay
+        ));
+
+        // sleep 醒来后的复查：正好到点、超过都算花完。
+        assert!(budget_spent(MAX_SIGNER_RETRY_BUDGET));
+        assert!(budget_spent(
+            MAX_SIGNER_RETRY_BUDGET + Duration::from_secs(1)
+        ));
+        assert!(!budget_spent(
+            MAX_SIGNER_RETRY_BUDGET - Duration::from_millis(1)
+        ));
     }
 
     /// 票 #57：非 2xx 只有 429/5xx 可重试，且永久错误码要挡住。
