@@ -297,8 +297,8 @@ pub struct HttpSignature {
     /// 401/400、永久错误码、空签名与解析失败都不重试。签名接口没有副作用，
     /// 复用同一个 `SignRequest` 是安全的（见 `docs/SIGNER-SERVICE.md` §2.4）。
     ///
-    /// 实际取值被夹在 [`MAX_SIGNER_RETRIES`] 以内：无论是 builder 还是直接写这个
-    /// 字段，一次签名都不会无限重打下去。
+    /// 实际只在 `sign()` 读取时夹紧，最多 8 次：无论是 builder 还是直接写这个
+    /// 字段，一次签名都不会无限重打下去（字段本身仍保留调用方写进去的值）。
     pub retries: u32,
 }
 
@@ -337,7 +337,7 @@ impl HttpSignature {
     }
 
     /// 设置失败后的额外重试次数（默认 1）。传 0 等价于 [`Self::without_retries`]；
-    /// 超过 [`MAX_SIGNER_RETRIES`] 按上限算。
+    /// 超过 8 次按 8 次算。
     pub fn retries(mut self, retries: u32) -> Self {
         self.retries = retries.min(MAX_SIGNER_RETRIES);
         self

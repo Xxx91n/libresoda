@@ -1087,7 +1087,10 @@ fn http_signature_does_not_retry_unparseable_body() {
         .timeout_ms(3_000)
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("JSON 解不开是签名故障");
-    assert!(error.to_string().contains("decode"), "{error}");
+    assert!(
+        error.to_string().contains("signer response decode"),
+        "{error}"
+    );
     assert_eq!(arrivals.lock().unwrap().len(), 1, "解不开的回包不该重试");
 }
 
