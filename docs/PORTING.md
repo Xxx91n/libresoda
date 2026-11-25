@@ -410,6 +410,9 @@
     旧数据已经没了」管的是前者。
   - **不做的事**：库内不重试、不等待、不睡眠、不加进程内锁表、不做磁盘压力淘汰（#2 的「明确不动」）。
     `fsync` 也不做（同上，几十 MB 的同步代价换「重下即可」的失败模式）。
+    这条只覆盖下载与续传层；签名器的 HTTP 调用是另一条路径（票
+    [`#57`](https://github.com/sodahub-org/libresoda/issues/57)，见「签名器 HTTP 调用有界重试」
+    一节）：它幂等，调用方也拿不到结构化错误，退避只能放在库内。
   - 已知限制照 #2 那条：网络文件系统上的锁不可靠，此时续传可能失效并退回重下，但不会产出坏文件
     （这句话在**锁可用的范围内**成立；锁完全失效且两路交错写时这一层不保证能识别，见上文
     「锁的实现选了 std」那一节）。
@@ -920,6 +923,51 @@
   `NoopSignature` / `CapturedSignature` 回空 → `Ok(None)`）、`src/soda/track.rs` 两条
   （空签名后零次 App POST、签名成功时闭包确实被调用）；既有「未配置 provider」用例
   保持通过。全部离线。
+
+* **签名器 HTTP 调用有界重试（`soda::signature` + `http`，上游无对应）**：实现票
+  [`#57`](https://github.com/sodahub-org/libresoda/issues/57)。`HttpSignature` 新增公开
+  字段 `retries`（默认 1）与 builder `retries(n)` / `without_retries()`。
+  **这是一处源码级破坏**：`HttpSignature` 的字段全 `pub`、又没有 `Default`，外部若有
+  结构体字面量构造，加字段会让它编译失败。仓内、`examples/` 与 sodam 都只用
+  `new()` / `from_env()` 加 builder，实际没有受影响方；这里仍按公开 API 变更记录，
+  而不是当作无破坏的加法。
+  - `sign()` 改为 `sign_once()` + 有界循环：可重试的失败带等待时长再打一次，
+    不可重试或次数用完就交回**最后一次**的错误 —— 文案形状与 `signer error:` 前缀不变，
+    `is_signer_failure()` 不受影响。
+  - 分类只读结构化事实：`non_2xx_retry_delay`（仅 429/5xx，且 body 的 `code` 不在
+    `INVALID_REQUEST` / `UNAUTHORIZED` / `SIGNER_UNAVAILABLE` 里；退避先看
+    `Retry-After` 头，头没有或认不出（HTTP-date）就用 `body_retry_seconds` 读 body
+    的 `retry_after_seconds` / `retry_after`，都没有才用 200ms）、
+    `ok_false_retry_delay`（仅 `BUSY` / `RATE_LIMITED`，等待时长与上一条共用
+    `body_retry_seconds`）。两者都封顶 2s（`cap_retry_delay`）。
+    传输层失败走固定 200ms。**不**从错误文案反解析（那里已脱敏并截断）。
+  - `http::post_with_status` 不再把「2xx 超 1 MiB」折成错误，改为照常交回并置
+    `body_truncated`，由 `sign_once` 判成不可重试的签名故障。这样「传输层失败可重试」
+    与「2xx 超限不可重试」在调用方分得开；`MAX_POST_RESPONSE_BODY` 因此改为
+    `pub(crate)`。非 2xx 超限行为不变。
+  - 非 2xx 的 401 / body `code=UNAUTHORIZED` 现在也带 `QISHUI_SIGNER_TOKEN` 提示
+    （此前只有 2xx `ok:false` 那条带）。提示文案抽成 `UNAUTHORIZED_HINT` 一处。
+  - 重试是 `std::thread::sleep`，同步阻塞：与既有 `sign()` 的同步签名一致，不引入
+    新依赖、不改 trait。`PORTING.md` 的「库内不重试、不等待、不睡眠」口径作用域限定为
+    下载与续传层，本调用是另一条路径（已在那一节写明理由）。
+  - `HttpSignature::retries` 由 `MAX_SIGNER_RETRIES`（8）夹紧：调用方填一个很大的数
+    也不会让一次签名无限重打。次数之外还有整轮总预算 `MAX_SIGNER_RETRY_BUDGET`
+    （30s）：发起一次重试前检查「已花时间 + 这次等待」够不够，`sleep` 醒来后再复查
+    一次（线程可能睡过头），到点就交回最后一次的错误。判断抽成 `retry_allowed` /
+    `budget_spent` 两个纯函数，单测能钉住 `<` 与 `<=`、漏加 `delay` 这类错误。
+  - **测试**：`tests/signature_tests.rs` 十三条（传输失败一次后成功且计数 = 2、尊重
+    `Retry-After: 1` 的间隔 ≥ 950ms、永久错误码只请求一次、401 只请求一次且带 token
+    提示、重试耗尽交回最后一次的文案（两次回包刻意不同，防「返回第一次」也能过）、
+    `Retry-After: 60` 退避落在 1.9s~2.8s、
+    `BUSY` 重试成功、`INVALID_REQUEST` 不重试、`without_retries()` 只请求一次、
+    2xx 超限 / 空签名 / JSON 解不开 / 非 `BUSY` 的 `ok:false` 各只请求一次）；
+    脚本化服务器在脚本用完后继续记账并回合法签名，好让「不该重试却重试了」既能被
+    计数看见、也会让 `expect_err` 因第二次成功而失败。既有一次性服务器用例全部显式
+    `.without_retries()`，继续钉住各自的失败形态。`src/soda/signature.rs` 六条纯函数
+    用例（默认重试数与 builder 夹紧、`Retry-After` 解析与封顶、
+    `BUSY`/`RATE_LIMITED` 判定、429/5xx 与永久错误码判定、头缺失时读 body 的
+    `retry_after_seconds` / `retry_after` 且同样封顶、整轮预算的边界与睡醒复查）。
+    全部离线。
 
 ## 未移植项
 
