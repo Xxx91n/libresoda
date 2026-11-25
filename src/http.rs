@@ -305,6 +305,9 @@ fn response_headers(response: &ureq::Response) -> Vec<(String, String)> {
 }
 
 /// POST 请求，4xx/5xx 也当正常响应交回（状态码 + 响应头 + 有上限的响应体）。
+///
+/// 响应体**可能被截断**：这时 `body_truncated` 是 `true`，调用方必须先检查它，
+/// 不能把 `body` 直接当完整数据解析。
 pub(crate) fn post_with_status(
     url: &str,
     body: &[u8],

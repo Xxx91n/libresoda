@@ -193,7 +193,7 @@ Cloudflare 530（回包 `retry_after: 120`）、TLS 握手被断开、TCP 超时
 | 情况 | 重试 | 退避 |
 | --- | --- | --- |
 | 传输层失败（连接被拒 / TLS 断连 / 超时） | 是 | 200ms 固定 |
-| HTTP 429 / 5xx，且 body 的 `code` 不属于永久错误 | 是 | `Retry-After`，缺省 200ms，封顶 2s |
+| HTTP 429 / 5xx，且 body 的 `code` 不属于永久错误 | 是 | `Retry-After`；头没有就看 body 的 `retry_after_seconds` / `retry_after`；都没有用 200ms。封顶 2s |
 | 2xx + `ok:false` 且 `code` 是 `BUSY` / `RATE_LIMITED` | 是 | `retry_after_seconds`，封顶 2s |
 | 401 / 400 / `INVALID_REQUEST` / `UNAUTHORIZED` / `SIGNER_UNAVAILABLE` | 否 | — |
 | 空签名 / JSON 解不开 / 2xx 超 1 MiB | 否 | — |
@@ -207,10 +207,12 @@ body 里的 `code` / `retry_after_seconds`），**不从错误文案反解析** 
 业务请求（`pc_post_json` / `track_v2`）仍然只发一次，不存在重复收藏、重复加歌这类风险。
 
 代价：签名器整体不可用时，一次签名从「最多 6s」变成「最多 12s + 2s」；sodam 听歌模式
-串行发 `feed_mode` + `discover` 两条签名请求，最坏 28s 才报错。另外重试会放大限流
-（libmssdk 默认 0.5 次/秒、突发 12），所以 429 必须尊重 `Retry-After` 而不是立刻重打。
-它治不了「整个域名挂了」：Cloudflare 530 如果持续，重试一次仍然失败，真正的自愈要靠
-多地址，那个先不做。
+串行发 `feed_mode` + `discover` 两条签名请求，最坏 28s 才报错。把次数调到上限 8 时，
+最坏耗时会明显更长，所以另有整轮 30s 的总预算（在每次重试发起前检查，到点就交回最后
+一次的错误）。另外重试会放大限流（libmssdk 默认 0.5 次/秒、突发 12），所以 429 必须
+尊重服务端给的等待时长而不是立刻重打；头里没写时读 body 的 `retry_after_seconds` /
+`retry_after`（libmssdk 头体各写一份，Cloudflare 530 只写体）。它治不了「整个域名挂了」：
+Cloudflare 530 如果持续，重试一次仍然失败，真正的自愈要靠多地址，那个先不做。
 
 ## 3. libresoda 侧用法
 

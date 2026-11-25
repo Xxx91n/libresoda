@@ -299,6 +299,10 @@ pub struct HttpSignature {
     ///
     /// 实际只在 `sign()` 读取时夹紧，最多 8 次：无论是 builder 还是直接写这个
     /// 字段，一次签名都不会无限重打下去（字段本身仍保留调用方写进去的值）。
+    ///
+    /// 次数之外还有整轮总预算（30s，检查点在一次重试发起之前）。最坏耗时大致是
+    /// `(次数 + 1) × timeout_ms + 次数 × 2s`，再受这个预算夹住；默认 1 次时约
+    /// 12s + 2s。
     pub retries: u32,
 }
 
@@ -309,6 +313,12 @@ const MAX_SIGNER_RETRIES: u32 = 8;
 const DEFAULT_SIGNER_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// 服务端给的等待时长封顶：一次签名最坏不能无限拖住调用方。
 const MAX_SIGNER_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// 整轮重试（含每次请求自己的 `timeout_ms`）的总预算：到点就交回最后一次的结果。
+///
+/// 只有次数上限时，`retries(8)` + 默认 6s 超时会卡住约 70s。签名器同步阻塞调用方，
+/// 这个总量得有个天花板。预算在**再发起一次重试之前**检查，所以最坏耗时约为
+/// 本值再加一次请求的 `timeout_ms`；默认 1 次重试的最坏耗时（12s + 2s）在预算之内。
+const MAX_SIGNER_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// 这些原因码是「重试也没用」：配置、鉴权或签名器在启动阶段就坏了。
 const PERMANENT_SIGNER_CODES: &[&str] = &["INVALID_REQUEST", "UNAUTHORIZED", "SIGNER_UNAVAILABLE"];
@@ -515,16 +525,30 @@ fn non_2xx_retry_delay(reply: &crate::http::PostResponse) -> Option<Duration> {
     if body_json(&reply.body).is_some_and(|json| is_permanent_code(&json_code(&json))) {
         return None;
     }
-    Some(retry_after_header(&reply.headers).unwrap_or(DEFAULT_SIGNER_RETRY_DELAY))
+    Some(
+        retry_after_header(&reply.headers)
+            .or_else(|| body_retry_seconds(&reply.body))
+            .unwrap_or(DEFAULT_SIGNER_RETRY_DELAY),
+    )
 }
 
-/// 读 `Retry-After`（秒）；缺省、非数字或 HTTP-date 形式都回落到固定退避。
+/// 读 `Retry-After`（秒）；缺省、非数字或 HTTP-date 形式都交回 `None`。
 /// 无论服务端写多大的数，实际等待都不超过 [`MAX_SIGNER_RETRY_DELAY`]。
 fn retry_after_header(headers: &[(String, String)]) -> Option<Duration> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
         .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(cap_retry_delay)
+}
+
+/// 头里没写等待时长时，从回包体读：`retry_after_seconds` 是 libmssdk 的字段名，
+/// `retry_after` 是 Cloudflare 530 那类代理的写法。都没有才回落到固定退避 ——
+/// 429/5xx 立刻重打会放大限流，所以体的值同样要认。
+fn body_retry_seconds(body: &[u8]) -> Option<Duration> {
+    let json = body_json(body)?;
+    json_u64(&json, "retry_after_seconds")
+        .or_else(|| json_u64(&json, "retry_after"))
         .map(cap_retry_delay)
 }
 
@@ -613,14 +637,18 @@ impl SignatureProvider for HttpSignature {
         // payload 是安全的；业务请求不在这一层，重试不会造成重复写操作。
         // 次数在用的地方再夹一次：字段是公开的，直接写 `retries` 也绕不过上限。
         let max_retries = self.retries.min(MAX_SIGNER_RETRIES);
+        let started = std::time::Instant::now();
         let mut attempt: u32 = 0;
         loop {
             match self.sign_once(&payload, &option) {
                 Ok(response) => return Ok(response),
                 Err(failure) => match failure.retry_delay {
-                    // 重试次数用完、或这类失败本来就不该重试：交回**最后一次**的结果，
-                    // 文案形状与直接调用一次时完全一致。
-                    Some(delay) if attempt < max_retries => {
+                    // 次数用完、这类失败不该重试、或已经花掉整轮预算：交回**最后一次**
+                    // 的结果，文案形状与直接调用一次时完全一致。
+                    Some(delay)
+                        if attempt < max_retries
+                            && started.elapsed() + delay < MAX_SIGNER_RETRY_BUDGET =>
+                    {
                         attempt += 1;
                         thread::sleep(delay);
                     }
@@ -713,8 +741,8 @@ fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     if !body.is_empty() {
         message.push_str(&format!("; body: {body}"));
     }
-    // 401 是「没带 token」或「token 不对」：非 2xx 路径此前没有这条可操作提示，
-    // 调用方只能看到状态码（票 #57 验收要求 401 文案仍带 QISHUI_SIGNER_TOKEN）。
+    // 401 是「没带 token」或「token 不对」。非 2xx 分支此前不给提示，调用方只能
+    // 看到状态码；带上 QISHUI_SIGNER_TOKEN 才可操作。
     let unauthorized = reply.status == 401
         || body_json(&reply.body).is_some_and(|json| is_unauthorized_code(&json_code(&json)));
     if unauthorized {
@@ -1563,6 +1591,63 @@ mod tests {
         // body 不是 JSON 时按「不属永久错误」处理：仍然可重试。
         assert_eq!(
             non_2xx_retry_delay(&post_response(500, Vec::new(), b"<html>oops</html>")),
+            Some(DEFAULT_SIGNER_RETRY_DELAY)
+        );
+    }
+
+    /// 头里没写等待时长时，回包体的字段也要认：只认头会立刻重打，放大限流。
+    #[test]
+    fn non_2xx_retry_reads_body_retry_seconds() {
+        let post_response =
+            |headers: Vec<(String, String)>, body: &[u8]| crate::http::PostResponse {
+                status: 429,
+                final_url: "http://127.0.0.1/sign".to_string(),
+                headers,
+                body: body.to_vec(),
+                body_truncated: false,
+            };
+
+        // libmssdk 的字段名。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(
+                Vec::new(),
+                br#"{"code":"RATE_LIMITED","retry_after_seconds":1}"#
+            )),
+            Some(Duration::from_secs(1))
+        );
+        // Cloudflare 530 那类代理的写法。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(Vec::new(), br#"{"retry_after":120}"#)),
+            Some(MAX_SIGNER_RETRY_DELAY),
+            "体里的等待时长同样封顶"
+        );
+        // 体里的值是数字字符串也要认。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(Vec::new(), br#"{"retry_after":"3"}"#)),
+            Some(MAX_SIGNER_RETRY_DELAY)
+        );
+        // 头优先于体。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(
+                vec![("Retry-After".to_string(), "0".to_string())],
+                br#"{"retry_after_seconds":120}"#
+            )),
+            Some(Duration::ZERO)
+        );
+        // 头是 HTTP-date（认不出）时退到体。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(
+                vec![(
+                    "Retry-After".to_string(),
+                    "Wed, 21 Oct 2015 07:28:00 GMT".to_string()
+                )],
+                br#"{"retry_after":1}"#
+            )),
+            Some(Duration::from_secs(1))
+        );
+        // 头和体都没有：固定退避。
+        assert_eq!(
+            non_2xx_retry_delay(&post_response(Vec::new(), b"")),
             Some(DEFAULT_SIGNER_RETRY_DELAY)
         );
     }
