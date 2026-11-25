@@ -137,7 +137,8 @@ libresoda 的 `SignRequest` 因此带上了 `headers` 字段：
 默认 `false`：配了 provider 却回空签名就是签名故障，不再静默改发未签名请求
 （票 [`#39`](https://github.com/sodahub-org/libresoda/issues/39)）。
 
-`HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回），
+`HttpSignature` 的非 2xx 走 `http::post_with_status`（状态码、响应头、响应体都交回；
+2xx 超 1 MiB 也照交回并置 `body_truncated`，由签名层判成不可重试的签名故障，见 §2.4），
 普通接口的非 2xx 仍是原来那句 `http request failed: status …` —— 结构化错误类型
 （新增 `SodaError` 变体）不在本票范围，本票先用 `SodaError::Http` + 稳定前缀 +
 状态/响应体/`Retry-After` 的顺序交付，下游（sodam #103）据此分类。

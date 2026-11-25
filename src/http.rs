@@ -266,8 +266,8 @@ pub(crate) struct PostResponse {
     /// 响应头，名字保留服务端写法并按名字排序（错误文案可复现）；同名只留第一行。
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
-    /// 响应体超过上限时只保留前一段。2xx 超限由签名层判成签名故障（不把截断的
-    /// 签名回包当合法 JSON 去解析）；非 2xx 超限仍保留状态码与响应头。
+    /// 响应体超过上限时只保留前一段，并由这个标志告知调用方「不完整」。
+    /// 怎么处置由调用方决定：非 2xx 仍可用状态码与响应头分类，2xx 则不能当真签名。
     pub(crate) body_truncated: bool,
 }
 

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 /// 应用级签名凭证：官方客户端每次请求都会带上的 `x-helios` / `x-medusa`
@@ -391,8 +392,9 @@ impl HttpSignature {
                 .unwrap_or("签名服务返回失败");
             let code = json_code(&value);
             let retry_after = json_u64(&value, "retry_after_seconds");
-            // 服务端要求鉴权时给出可操作的提示（libmssdk 会回 ok:false + code=unauthorized）
-            let unauthorized = code.eq_ignore_ascii_case("unauthorized")
+            // 服务端要求鉴权时给出可操作的提示（libmssdk 会回 ok:false + code=unauthorized）。
+            // 判据与 `http_signature_failure_message` 共用 `is_unauthorized_code`，免得两处漂。
+            let unauthorized = is_unauthorized_code(&code)
                 || message.to_ascii_lowercase().contains("unauthorized")
                 || message.contains("401");
             let mut detail = format!("signer error: {message}");
@@ -475,24 +477,24 @@ impl HttpSignature {
     }
 }
 
-/// 一次签名请求的失败：错误本身 + 是否值得再试（带服务端要求的等待时长）。
+/// 一次签名请求的失败：错误本身 + 可重试时等服务端要求的多久再打（不可重试为 `None`）。
 struct SignAttemptFailure {
     error: SodaError,
-    retry_after: Option<Duration>,
+    retry_delay: Option<Duration>,
 }
 
 impl SignAttemptFailure {
     fn retryable(error: SodaError, delay: Duration) -> Self {
         Self {
             error,
-            retry_after: Some(delay),
+            retry_delay: Some(delay),
         }
     }
 
     fn fatal(error: SodaError) -> Self {
         Self {
             error,
-            retry_after: None,
+            retry_delay: None,
         }
     }
 }
@@ -502,11 +504,7 @@ fn non_2xx_retry_delay(reply: &crate::http::PostResponse) -> Option<Duration> {
     if reply.status != 429 && !(500..600).contains(&reply.status) {
         return None;
     }
-    if body_code(&reply.body).is_some_and(|code| {
-        PERMANENT_SIGNER_CODES
-            .iter()
-            .any(|permanent| code.eq_ignore_ascii_case(permanent))
-    }) {
+    if body_json(&reply.body).is_some_and(|json| is_permanent_code(&json_code(&json))) {
         return None;
     }
     Some(retry_after_header(&reply.headers).unwrap_or(DEFAULT_SIGNER_RETRY_DELAY))
@@ -526,17 +524,27 @@ fn cap_retry_delay(seconds: u64) -> Duration {
     Duration::from_secs(seconds).min(MAX_SIGNER_RETRY_DELAY)
 }
 
-/// 从回包体读原因码；不是 JSON 或没有 `code` 就是 `None`（按「不属永久错误」处理）。
-fn body_code(body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let code = json_code(&value);
-    (!code.is_empty()).then_some(code)
+/// 回包体解析成 JSON；不是 JSON 就是 `None`（按「不属永久错误」处理，仍可重试）。
+fn body_json(body: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(body).ok()
+}
+
+/// 原因码是不是「重试也没用」那一类。
+fn is_permanent_code(code: &str) -> bool {
+    PERMANENT_SIGNER_CODES
+        .iter()
+        .any(|permanent| code.eq_ignore_ascii_case(permanent))
+}
+
+/// 原因码是鉴权失败（非 2xx 与 2xx `ok:false` 两条路径共用这一判据）。
+fn is_unauthorized_code(code: &str) -> bool {
+    code.eq_ignore_ascii_case("UNAUTHORIZED")
 }
 
 /// 2xx + `ok:false` 是否值得重试：只认 `BUSY` / `RATE_LIMITED`，
 /// 等待时长读 `retry_after_seconds`（缺省固定 200ms，封顶 2s）。
 fn ok_false_retry_delay(body: &[u8]) -> Option<Duration> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let value = body_json(body)?;
     if value.get("ok").and_then(|ok| ok.as_bool()) != Some(false) {
         return None;
     }
@@ -599,12 +607,12 @@ impl SignatureProvider for HttpSignature {
         loop {
             match self.sign_once(&payload, &option) {
                 Ok(response) => return Ok(response),
-                Err(failure) => match failure.retry_after {
+                Err(failure) => match failure.retry_delay {
                     // 重试次数用完、或这类失败本来就不该重试：交回**最后一次**的结果，
                     // 文案形状与直接调用一次时完全一致。
                     Some(delay) if attempt < self.retries => {
                         attempt += 1;
-                        std::thread::sleep(delay);
+                        thread::sleep(delay);
                     }
                     _ => return Err(failure.error),
                 },
@@ -698,7 +706,7 @@ fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     // 401 是「没带 token」或「token 不对」：非 2xx 路径此前没有这条可操作提示，
     // 调用方只能看到状态码（票 #57 验收要求 401 文案仍带 QISHUI_SIGNER_TOKEN）。
     let unauthorized = reply.status == 401
-        || body_code(&reply.body).is_some_and(|code| code.eq_ignore_ascii_case("unauthorized"));
+        || body_json(&reply.body).is_some_and(|json| is_unauthorized_code(&json_code(&json)));
     if unauthorized {
         message.push_str(UNAUTHORIZED_HINT);
     }

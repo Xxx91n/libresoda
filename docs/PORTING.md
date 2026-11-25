@@ -410,9 +410,9 @@
     旧数据已经没了」管的是前者。
   - **不做的事**：库内不重试、不等待、不睡眠、不加进程内锁表、不做磁盘压力淘汰（#2 的「明确不动」）。
     `fsync` 也不做（同上，几十 MB 的同步代价换「重下即可」的失败模式）。
-    **作用域是下载与续传层**；唯一的例外是签名器的 HTTP 调用（票
-    [`#57`](https://github.com/sodahub-org/libresoda/issues/57)，见「签名器 HTTP 调用有界重试」一节）——
-    理由是该调用幂等、且调用方拿不到结构化错误，只能靠库内退避。别把那条当违规改回去。
+    这条只覆盖下载与续传层；签名器的 HTTP 调用是另一条路径（票
+    [`#57`](https://github.com/sodahub-org/libresoda/issues/57)，见「签名器 HTTP 调用有界重试」
+    一节）：它幂等，调用方也拿不到结构化错误，退避只能放在库内。
   - 已知限制照 #2 那条：网络文件系统上的锁不可靠，此时续传可能失效并退回重下，但不会产出坏文件
     （这句话在**锁可用的范围内**成立；锁完全失效且两路交错写时这一层不保证能识别，见上文
     「锁的实现选了 std」那一节）。
@@ -926,10 +926,12 @@
 
 * **签名器 HTTP 调用有界重试（`soda::signature` + `http`，上游无对应）**：实现票
   [`#57`](https://github.com/sodahub-org/libresoda/issues/57)。`HttpSignature` 新增公开
-  字段 `retries`（默认 1）与 builder `retries(n)` / `without_retries()`；结构体新增字段
-  属于对外加字段，但该结构体一直以 `new()` 为构造入口、没有 `Default`，仓内与 sodam
-  都不写结构体字面量，故无破坏。
-  - `sign()` 改为 `sign_once()` + 有界循环：可重试的失败带 `retry_after` 再打一次，
+  字段 `retries`（默认 1）与 builder `retries(n)` / `without_retries()`。
+  **这是一处源码级破坏**：`HttpSignature` 的字段全 `pub`、又没有 `Default`，外部若有
+  结构体字面量构造，加字段会让它编译失败。仓内、`examples/` 与 sodam 都只用
+  `new()` / `from_env()` 加 builder，实际没有受影响方；这里仍按公开 API 变更记录，
+  而不是当作无破坏的加法。
+  - `sign()` 改为 `sign_once()` + 有界循环：可重试的失败带等待时长再打一次，
     不可重试或次数用完就交回**最后一次**的错误 —— 文案形状与 `signer error:` 前缀不变，
     `is_signer_failure()` 不受影响。
   - 分类只读结构化事实：`non_2xx_retry_delay`（仅 429/5xx，且 body 的 `code` 不在
@@ -945,12 +947,16 @@
     （此前只有 2xx `ok:false` 那条带）。提示文案抽成 `UNAUTHORIZED_HINT` 一处。
   - 重试是 `std::thread::sleep`，同步阻塞：与既有 `sign()` 的同步签名一致，不引入
     新依赖、不改 trait。`PORTING.md` 的「库内不重试、不等待、不睡眠」口径作用域限定为
-    下载与续传层，本调用是唯一例外（已在那一节写明理由）。
+    下载与续传层，本调用是另一条路径（已在那一节写明理由）。
   - **测试**：`tests/signature_tests.rs` 九条（传输失败一次后成功且计数 = 2、尊重
     `Retry-After: 1` 的间隔 ≥ 950ms、永久错误码只请求一次、401 只请求一次且带 token
-    提示、重试耗尽返回最后一次的 503 文案、`Retry-After: 60` 实际退避 ≤ 2.4s、`BUSY`
-    重试成功、`INVALID_REQUEST` 不重试、`without_retries()` 只请求一次）；既有一次性
-    服务器用例全部显式 `.without_retries()`，继续钉住各自的失败形态。全部离线。
+    提示、重试耗尽返回最后一次的 503 文案、`Retry-After: 60` 退避落在 1.9s~2.8s、
+    `BUSY` 重试成功、`INVALID_REQUEST` 不重试、`without_retries()` 只请求一次）；
+    脚本化服务器在脚本用完后继续记账并回合法签名，好让「不该重试却重试了」既能被
+    计数看见、也会让 `expect_err` 因第二次成功而失败。既有一次性服务器用例全部显式
+    `.without_retries()`，继续钉住各自的失败形态。`src/soda/signature.rs` 四条纯函数
+    用例（默认重试数与 builder、`Retry-After` 解析与封顶、`BUSY`/`RATE_LIMITED` 判定、
+    429/5xx 与永久错误码判定）。全部离线。
 
 ## 未移植项
 

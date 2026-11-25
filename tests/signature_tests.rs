@@ -765,6 +765,7 @@ fn http_signature_with_token_sends_authorization_header() {
     );
     let response = HttpSignature::new(url)
         .with_token(" tok-123 ") // 前后空白应被裁掉
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect("带 token 的签名请求应成功");
     assert_eq!(
@@ -811,7 +812,7 @@ fn http_signature_unauthorized_error_hints_token() {
 
 /// 服务端一段脚本化回包；`DropConnection` 表示接了就立刻断（传输层失败）。
 #[derive(Clone, Copy)]
-enum Reply {
+enum SignerReply {
     Respond {
         status_line: &'static str,
         headers: &'static str,
@@ -820,8 +821,12 @@ enum Reply {
     DropConnection,
 }
 
-fn reply(status_line: &'static str, headers: &'static str, body: &'static str) -> Reply {
-    Reply::Respond {
+fn signer_reply(
+    status_line: &'static str,
+    headers: &'static str,
+    body: &'static str,
+) -> SignerReply {
+    SignerReply::Respond {
         status_line,
         headers,
         body,
@@ -834,32 +839,44 @@ fn valid_signer_body() -> &'static str {
 }
 
 /// 按顺序回一段脚本，并记下每次请求到达的时刻。
-fn spawn_scripted_signer(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<Instant>>>) {
+///
+/// 脚本走完之后服务继续接连接：**每一次**多出来的请求都会被记下来、并回一份合法签名。
+/// 这样「本该不重试」的用例里一旦偷偷重试，计数会多、`expect_err` 也会因为第二次成功
+/// 而失败 —— 否则监听器提前退出，多打的那次只会撞成「连接被拒」，计数仍是 1，
+/// 刚好把要钉的行为藏起来。
+fn spawn_scripted_signer(script: Vec<SignerReply>) -> (String, Arc<Mutex<Vec<Instant>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind signer");
     let addr = listener.local_addr().expect("addr");
     let arrivals = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&arrivals);
     thread::spawn(move || {
+        let respond = |stream: &mut std::net::TcpStream, step: SignerReply| match step {
+            SignerReply::DropConnection => {}
+            SignerReply::Respond {
+                status_line,
+                headers,
+                body,
+            } => {
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        };
         for step in script {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             recorded.lock().unwrap().push(Instant::now());
             let _ = read_request(&mut stream);
-            match step {
-                Reply::DropConnection => drop(stream),
-                Reply::Respond {
-                    status_line,
-                    headers,
-                    body,
-                } => {
-                    let response = format!(
-                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-            }
+            respond(&mut stream, step);
+        }
+        // 脚本之后的请求：记账 + 回合法签名（见上面的注释）。
+        for (mut stream, _) in listener.incoming().flatten() {
+            recorded.lock().unwrap().push(Instant::now());
+            let _ = read_request(&mut stream);
+            respond(&mut stream, signer_reply("200 OK", "", valid_signer_body()));
         }
     });
     (format!("http://{addr}/sign"), arrivals)
@@ -869,8 +886,8 @@ fn spawn_scripted_signer(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<Instant>>
 fn http_signature_retries_transport_failure_once() {
     // 第一次直接断连接（TLS 断连/连接被拒同属传输层），第二次回合法签名。
     let (url, arrivals) = spawn_scripted_signer(vec![
-        Reply::DropConnection,
-        reply("200 OK", "", valid_signer_body()),
+        SignerReply::DropConnection,
+        signer_reply("200 OK", "", valid_signer_body()),
     ]);
     let response = HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -886,8 +903,8 @@ fn http_signature_retries_transport_failure_once() {
 #[test]
 fn http_signature_respects_retry_after_header() {
     let (url, arrivals) = spawn_scripted_signer(vec![
-        reply("503 Service Unavailable", "Retry-After: 1\r\n", ""),
-        reply("200 OK", "", valid_signer_body()),
+        signer_reply("503 Service Unavailable", "Retry-After: 1\r\n", ""),
+        signer_reply("200 OK", "", valid_signer_body()),
     ]);
     HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -905,7 +922,7 @@ fn http_signature_respects_retry_after_header() {
 #[test]
 fn http_signature_does_not_retry_permanent_code() {
     // 500 本身可重试，但 body 里的原因是永久错误：重试只会放大故障。
-    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply(
         "500 Internal Server Error",
         "",
         r#"{"ok":false,"error":"not configured","code":"SIGNER_UNAVAILABLE"}"#,
@@ -920,7 +937,7 @@ fn http_signature_does_not_retry_permanent_code() {
 
 #[test]
 fn http_signature_does_not_retry_unauthorized() {
-    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply(
         "401 Unauthorized",
         "",
         r#"{"ok":false,"error":"unauthorized"}"#,
@@ -939,8 +956,8 @@ fn http_signature_does_not_retry_unauthorized() {
 fn http_signature_reports_last_attempt_after_retries_exhausted() {
     // 两次都是 503：交回**最后一次**的文案（带状态码与 retry-after），不是传输错误。
     let (url, arrivals) = spawn_scripted_signer(vec![
-        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
-        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        signer_reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        signer_reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
     ]);
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -962,8 +979,8 @@ fn http_signature_reports_last_attempt_after_retries_exhausted() {
 fn http_signature_caps_retry_after_at_two_seconds() {
     // 服务端要求 60s：库里最多等 2s，不能让一次签名把调用方扣住一分钟。
     let (url, arrivals) = spawn_scripted_signer(vec![
-        reply("429 Too Many Requests", "Retry-After: 60\r\n", ""),
-        reply("200 OK", "", valid_signer_body()),
+        signer_reply("429 Too Many Requests", "Retry-After: 60\r\n", ""),
+        signer_reply("200 OK", "", valid_signer_body()),
     ]);
     HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -973,6 +990,10 @@ fn http_signature_caps_retry_after_at_two_seconds() {
     assert_eq!(at.len(), 2);
     let gap = at[1].duration_since(at[0]);
     assert!(
+        gap >= Duration::from_millis(1_900),
+        "封顶是 2s，不能退化成「立刻重打」（服务端要的是 60s），实际 {gap:?}"
+    );
+    assert!(
         gap <= Duration::from_millis(2_800),
         "退避要封顶 2s（服务端要的是 60s），实际 {gap:?}"
     );
@@ -981,12 +1002,12 @@ fn http_signature_caps_retry_after_at_two_seconds() {
 #[test]
 fn http_signature_retries_busy_ok_false() {
     let (url, arrivals) = spawn_scripted_signer(vec![
-        reply(
+        signer_reply(
             "200 OK",
             "",
             r#"{"ok":false,"error":"服务忙","code":"BUSY","retry_after_seconds":0}"#,
         ),
-        reply("200 OK", "", valid_signer_body()),
+        signer_reply("200 OK", "", valid_signer_body()),
     ]);
     HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -998,7 +1019,7 @@ fn http_signature_retries_busy_ok_false() {
 #[test]
 fn http_signature_does_not_retry_other_ok_false_codes() {
     // 只有 BUSY / RATE_LIMITED 值得再试；其余原因码重试也没用。
-    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply(
         "200 OK",
         "",
         r#"{"ok":false,"error":"bad request","code":"INVALID_REQUEST","retry_after_seconds":0}"#,
@@ -1017,8 +1038,8 @@ fn http_signature_does_not_retry_other_ok_false_codes() {
 #[test]
 fn http_signature_without_retries_sends_one_request() {
     let (url, arrivals) = spawn_scripted_signer(vec![
-        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
-        reply("200 OK", "", valid_signer_body()),
+        signer_reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        signer_reply("200 OK", "", valid_signer_body()),
     ]);
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
