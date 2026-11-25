@@ -873,7 +873,8 @@ fn spawn_scripted_signer(script: Vec<SignerReply>) -> (String, Arc<Mutex<Vec<Ins
             respond(&mut stream, step);
         }
         // 脚本之后的请求：记账 + 回合法签名（见上面的注释）。
-        for (mut stream, _) in listener.incoming().flatten() {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
             recorded.lock().unwrap().push(Instant::now());
             let _ = read_request(&mut stream);
             respond(&mut stream, signer_reply("200 OK", "", valid_signer_body()));
