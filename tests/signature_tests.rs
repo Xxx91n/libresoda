@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// 环境变量是进程级的，涉及 env 的用例要串行跑（`cargo test` 默认多线程）。
 fn env_lock() -> MutexGuard<'static, ()> {
@@ -361,7 +362,7 @@ fn http_signature_calls_remote_service() {
         true,
         None,
     );
-    let provider = HttpSignature::new(url).timeout_ms(3_000);
+    let provider = HttpSignature::new(url).timeout_ms(3_000).without_retries();
     let response = provider
         .sign(&sign_request(
             "https://api.qishui.com/luna/pc/track_v2?aid=386088",
@@ -388,6 +389,7 @@ fn http_signature_accepts_meting_style_flat_response() {
         None,
     );
     let response = HttpSignature::new(url)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect("remote sign");
     assert_eq!(
@@ -404,6 +406,7 @@ fn http_signature_accepts_meting_style_flat_response() {
 fn http_signature_reports_service_failure() {
     let url = spawn_signer_service(r#"{"ok":false,"error":"mssdk 未初始化"}"#, false, None);
     let error = HttpSignature::new(url)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("应把服务端错误往上抛");
     assert!(error.to_string().contains("mssdk 未初始化"), "{error}");
@@ -418,6 +421,7 @@ fn http_signature_non_2xx_keeps_status_headers_and_body() {
     );
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("非 2xx 是签名故障");
     let text = error.to_string();
@@ -468,6 +472,7 @@ fn http_signature_empty_success_is_a_signer_failure() {
     // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
     let url = spawn_signer_service("{}", false, None);
     let error = HttpSignature::new(url)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("空签名回包要报错");
     assert!(
@@ -482,6 +487,7 @@ fn oversized_2xx_response_is_a_signer_failure() {
     let url = spawn_http_once("200 OK", "", body);
     let error = HttpSignature::new(url)
         .timeout_ms(5_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("超长 2xx 回包不能当签名");
     let text = error.to_string();
@@ -497,6 +503,7 @@ fn http_signature_connection_refused_is_signer_failure() {
 
     let error = HttpSignature::new(format!("http://{addr}/sign?token=secret-token"))
         .timeout_ms(500)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("连不上签名服务就是签名故障");
     let text = error.to_string();
@@ -522,6 +529,7 @@ fn http_signature_timeout_is_signer_failure() {
 
     let error = HttpSignature::new(format!("http://{addr}/sign"))
         .timeout_ms(100)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("签名服务不回包就是签名故障");
     assert!(error.to_string().starts_with("signer error:"), "{error}");
@@ -570,6 +578,7 @@ fn non_2xx_oversized_body_keeps_status_and_marks_truncation() {
     let url = spawn_http_once("500 Internal Server Error", "", body);
     let error = HttpSignature::new(url)
         .timeout_ms(5_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("5xx 是签名故障");
     let text = error.to_string();
@@ -594,6 +603,7 @@ fn non_2xx_body_redacts_echoed_url_query_token() {
     );
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("非 2xx 是签名故障");
     let text = error.to_string();
@@ -629,6 +639,7 @@ fn non_2xx_body_redacts_bearer_and_bare_token() {
     );
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("非 2xx 是签名故障");
     let text = error.to_string();
@@ -661,6 +672,7 @@ fn non_2xx_oversized_body_redacts_before_truncation() {
     let url = spawn_http_once("500 Internal Server Error", "Retry-After: 3\r\n", body);
     let error = HttpSignature::new(url)
         .timeout_ms(5_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("5xx 是签名故障");
     let text = error.to_string();
@@ -701,6 +713,7 @@ fn non_2xx_redaction_shrinks_body_before_truncation() {
     let url = spawn_http_once("500 Internal Server Error", "", body);
     let error = HttpSignature::new(url)
         .timeout_ms(5_000)
+        .without_retries()
         .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
         .expect_err("5xx 是签名故障");
     let text = error.to_string();
@@ -720,7 +733,7 @@ fn pc_track_v2_surfaces_remote_signer_5xx_details() {
         r#"{"ok":false,"error":"busy","code":"BUSY"}"#,
     );
     let soda = libresoda::Soda::new("sessionid_ss=test");
-    soda.set_signature_provider(Arc::new(HttpSignature::new(url)));
+    soda.set_signature_provider(Arc::new(HttpSignature::new(url).without_retries()));
     let error = libresoda::soda::track::fetch_pc_track_v2(&soda, "7501674235158431760")
         .expect_err("签名服务 5xx 必须中断取流");
     let text = error.to_string();
@@ -792,4 +805,226 @@ fn http_signature_unauthorized_error_hints_token() {
         text.contains("QISHUI_SIGNER_TOKEN"),
         "应提示如何配置 token：{text}"
     );
+}
+
+// ---- 有界重试（票 #57）----
+
+/// 服务端一段脚本化回包；`DropConnection` 表示接了就立刻断（传输层失败）。
+#[derive(Clone, Copy)]
+enum Reply {
+    Respond {
+        status_line: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    },
+    DropConnection,
+}
+
+fn reply(status_line: &'static str, headers: &'static str, body: &'static str) -> Reply {
+    Reply::Respond {
+        status_line,
+        headers,
+        body,
+    }
+}
+
+/// 一份合法签名回包。
+fn valid_signer_body() -> &'static str {
+    r#"{"headers":{"x-helios":"h","x-medusa":"m"}}"#
+}
+
+/// 按顺序回一段脚本，并记下每次请求到达的时刻。
+fn spawn_scripted_signer(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<Instant>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind signer");
+    let addr = listener.local_addr().expect("addr");
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&arrivals);
+    thread::spawn(move || {
+        for step in script {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            recorded.lock().unwrap().push(Instant::now());
+            let _ = read_request(&mut stream);
+            match step {
+                Reply::DropConnection => drop(stream),
+                Reply::Respond {
+                    status_line,
+                    headers,
+                    body,
+                } => {
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        }
+    });
+    (format!("http://{addr}/sign"), arrivals)
+}
+
+#[test]
+fn http_signature_retries_transport_failure_once() {
+    // 第一次直接断连接（TLS 断连/连接被拒同属传输层），第二次回合法签名。
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        Reply::DropConnection,
+        reply("200 OK", "", valid_signer_body()),
+    ]);
+    let response = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect("传输失败一次后应重试成功");
+    assert_eq!(
+        response.headers.get("x-helios").map(String::as_str),
+        Some("h")
+    );
+    assert_eq!(arrivals.lock().unwrap().len(), 2, "应恰好请求两次");
+}
+
+#[test]
+fn http_signature_respects_retry_after_header() {
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        reply("503 Service Unavailable", "Retry-After: 1\r\n", ""),
+        reply("200 OK", "", valid_signer_body()),
+    ]);
+    HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect("503 后应重试成功");
+    let at = arrivals.lock().unwrap().clone();
+    assert_eq!(at.len(), 2);
+    let gap = at[1].duration_since(at[0]);
+    assert!(
+        gap >= Duration::from_millis(950),
+        "要按 Retry-After 等够 1s，实际 {gap:?}"
+    );
+}
+
+#[test]
+fn http_signature_does_not_retry_permanent_code() {
+    // 500 本身可重试，但 body 里的原因是永久错误：重试只会放大故障。
+    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+        "500 Internal Server Error",
+        "",
+        r#"{"ok":false,"error":"not configured","code":"SIGNER_UNAVAILABLE"}"#,
+    )]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("永久错误不重试");
+    assert!(error.to_string().contains("SIGNER_UNAVAILABLE"), "{error}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1, "永久错误只请求一次");
+}
+
+#[test]
+fn http_signature_does_not_retry_unauthorized() {
+    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+        "401 Unauthorized",
+        "",
+        r#"{"ok":false,"error":"unauthorized"}"#,
+    )]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("401 不重试");
+    let text = error.to_string();
+    assert!(text.starts_with("signer error:"), "{text}");
+    assert!(text.contains("QISHUI_SIGNER_TOKEN"), "{text}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1, "401 只请求一次");
+}
+
+#[test]
+fn http_signature_reports_last_attempt_after_retries_exhausted() {
+    // 两次都是 503：交回**最后一次**的文案（带状态码与 retry-after），不是传输错误。
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+    ]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("重试耗尽仍失败");
+    let text = error.to_string();
+    assert!(
+        text.starts_with("signer error: http request failed: status 503"),
+        "{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 0"),
+        "{text}"
+    );
+    assert_eq!(arrivals.lock().unwrap().len(), 2, "默认只重试一次");
+}
+
+#[test]
+fn http_signature_caps_retry_after_at_two_seconds() {
+    // 服务端要求 60s：库里最多等 2s，不能让一次签名把调用方扣住一分钟。
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        reply("429 Too Many Requests", "Retry-After: 60\r\n", ""),
+        reply("200 OK", "", valid_signer_body()),
+    ]);
+    HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect("封顶后仍应重试成功");
+    let at = arrivals.lock().unwrap().clone();
+    assert_eq!(at.len(), 2);
+    let gap = at[1].duration_since(at[0]);
+    assert!(
+        gap <= Duration::from_millis(2_800),
+        "退避要封顶 2s（服务端要的是 60s），实际 {gap:?}"
+    );
+}
+
+#[test]
+fn http_signature_retries_busy_ok_false() {
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        reply(
+            "200 OK",
+            "",
+            r#"{"ok":false,"error":"服务忙","code":"BUSY","retry_after_seconds":0}"#,
+        ),
+        reply("200 OK", "", valid_signer_body()),
+    ]);
+    HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect("BUSY 后应重试成功");
+    assert_eq!(arrivals.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn http_signature_does_not_retry_other_ok_false_codes() {
+    // 只有 BUSY / RATE_LIMITED 值得再试；其余原因码重试也没用。
+    let (url, arrivals) = spawn_scripted_signer(vec![reply(
+        "200 OK",
+        "",
+        r#"{"ok":false,"error":"bad request","code":"INVALID_REQUEST","retry_after_seconds":0}"#,
+    )]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("INVALID_REQUEST 不重试");
+    assert!(
+        error.to_string().contains("[code=INVALID_REQUEST]"),
+        "{error}"
+    );
+    assert_eq!(arrivals.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn http_signature_without_retries_sends_one_request() {
+    let (url, arrivals) = spawn_scripted_signer(vec![
+        reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        reply("200 OK", "", valid_signer_body()),
+    ]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .without_retries()
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("关掉重试后一次性失败");
+    assert!(error.to_string().contains("status 503"), "{error}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1);
 }

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// 应用级签名凭证：官方客户端每次请求都会带上的 `x-helios` / `x-medusa`
 /// 以及与之绑定的设备指纹。
@@ -289,7 +290,28 @@ pub struct HttpSignature {
     pub timeout_ms: u64,
     /// 可选：调用签名服务时附加的请求头（例如鉴权用的 `Authorization`）。
     pub headers: BTreeMap<String, String>,
+    /// 失败后最多再试几次：默认 1（一次有界重试），0 表示不重试。
+    ///
+    /// 只重试明确可恢复的形态（传输层失败、429/5xx、`BUSY`/`RATE_LIMITED`）；
+    /// 401/400、永久错误码、空签名与解析失败都不重试。签名接口没有副作用，
+    /// 复用同一个 `SignRequest` 是安全的（见 `docs/SIGNER-SERVICE.md` §2.4）。
+    pub retries: u32,
 }
+
+/// 传输层失败、以及服务端没给等待时长时的固定退避。
+const DEFAULT_SIGNER_RETRY_DELAY: Duration = Duration::from_millis(200);
+/// 服务端给的等待时长封顶：一次签名最坏不能无限拖住调用方。
+const MAX_SIGNER_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// 这些原因码是「重试也没用」：配置、鉴权或签名器在启动阶段就坏了。
+const PERMANENT_SIGNER_CODES: &[&str] = &["INVALID_REQUEST", "UNAUTHORIZED", "SIGNER_UNAVAILABLE"];
+
+/// 2xx + `ok:false` 里明确表示「服务忙，等一下再来」的原因码。
+const RETRYABLE_OK_FALSE_CODES: &[&str] = &["BUSY", "RATE_LIMITED"];
+
+/// 鉴权失败的统一提示（非 2xx 401 与 2xx `ok:false` 两条路径共用）。
+const UNAUTHORIZED_HINT: &str = "（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN，\
+     或用 HttpSignature::new(url).with_token(..) / .header(\"Authorization\", ..)）";
 
 impl HttpSignature {
     /// 默认超时 6 秒：签名服务通常在同一局域网，超过这个时间说明它挂了。
@@ -298,12 +320,24 @@ impl HttpSignature {
             url: url.into(),
             timeout_ms: 6_000,
             headers: BTreeMap::new(),
+            retries: 1,
         }
     }
 
     pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = timeout_ms;
         self
+    }
+
+    /// 设置失败后的额外重试次数（默认 1）。传 0 等价于 [`Self::without_retries`]。
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// 关闭重试：调用方想自己掌握重试节奏、或测试要钉住一次性失败形态时用。
+    pub fn without_retries(self) -> Self {
+        self.retries(0)
     }
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -370,10 +404,7 @@ impl HttpSignature {
                 detail.push_str(&format!(" [retry_after_seconds={seconds}]"));
             }
             if unauthorized {
-                detail.push_str(
-                    "（签名服务要求鉴权：设置 QISHUI_SIGNER_TOKEN，\
-                     或用 HttpSignature::new(url).with_token(..) / .header(\"Authorization\", ..)）",
-                );
+                detail.push_str(UNAUTHORIZED_HINT);
             }
             return Err(SodaError::http(detail));
         }
@@ -396,6 +427,131 @@ impl HttpSignature {
         }
         Ok(response)
     }
+
+    /// 走一次签名请求，并把失败分成「可重试（带等待时长）」与「直接报错」。
+    ///
+    /// 分类只看结构化回包（状态码、`Retry-After` 头、body 里的 `code` /
+    /// `retry_after_seconds`），不从错误文案反解析 —— 那里已经脱敏并截断。
+    fn sign_once(
+        &self,
+        payload: &[u8],
+        option: &crate::http::RequestOption,
+    ) -> std::result::Result<SignResponse, SignAttemptFailure> {
+        // 传输层失败（拒绝连接 / TLS 断开 / 超时）基本都是一过性的，固定退避后
+        // 再试一次；重试耗尽的最终错误仍走原来的 `signer_transport_error` 形状。
+        let reply =
+            match crate::http::post_with_status(&self.url, payload, std::slice::from_ref(option)) {
+                Ok(reply) => reply,
+                Err(err) => {
+                    return Err(SignAttemptFailure::retryable(
+                        signer_transport_error(&self.url, err),
+                        DEFAULT_SIGNER_RETRY_DELAY,
+                    ));
+                }
+            };
+        if !(200..300).contains(&reply.status) {
+            let error = SodaError::http(http_signature_failure_message(&reply));
+            return Err(match non_2xx_retry_delay(&reply) {
+                Some(delay) => SignAttemptFailure::retryable(error, delay),
+                None => SignAttemptFailure::fatal(error),
+            });
+        }
+        if reply.body_truncated {
+            // 2xx 超限说明回包不是正常签名结果：不重试，也不拿截断的 JSON 当签名。
+            return Err(SignAttemptFailure::fatal(SodaError::http(format!(
+                "signer error: http response body exceeds {} bytes",
+                crate::http::MAX_POST_RESPONSE_BODY
+            ))));
+        }
+        match Self::parse_response(&reply.body) {
+            Ok(response) if !response.is_empty() => Ok(response),
+            // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
+            Ok(_) => Err(SignAttemptFailure::fatal(empty_signature_error())),
+            Err(error) => match ok_false_retry_delay(&reply.body) {
+                Some(delay) => Err(SignAttemptFailure::retryable(error, delay)),
+                None => Err(SignAttemptFailure::fatal(error)),
+            },
+        }
+    }
+}
+
+/// 一次签名请求的失败：错误本身 + 是否值得再试（带服务端要求的等待时长）。
+struct SignAttemptFailure {
+    error: SodaError,
+    retry_after: Option<Duration>,
+}
+
+impl SignAttemptFailure {
+    fn retryable(error: SodaError, delay: Duration) -> Self {
+        Self {
+            error,
+            retry_after: Some(delay),
+        }
+    }
+
+    fn fatal(error: SodaError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// 非 2xx 是否值得重试：只有 429 / 5xx，且回包里的原因码不是永久错误。
+fn non_2xx_retry_delay(reply: &crate::http::PostResponse) -> Option<Duration> {
+    if reply.status != 429 && !(500..600).contains(&reply.status) {
+        return None;
+    }
+    if body_code(&reply.body).is_some_and(|code| {
+        PERMANENT_SIGNER_CODES
+            .iter()
+            .any(|permanent| code.eq_ignore_ascii_case(permanent))
+    }) {
+        return None;
+    }
+    Some(retry_after_header(&reply.headers).unwrap_or(DEFAULT_SIGNER_RETRY_DELAY))
+}
+
+/// 读 `Retry-After`（秒）；缺省、非数字或 HTTP-date 形式都回落到固定退避。
+/// 无论服务端写多大的数，实际等待都不超过 [`MAX_SIGNER_RETRY_DELAY`]。
+fn retry_after_header(headers: &[(String, String)]) -> Option<Duration> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(cap_retry_delay)
+}
+
+fn cap_retry_delay(seconds: u64) -> Duration {
+    Duration::from_secs(seconds).min(MAX_SIGNER_RETRY_DELAY)
+}
+
+/// 从回包体读原因码；不是 JSON 或没有 `code` 就是 `None`（按「不属永久错误」处理）。
+fn body_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = json_code(&value);
+    (!code.is_empty()).then_some(code)
+}
+
+/// 2xx + `ok:false` 是否值得重试：只认 `BUSY` / `RATE_LIMITED`，
+/// 等待时长读 `retry_after_seconds`（缺省固定 200ms，封顶 2s）。
+fn ok_false_retry_delay(body: &[u8]) -> Option<Duration> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if value.get("ok").and_then(|ok| ok.as_bool()) != Some(false) {
+        return None;
+    }
+    let code = json_code(&value);
+    if !RETRYABLE_OK_FALSE_CODES
+        .iter()
+        .any(|retryable| code.eq_ignore_ascii_case(retryable))
+    {
+        return None;
+    }
+    Some(
+        json_u64(&value, "retry_after_seconds")
+            .map(cap_retry_delay)
+            .unwrap_or(DEFAULT_SIGNER_RETRY_DELAY),
+    )
 }
 
 fn is_loopback_signer_host(host: Option<&str>) -> bool {
@@ -428,7 +584,7 @@ impl SignatureProvider for HttpSignature {
         let mut option = crate::http::RequestOption::new()
             .header("Content-Type", "application/json; charset=utf-8")
             .header("Accept", "application/json")
-            .timeout(std::time::Duration::from_millis(self.timeout_ms));
+            .timeout(Duration::from_millis(self.timeout_ms));
         for (name, value) in &self.headers {
             option = option.header(name.clone(), value.clone());
         }
@@ -436,17 +592,24 @@ impl SignatureProvider for HttpSignature {
         // libmssdk 用它们区分「服务忙，等一下再来」与「必须有人来修」。
         // 传输层失败（拒绝连接 / 超时）也要带上签名上下文：直接调用
         // `HttpSignature::sign` 的调用方同样能把它判成签名故障。
-        let reply = crate::http::post_with_status(&self.url, &payload, &[option])
-            .map_err(|err| signer_transport_error(&self.url, err))?;
-        if !(200..300).contains(&reply.status) {
-            return Err(SodaError::http(http_signature_failure_message(&reply)));
+        //
+        // 有界重试：签名接口幂等（只算一次签名，`ts_ms` 不做新鲜度校验），复用同一个
+        // payload 是安全的；业务请求不在这一层，重试不会造成重复写操作。
+        let mut attempt: u32 = 0;
+        loop {
+            match self.sign_once(&payload, &option) {
+                Ok(response) => return Ok(response),
+                Err(failure) => match failure.retry_after {
+                    // 重试次数用完、或这类失败本来就不该重试：交回**最后一次**的结果，
+                    // 文案形状与直接调用一次时完全一致。
+                    Some(delay) if attempt < self.retries => {
+                        attempt += 1;
+                        std::thread::sleep(delay);
+                    }
+                    _ => return Err(failure.error),
+                },
+            }
         }
-        let response = Self::parse_response(&reply.body)?;
-        if response.is_empty() {
-            // 配了远程签名器却回空签名，等于没签：不能悄悄改发未签名请求。
-            return Err(empty_signature_error());
-        }
-        Ok(response)
     }
 
     fn exposes_credentials_over_plain_http(&self) -> bool {
@@ -531,6 +694,13 @@ fn http_signature_failure_message(reply: &crate::http::PostResponse) -> String {
     }
     if !body.is_empty() {
         message.push_str(&format!("; body: {body}"));
+    }
+    // 401 是「没带 token」或「token 不对」：非 2xx 路径此前没有这条可操作提示，
+    // 调用方只能看到状态码（票 #57 验收要求 401 文案仍带 QISHUI_SIGNER_TOKEN）。
+    let unauthorized = reply.status == 401
+        || body_code(&reply.body).is_some_and(|code| code.eq_ignore_ascii_case("unauthorized"));
+    if unauthorized {
+        message.push_str(UNAUTHORIZED_HINT);
     }
     message
 }
@@ -1241,6 +1411,131 @@ mod tests {
         );
         assert!(
             !HttpSignature::new("HTTP://LOCALHOST:8899/sign").exposes_credentials_over_plain_http()
+        );
+    }
+
+    /// 票 #57：重试次数的默认值与 builder。
+    #[test]
+    fn http_signature_retries_default_to_one() {
+        assert_eq!(HttpSignature::new("http://127.0.0.1/sign").retries, 1);
+        assert_eq!(
+            HttpSignature::new("http://127.0.0.1/sign")
+                .retries(3)
+                .retries,
+            3
+        );
+        assert_eq!(
+            HttpSignature::new("http://127.0.0.1/sign")
+                .without_retries()
+                .retries,
+            0
+        );
+    }
+
+    /// 票 #57：`Retry-After` 只认秒数；封顶 2s，避免一次签名拖住调用方。
+    #[test]
+    fn retry_after_header_is_parsed_and_capped() {
+        let header = |value: &str| vec![("Retry-After".to_string(), value.to_string())];
+        assert_eq!(
+            retry_after_header(&header("1")),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            retry_after_header(&header(" 0 ")),
+            Some(Duration::ZERO),
+            "前后空白要容忍"
+        );
+        assert_eq!(
+            retry_after_header(&header("60")),
+            Some(MAX_SIGNER_RETRY_DELAY),
+            "服务端要 60s 也只等 2s"
+        );
+        // HTTP-date 形式与非数字：交回 None，由调用方回落到固定退避。
+        assert_eq!(
+            retry_after_header(&header("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(retry_after_header(&[]), None);
+        // 头名大小写不敏感。
+        assert_eq!(
+            retry_after_header(&[("retry-after".to_string(), "2".to_string())]),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    /// 票 #57：只有 `BUSY` / `RATE_LIMITED` 在 2xx `ok:false` 下可重试。
+    #[test]
+    fn ok_false_retry_only_for_busy_and_rate_limited() {
+        let busy = br#"{"ok":false,"code":"BUSY","retry_after_seconds":1}"#;
+        assert_eq!(ok_false_retry_delay(busy), Some(Duration::from_secs(1)));
+
+        let limited = br#"{"ok":false,"code":"rate_limited","retry_after_seconds":"60"}"#;
+        assert_eq!(
+            ok_false_retry_delay(limited),
+            Some(MAX_SIGNER_RETRY_DELAY),
+            "原因码大小写不敏感，且仍封顶"
+        );
+
+        // 没给等待时长时用固定 200ms。
+        let no_wait = br#"{"ok":false,"code":"BUSY"}"#;
+        assert_eq!(
+            ok_false_retry_delay(no_wait),
+            Some(DEFAULT_SIGNER_RETRY_DELAY)
+        );
+
+        // 其余原因码、以及根本不是 `ok:false` 的回包都不重试。
+        assert_eq!(
+            ok_false_retry_delay(br#"{"ok":false,"code":"INVALID_REQUEST"}"#),
+            None
+        );
+        assert_eq!(ok_false_retry_delay(br#"{"ok":true,"code":"BUSY"}"#), None);
+        assert_eq!(ok_false_retry_delay(b"not json"), None);
+    }
+
+    /// 票 #57：非 2xx 只有 429/5xx 可重试，且永久错误码要挡住。
+    #[test]
+    fn non_2xx_retry_excludes_permanent_codes() {
+        let reply =
+            |status: u16, headers: Vec<(String, String)>, body: &[u8]| crate::http::PostResponse {
+                status,
+                final_url: "http://127.0.0.1/sign".to_string(),
+                headers,
+                body: body.to_vec(),
+                body_truncated: false,
+            };
+
+        assert_eq!(
+            non_2xx_retry_delay(&reply(503, Vec::new(), b"")),
+            Some(DEFAULT_SIGNER_RETRY_DELAY)
+        );
+        assert_eq!(
+            non_2xx_retry_delay(&reply(
+                429,
+                vec![("Retry-After".to_string(), "1".to_string())],
+                b""
+            )),
+            Some(Duration::from_secs(1))
+        );
+
+        // 400/401/404 不在可重试集合里。
+        for status in [400_u16, 401, 404, 403, 302] {
+            assert_eq!(non_2xx_retry_delay(&reply(status, Vec::new(), b"")), None);
+        }
+
+        // 5xx 但原因是永久错误：不重试。
+        for code in PERMANENT_SIGNER_CODES {
+            let body = format!(r#"{{"code":"{code}"}}"#).into_bytes();
+            assert_eq!(
+                non_2xx_retry_delay(&reply(503, Vec::new(), &body)),
+                None,
+                "{code} 是永久错误"
+            );
+        }
+
+        // body 不是 JSON 时按「不属永久错误」处理：仍然可重试。
+        assert_eq!(
+            non_2xx_retry_delay(&reply(500, Vec::new(), b"<html>oops</html>")),
+            Some(DEFAULT_SIGNER_RETRY_DELAY)
         );
     }
 }

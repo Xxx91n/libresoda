@@ -180,6 +180,37 @@ Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户�
 子进程、在**子进程**里 `setsid()`（它那时不是组长），并让它关掉或重定向继承的 stdout/stderr，
 否则会撞上上面说的 1 s 宽限。
 
+### 2.4 签名器 HTTP 调用有界重试一次（唯一的重试例外）
+
+票 [`#57`](https://github.com/sodahub-org/libresoda/issues/57)。签名服务间歇性抽风是常态：
+Cloudflare 530（回包 `retry_after: 120`）、TLS 握手被断开、TCP 超时，这些基本都是一过性的。
+以前 `HttpSignature::sign` 只发一次，一次抖动就让调用方看到「常用模式」永久转圈。
+
+`HttpSignature` 默认 `retries = 1`（一次有界重试），`.retries(n)` 可调，`.without_retries()` 关掉。
+**只重试明确可恢复的形态**：
+
+| 情况 | 重试 | 退避 |
+| --- | --- | --- |
+| 传输层失败（连接被拒 / TLS 断连 / 超时） | 是 | 200ms 固定 |
+| HTTP 429 / 5xx，且 body 的 `code` 不属于永久错误 | 是 | `Retry-After`，缺省 200ms，封顶 2s |
+| 2xx + `ok:false` 且 `code` 是 `BUSY` / `RATE_LIMITED` | 是 | `retry_after_seconds`，封顶 2s |
+| 401 / 400 / `INVALID_REQUEST` / `UNAUTHORIZED` / `SIGNER_UNAVAILABLE` | 否 | — |
+| 空签名 / JSON 解不开 / 2xx 超 1 MiB | 否 | — |
+
+重试耗尽后交回**最后一次**的结果，文案形状与 `signer error:` 前缀不变，
+`is_signer_failure()` 的判定不受影响。分类只读结构化事实（状态码、`Retry-After` 头、
+body 里的 `code` / `retry_after_seconds`），**不从错误文案反解析** —— 那里已经脱敏并截断。
+
+为什么可以重试：libmssdk 的契约写明签名接口没有副作用，`/sign` 只算一次签名，
+`ts_ms` 不做新鲜度校验，复用同一个 `SignRequest` 是安全的。本库只重试签名器调用，
+业务请求（`pc_post_json` / `track_v2`）仍然只发一次，不存在重复收藏、重复加歌这类风险。
+
+代价：签名器整体不可用时，一次签名从「最多 6s」变成「最多 12s + 2s」；sodam 听歌模式
+串行发 `feed_mode` + `discover` 两条签名请求，最坏 28s 才报错。另外重试会放大限流
+（libmssdk 默认 0.5 次/秒、突发 12），所以 429 必须尊重 `Retry-After` 而不是立刻重打。
+它治不了「整个域名挂了」：Cloudflare 530 如果持续，重试一次仍然失败，真正的自愈要靠
+多地址，那个先不做。
+
 ## 3. libresoda 侧用法
 
 ```rust
@@ -243,9 +274,9 @@ let provider = HttpSignature::new("http://signer.example.com:8921/sign")
 | --- | --- | --- |
 | `check_stream_access().app_error` 提示"缺少应用级签名头" | 没配签名器 | 配 `HttpSignature` 或 `CommandSignature` |
 | 提示"签名凭证可能已过期" | 设备指纹/会话换了 | 重新抓 `device_id` / `iid` / `fp` |
-| `signer error: …` / `signer exited …` | 签名器已配置但调用失败 | 看错误里的状态码、响应体与 `Retry-After`；可重试的按服务端给的时长退避 |
+| `signer error: …` / `signer exited …` | 签名器已配置但调用失败（一次重试后仍失败，见 §2.4） | 看错误里的状态码、响应体与 `Retry-After`；持续失败就先修签名器 |
 | `check_stream_access().signer_failed == true` | 同上；报告仍给出 web 侧候选 | 修签名器后再看 `app_error`，不要把它当曲目权益问题 |
-| `/sign` 回 503 `BUSY` / 429 `RATE_LIMITED` | 服务忙 / 被限流 | 按 `Retry-After` 退避；`/stat` 看队列与桶 |
+| `/sign` 回 503 `BUSY` / 429 `RATE_LIMITED` | 服务忙 / 被限流 | 库内已按 `Retry-After` 退避重试一次（封顶 2s）；仍失败就看 `Retry-After` 后再退避，`/stat` 看队列与桶 |
 | 拿到 30 秒试听且 `is_preview=true` 且 `signer_failed=false` | 签名缺失或不被接受 | 先跑 `--selftest`，再用 `stream_access_diagnose_online` 验收 |
 
 ## 5. 安全与合规

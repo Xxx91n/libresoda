@@ -266,14 +266,14 @@ pub(crate) struct PostResponse {
     /// 响应头，名字保留服务端写法并按名字排序（错误文案可复现）；同名只留第一行。
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
-    /// 非 2xx 的响应体超过上限时只保留前一段；2xx 超限直接报错（不把截断的
-    /// 签名回包当合法 JSON 去解析）。
+    /// 响应体超过上限时只保留前一段。2xx 超限由签名层判成签名故障（不把截断的
+    /// 签名回包当合法 JSON 去解析）；非 2xx 超限仍保留状态码与响应头。
     pub(crate) body_truncated: bool,
 }
 
 /// 读回来的响应体硬上限。签名服务回包正常只有几百字节，超过它不是正常结果，
 /// 也不该被整块读进内存或拼进错误文案。
-const MAX_POST_RESPONSE_BODY: usize = 1024 * 1024;
+pub(crate) const MAX_POST_RESPONSE_BODY: usize = 1024 * 1024;
 
 /// 发一次 POST，**4xx/5xx 也当响应交回**；传输层失败才返回 `Err`。
 fn send_post(url: &str, body: &[u8], options: &[RequestOption]) -> Result<ureq::Response> {
@@ -326,13 +326,9 @@ pub(crate) fn post_with_status(
         .map_err(|err| SodaError::http(err.to_string()))?;
     let body_truncated = data.len() > MAX_POST_RESPONSE_BODY;
     if body_truncated {
-        // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限说明
-        // 回包不是正常签名结果，不能拿截断的 JSON 当签名。
-        if (200..300).contains(&status) {
-            return Err(SodaError::http(format!(
-                "http response body exceeds {MAX_POST_RESPONSE_BODY} bytes"
-            )));
-        }
+        // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限也照交回，
+        // 由调用方（签名层）判成不可重试的签名故障 —— 这里不先折成错误，才能让
+        // 「传输层失败可重试」与「2xx 超限不可重试」在调用方分得开。
         data.truncate(MAX_POST_RESPONSE_BODY);
     }
     Ok(PostResponse {
