@@ -297,8 +297,7 @@ pub struct HttpSignature {
     /// 401/400、永久错误码、空签名与解析失败都不重试。签名接口没有副作用，
     /// 复用同一个 `SignRequest` 是安全的（见 `docs/SIGNER-SERVICE.md` §2.4）。
     ///
-    /// 读取时夹到 `MAX_SIGNER_RETRIES`；另有整轮总预算 `MAX_SIGNER_RETRY_BUDGET`
-    /// 兜底（各自的注释写了范围与算法）。
+    /// 读取时夹到 `MAX_SIGNER_RETRIES`；整轮预算见 `MAX_SIGNER_RETRY_BUDGET`。
     pub retries: u32,
 }
 
