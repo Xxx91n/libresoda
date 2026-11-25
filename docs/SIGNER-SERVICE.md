@@ -187,8 +187,8 @@ Unix 上签名器自成进程组：终端 Ctrl-C 不再直接传给它是用户�
 Cloudflare 530（回包 `retry_after: 120`）、TLS 握手被断开、TCP 超时，这些基本都是一过性的。
 以前 `HttpSignature::sign` 只发一次，一次抖动就让调用方看到「常用模式」永久转圈。
 
-`HttpSignature` 默认 `retries = 1`（一次有界重试），`.retries(n)` 可调，`.without_retries()` 关掉。
-**只重试明确可恢复的形态**：
+`HttpSignature` 默认 `retries = 1`（一次有界重试），`.retries(n)` 可调（上限 8），
+`.without_retries()` 关掉。**只重试明确可恢复的形态**：
 
 | 情况 | 重试 | 退避 |
 | --- | --- | --- |

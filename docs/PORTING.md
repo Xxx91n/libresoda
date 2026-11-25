@@ -948,15 +948,18 @@
   - 重试是 `std::thread::sleep`，同步阻塞：与既有 `sign()` 的同步签名一致，不引入
     新依赖、不改 trait。`PORTING.md` 的「库内不重试、不等待、不睡眠」口径作用域限定为
     下载与续传层，本调用是另一条路径（已在那一节写明理由）。
-  - **测试**：`tests/signature_tests.rs` 九条（传输失败一次后成功且计数 = 2、尊重
+  - `HttpSignature::retries` 由 `MAX_SIGNER_RETRIES`（8）夹紧：调用方填一个很大的数
+    也不会让一次签名无限重打。
+  - **测试**：`tests/signature_tests.rs` 十三条（传输失败一次后成功且计数 = 2、尊重
     `Retry-After: 1` 的间隔 ≥ 950ms、永久错误码只请求一次、401 只请求一次且带 token
     提示、重试耗尽返回最后一次的 503 文案、`Retry-After: 60` 退避落在 1.9s~2.8s、
-    `BUSY` 重试成功、`INVALID_REQUEST` 不重试、`without_retries()` 只请求一次）；
+    `BUSY` 重试成功、`INVALID_REQUEST` 不重试、`without_retries()` 只请求一次、
+    2xx 超限 / 空签名 / JSON 解不开 / 非 `BUSY` 的 `ok:false` 各只请求一次）；
     脚本化服务器在脚本用完后继续记账并回合法签名，好让「不该重试却重试了」既能被
     计数看见、也会让 `expect_err` 因第二次成功而失败。既有一次性服务器用例全部显式
     `.without_retries()`，继续钉住各自的失败形态。`src/soda/signature.rs` 四条纯函数
-    用例（默认重试数与 builder、`Retry-After` 解析与封顶、`BUSY`/`RATE_LIMITED` 判定、
-    429/5xx 与永久错误码判定）。全部离线。
+    用例（默认重试数与 builder 夹紧、`Retry-After` 解析与封顶、
+    `BUSY`/`RATE_LIMITED` 判定、429/5xx 与永久错误码判定）。全部离线。
 
 ## 未移植项
 

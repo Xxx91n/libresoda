@@ -325,10 +325,9 @@ pub(crate) fn post_with_status(
         .read_to_end(&mut data)
         .map_err(|err| SodaError::http(err.to_string()))?;
     let body_truncated = data.len() > MAX_POST_RESPONSE_BODY;
+    // 超限只截断、不折成错误：状态码、响应头与这一段体仍是调用方的分类依据。
+    // 2xx 超限由签名层判成不可重试的签名故障，非 2xx 超限照常分类。
     if body_truncated {
-        // 非 2xx 保留状态码/头/前一段响应体（这些才是分类依据）；2xx 超限也照交回，
-        // 由调用方（签名层）判成不可重试的签名故障 —— 这里不先折成错误，才能让
-        // 「传输层失败可重试」与「2xx 超限不可重试」在调用方分得开。
         data.truncate(MAX_POST_RESPONSE_BODY);
     }
     Ok(PostResponse {

@@ -1050,3 +1050,58 @@ fn http_signature_without_retries_sends_one_request() {
     assert!(error.to_string().contains("status 503"), "{error}");
     assert_eq!(arrivals.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn http_signature_does_not_retry_oversized_2xx() {
+    // 2xx 超 1 MiB：回包不是正常签名结果，重试也只会再拿一份超长垃圾。
+    // 脚本之后多打的请求会收到合法签名，所以一旦重试，`expect_err` 会直接失败。
+    let big: &'static str = Box::leak("x".repeat(2 * 1024 * 1024).into_boxed_str());
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply("200 OK", "", big)]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(5_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("2xx 超限是签名故障");
+    assert!(error.to_string().contains("body exceeds"), "{error}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1, "2xx 超限不该重试");
+}
+
+#[test]
+fn http_signature_does_not_retry_empty_signature() {
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply("200 OK", "", "{}")]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("空签名是签名故障");
+    assert!(
+        error.to_string().contains("empty signature response"),
+        "{error}"
+    );
+    assert_eq!(arrivals.lock().unwrap().len(), 1, "空签名不该重试");
+}
+
+#[test]
+fn http_signature_does_not_retry_unparseable_body() {
+    // JSON 解不开：拿不到原因码，也不该重试。
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply("200 OK", "", "not json")]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("JSON 解不开是签名故障");
+    assert!(error.to_string().contains("decode"), "{error}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1, "解不开的回包不该重试");
+}
+
+#[test]
+fn http_signature_does_not_retry_non_busy_ok_false() {
+    let (url, arrivals) = spawn_scripted_signer(vec![signer_reply(
+        "200 OK",
+        "",
+        r#"{"ok":false,"error":"鉴权失败","code":"UNAUTHORIZED"}"#,
+    )]);
+    let error = HttpSignature::new(url)
+        .timeout_ms(3_000)
+        .sign(&sign_request("https://api.qishui.com/x", "POST", "{}"))
+        .expect_err("UNAUTHORIZED 不重试");
+    assert!(error.to_string().contains("[code=UNAUTHORIZED]"), "{error}");
+    assert_eq!(arrivals.lock().unwrap().len(), 1);
+}

@@ -296,8 +296,14 @@ pub struct HttpSignature {
     /// 只重试明确可恢复的形态（传输层失败、429/5xx、`BUSY`/`RATE_LIMITED`）；
     /// 401/400、永久错误码、空签名与解析失败都不重试。签名接口没有副作用，
     /// 复用同一个 `SignRequest` 是安全的（见 `docs/SIGNER-SERVICE.md` §2.4）。
+    ///
+    /// 实际取值被夹在 [`MAX_SIGNER_RETRIES`] 以内：无论是 builder 还是直接写这个
+    /// 字段，一次签名都不会无限重打下去。
     pub retries: u32,
 }
+
+/// 重试次数上限：再往上重打只是放大限流与故障，收益为零。
+const MAX_SIGNER_RETRIES: u32 = 8;
 
 /// 传输层失败、以及服务端没给等待时长时的固定退避。
 const DEFAULT_SIGNER_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -330,9 +336,10 @@ impl HttpSignature {
         self
     }
 
-    /// 设置失败后的额外重试次数（默认 1）。传 0 等价于 [`Self::without_retries`]。
+    /// 设置失败后的额外重试次数（默认 1）。传 0 等价于 [`Self::without_retries`]；
+    /// 超过 [`MAX_SIGNER_RETRIES`] 按上限算。
     pub fn retries(mut self, retries: u32) -> Self {
-        self.retries = retries;
+        self.retries = retries.min(MAX_SIGNER_RETRIES);
         self
     }
 
@@ -393,7 +400,8 @@ impl HttpSignature {
             let code = json_code(&value);
             let retry_after = json_u64(&value, "retry_after_seconds");
             // 服务端要求鉴权时给出可操作的提示（libmssdk 会回 ok:false + code=unauthorized）。
-            // 判据与 `http_signature_failure_message` 共用 `is_unauthorized_code`，免得两处漂。
+            // 2xx 分支还能看到 `error` 原文，所以除了原因码也认文案里的 unauthorized/401；
+            // 非 2xx 分支只有状态码与 body，判据见 `http_signature_failure_message`。
             let unauthorized = is_unauthorized_code(&code)
                 || message.to_ascii_lowercase().contains("unauthorized")
                 || message.contains("401");
@@ -603,6 +611,8 @@ impl SignatureProvider for HttpSignature {
         //
         // 有界重试：签名接口幂等（只算一次签名，`ts_ms` 不做新鲜度校验），复用同一个
         // payload 是安全的；业务请求不在这一层，重试不会造成重复写操作。
+        // 次数在用的地方再夹一次：字段是公开的，直接写 `retries` 也绕不过上限。
+        let max_retries = self.retries.min(MAX_SIGNER_RETRIES);
         let mut attempt: u32 = 0;
         loop {
             match self.sign_once(&payload, &option) {
@@ -610,7 +620,7 @@ impl SignatureProvider for HttpSignature {
                 Err(failure) => match failure.retry_delay {
                     // 重试次数用完、或这类失败本来就不该重试：交回**最后一次**的结果，
                     // 文案形状与直接调用一次时完全一致。
-                    Some(delay) if attempt < self.retries => {
+                    Some(delay) if attempt < max_retries => {
                         attempt += 1;
                         thread::sleep(delay);
                     }
@@ -1432,6 +1442,13 @@ mod tests {
                 .retries,
             3
         );
+        // 填再大的数也按上限算：一次签名不能无限重打下去。
+        assert_eq!(
+            HttpSignature::new("http://127.0.0.1/sign")
+                .retries(u32::MAX)
+                .retries,
+            MAX_SIGNER_RETRIES
+        );
         assert_eq!(
             HttpSignature::new("http://127.0.0.1/sign")
                 .without_retries()
@@ -1503,7 +1520,7 @@ mod tests {
     /// 票 #57：非 2xx 只有 429/5xx 可重试，且永久错误码要挡住。
     #[test]
     fn non_2xx_retry_excludes_permanent_codes() {
-        let reply =
+        let post_response =
             |status: u16, headers: Vec<(String, String)>, body: &[u8]| crate::http::PostResponse {
                 status,
                 final_url: "http://127.0.0.1/sign".to_string(),
@@ -1513,11 +1530,11 @@ mod tests {
             };
 
         assert_eq!(
-            non_2xx_retry_delay(&reply(503, Vec::new(), b"")),
+            non_2xx_retry_delay(&post_response(503, Vec::new(), b"")),
             Some(DEFAULT_SIGNER_RETRY_DELAY)
         );
         assert_eq!(
-            non_2xx_retry_delay(&reply(
+            non_2xx_retry_delay(&post_response(
                 429,
                 vec![("Retry-After".to_string(), "1".to_string())],
                 b""
@@ -1527,14 +1544,17 @@ mod tests {
 
         // 400/401/404 不在可重试集合里。
         for status in [400_u16, 401, 404, 403, 302] {
-            assert_eq!(non_2xx_retry_delay(&reply(status, Vec::new(), b"")), None);
+            assert_eq!(
+                non_2xx_retry_delay(&post_response(status, Vec::new(), b"")),
+                None
+            );
         }
 
         // 5xx 但原因是永久错误：不重试。
         for code in PERMANENT_SIGNER_CODES {
             let body = format!(r#"{{"code":"{code}"}}"#).into_bytes();
             assert_eq!(
-                non_2xx_retry_delay(&reply(503, Vec::new(), &body)),
+                non_2xx_retry_delay(&post_response(503, Vec::new(), &body)),
                 None,
                 "{code} 是永久错误"
             );
@@ -1542,7 +1562,7 @@ mod tests {
 
         // body 不是 JSON 时按「不属永久错误」处理：仍然可重试。
         assert_eq!(
-            non_2xx_retry_delay(&reply(500, Vec::new(), b"<html>oops</html>")),
+            non_2xx_retry_delay(&post_response(500, Vec::new(), b"<html>oops</html>")),
             Some(DEFAULT_SIGNER_RETRY_DELAY)
         );
     }
