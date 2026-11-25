@@ -955,10 +955,20 @@ fn http_signature_does_not_retry_unauthorized() {
 
 #[test]
 fn http_signature_reports_last_attempt_after_retries_exhausted() {
-    // 两次都是 503：交回**最后一次**的文案（带状态码与 retry-after），不是传输错误。
+    // 两次失败的回包刻意不同：交回的必须是**最后一次**（502 + last-attempt），
+    // 不是第一次（503 + first-attempt）。两次一样的话，「返回第一次的错误」这种
+    // 回归也能通过。
     let (url, arrivals) = spawn_scripted_signer(vec![
-        signer_reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
-        signer_reply("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+        signer_reply(
+            "503 Service Unavailable",
+            "Retry-After: 0\r\n",
+            r#"{"error":"first-attempt"}"#,
+        ),
+        signer_reply(
+            "502 Bad Gateway",
+            "Retry-After: 0\r\n",
+            r#"{"error":"last-attempt"}"#,
+        ),
     ]);
     let error = HttpSignature::new(url)
         .timeout_ms(3_000)
@@ -966,8 +976,16 @@ fn http_signature_reports_last_attempt_after_retries_exhausted() {
         .expect_err("重试耗尽仍失败");
     let text = error.to_string();
     assert!(
-        text.starts_with("signer error: http request failed: status 503"),
-        "{text}"
+        text.starts_with("signer error: http request failed: status 502"),
+        "要交回最后一次的状态码：{text}"
+    );
+    assert!(
+        text.contains("last-attempt"),
+        "要交回最后一次的回包：{text}"
+    );
+    assert!(
+        !text.contains("first-attempt"),
+        "不能把第一次的错误当结果：{text}"
     );
     assert!(
         text.to_ascii_lowercase().contains("retry-after: 0"),
